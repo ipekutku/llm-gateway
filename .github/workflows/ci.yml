@@ -15,6 +15,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -24,12 +25,24 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.mod
 
       - name: Show Go version
         run: go version
+
+      - name: Check formatting
+        run: |
+          unformatted_files=$(gofmt -l .)
+          if [ -n "$unformatted_files" ]; then
+            printf 'Run gofmt on these files:\n%s\n' "$unformatted_files"
+            exit 1
+          fi
 
       - name: Vet
         run: go vet ./...
 
       - name: Test
-        run: go test -race ./...
+        run: go test -race -timeout 2m ./...
+
+      - name: Build
+        run: go build ./cmd/gateway
