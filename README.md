@@ -85,8 +85,8 @@ The same checks run automatically through GitHub Actions for pull requests and c
 | Static model routing (`internal/routing`) | ✅ Done |
 | `/v1/chat/completions` handler, validation, and error mapping (`internal/httpapi`) | ✅ Done |
 | OpenAI provider adapter (`internal/provider/openai`) | ✅ Done |
-| Anthropic provider adapter | ⏳ Next |
-| Configuration, server wiring, and end-to-end tests (`cmd/gateway`) | ⏳ Planned |
+| Anthropic provider adapter (`internal/provider/anthropic`) | ✅ Done |
+| Configuration, server wiring, and end-to-end tests (`cmd/gateway`) | ⏳ Next |
 
 The gateway cannot be run as a server yet; `cmd/gateway` is wired up in the final v0.1 step, together with configuration and usage instructions. Design decisions are documented in [docs/architecture.md](docs/architecture.md).
 

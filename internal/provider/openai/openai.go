@@ -103,6 +103,7 @@ type chatChoice struct {
 type responseMessage struct {
 	Role         string          `json:"role"`
 	Content      *string         `json:"content"`
+	Refusal      *string         `json:"refusal"`
 	ToolCalls    json.RawMessage `json:"tool_calls"`
 	FunctionCall json.RawMessage `json:"function_call"`
 }
@@ -208,13 +209,22 @@ func decodeResponse(data []byte) (llm.ChatResponse, error) {
 	if isPresent(msg.ToolCalls) || isPresent(msg.FunctionCall) {
 		return llm.ChatResponse{}, errors.New("response contains tool calls, which are unsupported")
 	}
-	if msg.Content == nil {
-		return llm.ChatResponse{}, errors.New("response message has no text content")
-	}
 
-	finish, err := finishReason(choice.FinishReason)
-	if err != nil {
-		return llm.ChatResponse{}, err
+	// A refusal arrives as a refusal string instead of content. It is
+	// returned as the message text with the content_filter finish reason,
+	// matching how the Anthropic adapter reports refusals.
+	var text, finish string
+	switch {
+	case msg.Refusal != nil:
+		text, finish = *msg.Refusal, llm.FinishReasonContentFilter
+	case msg.Content != nil:
+		var err error
+		if finish, err = finishReason(choice.FinishReason); err != nil {
+			return llm.ChatResponse{}, err
+		}
+		text = *msg.Content
+	default:
+		return llm.ChatResponse{}, errors.New("response message has no text content")
 	}
 
 	if resp.Usage == nil || resp.Usage.PromptTokens == nil || resp.Usage.CompletionTokens == nil {
@@ -223,7 +233,7 @@ func decodeResponse(data []byte) (llm.ChatResponse, error) {
 
 	return llm.ChatResponse{
 		Model:        resp.Model,
-		Message:      llm.Message{Role: llm.RoleAssistant, Content: *msg.Content},
+		Message:      llm.Message{Role: llm.RoleAssistant, Content: text},
 		FinishReason: finish,
 		Usage: llm.Usage{
 			InputTokens:  *resp.Usage.PromptTokens,
