@@ -67,17 +67,28 @@ This project prioritizes:
 Run the verification suite locally with:
 
 ```bash
+gofmt -l .
 go vet ./...
 go test -race ./...
+go build ./cmd/gateway
 ```
 
-The same checks run automatically through GitHub Actions for pull requests and changes to `main`.
+The same checks run automatically through GitHub Actions for pull requests and changes to `main`. Tests use local fake provider servers and need no API keys or network access.
 
 ## Project Status
 
-🚧 **Early development**
+🚧 **Early development** — v0.1 is in progress.
 
-The repository is currently being built from the minimal gateway core outward. Infrastructure and platform features will be introduced only after the core service is working and tested.
+| Component | Status |
+|---|---|
+| Vendor-neutral types and provider interface (`internal/llm`) | ✅ Done |
+| Static model routing (`internal/routing`) | ✅ Done |
+| `/v1/chat/completions` handler, validation, and error mapping (`internal/httpapi`) | ✅ Done |
+| OpenAI provider adapter (`internal/provider/openai`) | ✅ Done |
+| Anthropic provider adapter | ⏳ Next |
+| Configuration, server wiring, and end-to-end tests (`cmd/gateway`) | ⏳ Planned |
+
+The gateway cannot be run as a server yet; `cmd/gateway` is wired up in the final v0.1 step, together with configuration and usage instructions. Design decisions are documented in [docs/architecture.md](docs/architecture.md).
 
 ## Planned Evolution
 
