@@ -18,7 +18,8 @@ The incoming request's `context.Context` is passed unchanged through every step 
 | `internal/llm` | Vendor-neutral types (`ChatRequest`, `ChatResponse`, `Message`, `Usage`), the `Provider` interface, and shared errors. |
 | `internal/routing` | Exact-match static model router. |
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
-| `internal/provider/openai`, `internal/provider/anthropic` | *(planned)* Provider HTTP clients with private wire types. |
+| `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
+| `internal/provider/anthropic` | *(planned)* Anthropic Messages client with private wire types. |
 | `cmd/gateway` | *(planned)* Configuration, wiring, and server lifecycle. |
 
 Rules:
@@ -132,3 +133,34 @@ Decisions:
 - **Each failure is logged once** at the handler with `slog`: status, code, model, provider, upstream status, and the error. Logs never include credentials, prompt or completion content, or raw upstream bodies. 5xx responses log at error level and 4xx responses at warn.
 
 Milestone 1 imposes no request deadline. A slow upstream runs until it completes or the client cancels. Upstream timeouts are a Milestone 2 concern; the 504 mapping is ready for them.
+
+## Provider adapters
+
+Each adapter's constructor takes an API key, a base URL, and an `*http.Client`.
+
+- **Base URL.** An `http` or `https` origin with an optional path prefix and without the endpoint suffix. The adapter appends its endpoint path exactly once, so `https://api.openai.com` and `http://127.0.0.1:9000/proxy/` both work. URLs with credentials, a query, or a fragment are rejected. Production uses the HTTPS provider origin; tests inject local `httptest` servers.
+- **HTTP client.** `nil` means `http.DefaultClient`. The adapter adds no timeout or retry policy of its own; that is Milestone 2.
+- **Requests.** Built with `http.NewRequestWithContext`, so the incoming context reaches the upstream call.
+- **Responses.** Bodies are closed on every path. Successful responses are read up to 4 MiB; anything larger is an upstream failure. Non-2xx response bodies are not read at all, so they cannot leak into errors or logs.
+- **Errors.** Every upstream failure is a `*llm.ProviderError`: non-2xx status, transport failure, unreadable or oversized body, malformed JSON, or a structurally unusable response. When the context is done, the context error is always wrapped, so `errors.Is(err, context.Canceled)` holds even if cancellation interrupts the body read. A request the gateway should never produce (blank model, non-positive `MaxTokens`, no messages, unknown role) returns a plain error without calling the upstream. The handler treats that as an internal error.
+- **Usage.** Never fabricated. A response without both token counts is a protocol error.
+- **Empty text.** A structurally valid response with empty text is a success.
+
+### OpenAI
+
+`POST {base}/v1/chat/completions` with `Authorization: Bearer <key>`.
+
+| Neutral | OpenAI |
+|---|---|
+| `Model` | `model` |
+| `Messages` | `messages`, with roles and content unchanged; `system` stays a message |
+| `MaxTokens` | `max_completion_tokens` |
+| response `Model` | `model` |
+| `Usage.InputTokens` / `OutputTokens` | `usage.prompt_tokens` / `usage.completion_tokens` |
+
+- **`max_completion_tokens`, not `max_tokens`.** OpenAI's API specification marks `max_tokens` as deprecated and "not compatible with o-series models". `max_completion_tokens` is accepted by current models. On reasoning models it also counts reasoning tokens, so a small limit can produce an empty, length-truncated answer.
+- **Exactly one choice.** The response must contain one choice with an `assistant` message and string `content`. Zero or several choices, a missing message, `null` content, `tool_calls`, and `function_call` are protocol errors.
+- **Refusals are protocol errors.** A refusal arrives as `content: null` with a `refusal` string, so it is rejected for now.
+- **Finish reasons.** `stop`, `length`, and `content_filter` map to the neutral values of the same name. `tool_calls`, `function_call`, and any undocumented reason are protocol errors.
+
+Response fixtures follow the example in OpenAI's published OpenAPI specification. No live model has been verified yet; the README will list tested model IDs.
