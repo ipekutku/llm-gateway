@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the architecture as implemented. It grows with each Milestone 1 pull request; sections for the provider adapters and configuration are added as those parts land.
+This document describes the architecture as implemented in v0.1: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, and static routing.
 
 ## Request flow
 
@@ -20,7 +20,7 @@ The incoming request's `context.Context` is passed unchanged through every step 
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
 | `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
 | `internal/provider/anthropic` | Anthropic Messages client with private wire types. |
-| `cmd/gateway` | *(planned)* Configuration, wiring, and server lifecycle. |
+| `cmd/gateway` | Environment configuration, wiring, and server lifecycle. |
 
 Rules:
 
@@ -195,3 +195,42 @@ Stop reasons, as documented for API version `2023-06-01`:
 On models that always think, thinking tokens count toward `max_tokens`. A small limit, including the gateway default of 1024, can therefore end with `length` and little or no text. The same applies to OpenAI reasoning models.
 
 Response fixtures follow Anthropic's documented response shape. No live model has been verified yet.
+
+## Configuration
+
+Configuration is read once at startup from the environment in `cmd/gateway`. There is no configuration file or framework.
+
+| Variable | Rule |
+|---|---|
+| `OPENAI_MODEL`, `OPENAI_API_KEY` | Both absent disables OpenAI. Both present routes that one model to OpenAI. Only one present fails startup. |
+| `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Same rule for Anthropic. |
+| `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`, so the unauthenticated gateway is not exposed by accident. |
+
+- **Absent means unset or blank.** A whitespace-only value counts as absent. Non-blank values, including model names, are used unchanged.
+- **Startup fails if no provider is enabled, if a pair is incomplete, or if both providers declare the same model.** All pair errors are reported together. Errors name the variables and never include their values. An enabled route is never silently dropped.
+- **Base URLs are fixed** to the providers' production HTTPS origins. Tests inject local fake servers through the same `config` struct, but there is no environment variable for them in v0.1.
+- **Model IDs are not defaulted.** A built-in model name would go stale; the operator always chooses.
+- The startup log names the configured models, never the keys.
+
+`newHandler` builds one client per enabled provider, the router, and the HTTP handler. Upstream calls use `http.DefaultClient`. Dedicated clients with timeouts arrive with Milestone 2.
+
+## Server lifecycle
+
+- `http.Server` sets `ReadHeaderTimeout` to 5 seconds. Other server timeouts are left unset, because M1 imposes no deadline on slow upstream responses.
+- `signal.NotifyContext` cancels on `SIGINT` or `SIGTERM`. Shutdown then runs with a fresh 5-second context; the signal context is already canceled.
+- During graceful shutdown the listener closes and in-flight requests finish normally. If they are still running after 5 seconds, the server is closed. That cancels their request contexts, and the cancellation propagates to the upstream calls. The process then exits non-zero.
+- `http.ErrServerClosed` counts as a normal stop. Configuration, listen, and serve errors are logged and exit with status 1.
+
+These limits govern the server's own lifecycle. They are not the upstream timeout policy planned for Milestone 2.
+
+## Testing
+
+All tests run without credentials or network access, using `httptest` servers.
+
+| Level | What it proves |
+|---|---|
+| `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers. |
+| `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
+| `cmd/gateway` | Configuration rules, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, client cancellation reaching the upstream, and graceful and forced shutdown. |
+
+Tests coordinate with channels. Timeouts are used only as failure guards. CI runs `gofmt`, `go vet`, `go test -race`, and `go build ./cmd/gateway`.

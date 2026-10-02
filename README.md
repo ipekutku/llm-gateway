@@ -62,6 +62,81 @@ This project prioritizes:
 * production-oriented error handling
 * measurable reliability and performance as the project evolves
 
+## Running Locally
+
+Requires Go 1.26 or later. Configure at least one provider and start the gateway:
+
+```bash
+export OPENAI_MODEL=gpt-4o
+export OPENAI_API_KEY=sk-...            # your OpenAI key
+
+export ANTHROPIC_MODEL=claude-opus-5-5
+export ANTHROPIC_API_KEY=sk-ant-...     # your Anthropic key
+
+go run ./cmd/gateway
+```
+
+The gateway listens on `127.0.0.1:8080` and logs the configured models. Stop it with `Ctrl+C` or `SIGTERM`; in-flight requests get up to 5 seconds to finish.
+
+Send a request to either model:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [
+      {"role": "system", "content": "Answer concisely."},
+      {"role": "user", "content": "Explain TCP."}
+    ],
+    "max_tokens": 200
+  }'
+
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-opus-5-5",
+    "messages": [{"role": "user", "content": "Explain TCP."}],
+    "max_tokens": 200
+  }'
+```
+
+The `model` field must match a configured model exactly; the request is routed to that provider and the model name is forwarded unchanged.
+
+### Configuration
+
+| Variable | Description |
+|---|---|
+| `OPENAI_MODEL`, `OPENAI_API_KEY` | Enable OpenAI for one model. Set both or neither. |
+| `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Enable Anthropic for one model. Set both or neither. |
+| `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
+
+Startup fails if no provider is configured, if only one variable of a pair is set, or if both providers use the same model name. Error messages name the variables but never print their values.
+
+The model names above are examples. Any model the provider's API accepts can be configured. Both adapters are tested against fake servers built from the providers' documented API formats; they have not yet been verified against the live APIs.
+
+### Supported API
+
+`POST /v1/chat/completions` implements a small subset of the OpenAI Chat Completions format. It is not a full OpenAI-compatible API.
+
+| Request field | Support |
+|---|---|
+| `model` | Required. Must match a configured model. |
+| `messages` | Required. `role` is `system`, `user`, or `assistant`; `content` is a non-empty string. An optional `system` message must come first. |
+| `max_tokens` | Optional positive integer. Default `1024`. Sent to OpenAI as `max_completion_tokens` and to Anthropic as `max_tokens`. |
+| `stream` | Only `false` or absent. Streaming is not supported. |
+| anything else | Accepted but ignored (for example `temperature`, `tools`, `n`). |
+
+The response contains exactly one choice with `finish_reason` `stop`, `length`, or `content_filter`, plus token usage. Errors use the envelope `{"error": {"message", "type", "code"}}`; see [docs/architecture.md](docs/architecture.md#error-mapping) for the full status mapping.
+
+### Limitations
+
+* One model per provider, matched by exact name; no aliases or wildcards.
+* Text only: no streaming, tool calls, images, or multiple choices.
+* No upstream timeouts or retries yet; a slow provider is waited on until the client disconnects (planned for v0.2).
+* No gateway authentication; run it only on a trusted network (planned for v0.4).
+* On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
+
 ## Development
 
 Run the verification suite locally with:
@@ -77,7 +152,7 @@ The same checks run automatically through GitHub Actions for pull requests and c
 
 ## Project Status
 
-🚧 **Early development** — v0.1 is in progress.
+🚧 **Early development** — v0.1 is feature-complete.
 
 | Component | Status |
 |---|---|
@@ -86,9 +161,9 @@ The same checks run automatically through GitHub Actions for pull requests and c
 | `/v1/chat/completions` handler, validation, and error mapping (`internal/httpapi`) | ✅ Done |
 | OpenAI provider adapter (`internal/provider/openai`) | ✅ Done |
 | Anthropic provider adapter (`internal/provider/anthropic`) | ✅ Done |
-| Configuration, server wiring, and end-to-end tests (`cmd/gateway`) | ⏳ Next |
+| Configuration, server wiring, and end-to-end tests (`cmd/gateway`) | ✅ Done |
 
-The gateway cannot be run as a server yet; `cmd/gateway` is wired up in the final v0.1 step, together with configuration and usage instructions. Design decisions are documented in [docs/architecture.md](docs/architecture.md).
+Design decisions are documented in [docs/architecture.md](docs/architecture.md).
 
 ## Planned Evolution
 
