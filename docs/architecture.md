@@ -19,7 +19,7 @@ The incoming request's `context.Context` is passed unchanged through every step 
 | `internal/routing` | Exact-match static model router. |
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
 | `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
-| `internal/provider/anthropic` | *(planned)* Anthropic Messages client with private wire types. |
+| `internal/provider/anthropic` | Anthropic Messages client with private wire types. |
 | `cmd/gateway` | *(planned)* Configuration, wiring, and server lifecycle. |
 
 Rules:
@@ -160,7 +160,38 @@ Each adapter's constructor takes an API key, a base URL, and an `*http.Client`.
 
 - **`max_completion_tokens`, not `max_tokens`.** OpenAI's API specification marks `max_tokens` as deprecated and "not compatible with o-series models". `max_completion_tokens` is accepted by current models. On reasoning models it also counts reasoning tokens, so a small limit can produce an empty, length-truncated answer.
 - **Exactly one choice.** The response must contain one choice with an `assistant` message and string `content`. Zero or several choices, a missing message, `null` content, `tool_calls`, and `function_call` are protocol errors.
-- **Refusals are protocol errors.** A refusal arrives as `content: null` with a `refusal` string, so it is rejected for now.
+- **Refusals map to `content_filter`.** A refusal arrives as a `refusal` string instead of `content`. It is returned as the message text with finish reason `content_filter`, matching the Anthropic adapter.
 - **Finish reasons.** `stop`, `length`, and `content_filter` map to the neutral values of the same name. `tool_calls`, `function_call`, and any undocumented reason are protocol errors.
 
 Response fixtures follow the example in OpenAI's published OpenAPI specification. No live model has been verified yet; the README will list tested model IDs.
+
+### Anthropic
+
+`POST {base}/v1/messages` with `x-api-key: <key>` and the pinned header `anthropic-version: 2023-06-01`.
+
+| Neutral | Anthropic |
+|---|---|
+| `Model` | `model` |
+| leading `system` message | top-level `system` string, omitted when absent |
+| other `Messages` | `messages`, with roles and content unchanged and in order |
+| `MaxTokens` | `max_tokens`, always sent with no provider-specific default |
+| response `Model` | `model` |
+| `Usage.InputTokens` | `usage.input_tokens + cache_creation_input_tokens + cache_read_input_tokens` |
+| `Usage.OutputTokens` | `usage.output_tokens` |
+
+- **Conversation rules are left to the upstream.** Anthropic constraints such as role alternation or a final assistant turn (prefill, rejected by current models) are not pre-validated. They surface as an upstream 400, which the gateway maps to 400.
+- **Response content.** `text` blocks are concatenated in order with no separator. `thinking` and `redacted_thinking` blocks are reasoning, not output, and are skipped; current models such as Claude Opus 5.5 always think, so rejecting them would fail every request. Any other block type (`tool_use`, `server_tool_use`, tool results, unknown types) is a protocol error. An empty `content` array or empty text is a valid empty answer.
+- **Input usage includes cached tokens.** `input_tokens` excludes prompt-cache reads and writes, while OpenAI's `prompt_tokens` includes cached tokens. Adding the cache fields keeps the neutral count comparable. The gateway does not request caching itself.
+
+Stop reasons, as documented for API version `2023-06-01`:
+
+| `stop_reason` | Neutral finish reason |
+|---|---|
+| `end_turn`, `stop_sequence` | `stop` |
+| `max_tokens`, `model_context_window_exceeded` | `length` |
+| `refusal` | `content_filter`, keeping any partial text |
+| `tool_use`, `pause_turn`, anything else | protocol error (502) |
+
+On models that always think, thinking tokens count toward `max_tokens`. A small limit, including the gateway default of 1024, can therefore end with `length` and little or no text. The same applies to OpenAI reasoning models.
+
+Response fixtures follow Anthropic's documented response shape. No live model has been verified yet.
