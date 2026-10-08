@@ -214,7 +214,7 @@ Configuration is read once at startup from the environment in `cmd/gateway`. The
 
 - **Absent means unset or blank.** A whitespace-only value counts as absent. Non-blank values, including model names, are used unchanged.
 - **Startup fails if no provider is enabled, if a pair is incomplete, or if both providers declare the same model.** All pair errors are reported together. Errors name the variables and never include their values. An enabled route is never silently dropped.
-- **Base URLs are fixed** to the providers' production HTTPS origins. Tests inject local fake servers through the same `config` struct, but there is no environment variable for them in v0.1.
+- **Base URLs are fixed** to the providers' production HTTPS origins. Tests inject local fake servers through the same `config` struct, but there is no environment variable for them, so a manual run of the gateway always talks to the real providers. This keeps upstream destinations under server control and avoids sending provider keys to an arbitrary host through misconfiguration.
 - **Model IDs are not defaulted.** A built-in model name would go stale; the operator always chooses.
 - **Durations must be positive.** An unparsable, zero, or negative duration, or an attempt count outside 1–10, fails startup and is reported together with any other configuration errors.
 - The startup log names the configured models, never the keys.
