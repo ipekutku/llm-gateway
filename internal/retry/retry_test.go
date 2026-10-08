@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -72,7 +73,7 @@ func (s *scripted) Calls() int {
 // full backoff and whose sleep records the delays without waiting.
 func newTestProvider(t *testing.T, next llm.Provider, policy Policy) (*Provider, *[]time.Duration) {
 	t.Helper()
-	p, err := New(next, policy)
+	p, err := New(next, policy, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -102,7 +103,7 @@ func TestNew(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := New(tt.next, tt.policy)
+			_, err := New(tt.next, tt.policy, nil)
 			if (err == nil) != tt.ok {
 				t.Errorf("New() error = %v, want ok %v", err, tt.ok)
 			}
@@ -235,6 +236,32 @@ func TestChatDoesNotRetryNonRetryableFailures(t *testing.T) {
 	}
 }
 
+func TestChatLogsEachRetry(t *testing.T) {
+	const prompt = "my private prompt"
+	next := &scripted{results: []error{statusErr(http.StatusServiceUnavailable), statusErr(http.StatusBadGateway), nil}}
+	p, _ := newTestProvider(t, next, testPolicy)
+	var logs strings.Builder
+	p.log = slog.New(slog.NewTextHandler(&logs, nil))
+	req := testRequest
+	req.Messages = []llm.Message{{Role: llm.RoleUser, Content: prompt}}
+
+	if _, err := p.Chat(context.Background(), req); err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+
+	if n := strings.Count(logs.String(), "upstream attempt failed, retrying"); n != 2 {
+		t.Errorf("logged %d retries, want 2:\n%s", n, logs.String())
+	}
+	for _, want := range []string{"model=model-a", "provider=openai", "attempt=1", "upstream_status=503", "attempt=2", "upstream_status=502", "retry_in="} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log does not contain %q:\n%s", want, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), prompt) {
+		t.Errorf("log contains prompt content:\n%s", logs.String())
+	}
+}
+
 func TestRetryable(t *testing.T) {
 	for _, status := range []int{429, 502, 503, 504, 529} {
 		if !Retryable(statusErr(status)) {
@@ -312,7 +339,7 @@ func (b *blocking) Calls() int {
 func TestChatCancellationDuringWaitStopsRetries(t *testing.T) {
 	next := &scripted{results: []error{statusErr(http.StatusServiceUnavailable), nil}}
 	// The real sleep, with a backoff far longer than the test.
-	p, err := New(next, Policy{MaxAttempts: 3, BaseDelay: time.Hour, MaxDelay: time.Hour})
+	p, err := New(next, Policy{MaxAttempts: 3, BaseDelay: time.Hour, MaxDelay: time.Hour}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

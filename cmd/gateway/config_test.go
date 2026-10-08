@@ -8,6 +8,7 @@ import (
 
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
+	"github.com/ipekutku/llm-gateway/internal/retry"
 )
 
 // env returns a getenv func backed by vars.
@@ -24,9 +25,10 @@ func TestLoadConfig(t *testing.T) {
 	openaiCfg := &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: openai.DefaultBaseURL}
 	anthropicCfg := &providerConfig{Model: "claude-opus-5-5", APIKey: anthropicKey, BaseURL: anthropic.DefaultBaseURL}
 
-	// withDefaults fills in the default timeouts.
+	// withDefaults fills in the default timeouts and retry policy.
 	withDefaults := func(c config) config {
 		c.UpstreamTimeout, c.ConnectTimeout = defaultUpstreamTimeout, defaultConnectTimeout
+		c.Retry = defaultRetry
 		return c
 	}
 
@@ -74,7 +76,23 @@ func TestLoadConfig(t *testing.T) {
 				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
 				"GATEWAY_UPSTREAM_TIMEOUT": "45s", "GATEWAY_UPSTREAM_CONNECT_TIMEOUT": " 1500ms ",
 			},
-			want: config{Addr: defaultAddr, OpenAI: openaiCfg, UpstreamTimeout: 45 * time.Second, ConnectTimeout: 1500 * time.Millisecond},
+			want: config{Addr: defaultAddr, OpenAI: openaiCfg, UpstreamTimeout: 45 * time.Second, ConnectTimeout: 1500 * time.Millisecond, Retry: defaultRetry},
+		},
+		{
+			name: "custom retry policy",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_RETRY_MAX_ATTEMPTS": " 5 ", "GATEWAY_RETRY_BASE_DELAY": "200ms", "GATEWAY_RETRY_MAX_DELAY": "200ms",
+			},
+			want: withDefaults(config{Addr: defaultAddr, OpenAI: openaiCfg}).withRetry(retry.Policy{MaxAttempts: 5, BaseDelay: 200 * time.Millisecond, MaxDelay: 200 * time.Millisecond}),
+		},
+		{
+			name: "retries disabled",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_RETRY_MAX_ATTEMPTS": "1",
+			},
+			want: withDefaults(config{Addr: defaultAddr, OpenAI: openaiCfg}).withRetry(retry.Policy{MaxAttempts: 1, BaseDelay: defaultRetryBaseDelay, MaxDelay: defaultRetryMaxDelay}),
 		},
 		{
 			name: "blank timeouts use defaults",
@@ -96,6 +114,17 @@ func TestLoadConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+var defaultRetry = retry.Policy{
+	MaxAttempts: defaultRetryMaxAttempts,
+	BaseDelay:   defaultRetryBaseDelay,
+	MaxDelay:    defaultRetryMaxDelay,
+}
+
+func (c config) withRetry(p retry.Policy) config {
+	c.Retry = p
+	return c
 }
 
 func TestLoadConfigErrors(t *testing.T) {
@@ -167,6 +196,42 @@ func TestLoadConfigErrors(t *testing.T) {
 				"GATEWAY_UPSTREAM_CONNECT_TIMEOUT must be a positive duration",
 				"OPENAI_MODEL is set but OPENAI_API_KEY is missing",
 			},
+		},
+		{
+			name: "retry attempts out of range",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_RETRY_MAX_ATTEMPTS": "11",
+			},
+			want: []string{"GATEWAY_RETRY_MAX_ATTEMPTS must be an integer from 1 to 10"},
+		},
+		{
+			name: "zero retry attempts",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_RETRY_MAX_ATTEMPTS": "0",
+			},
+			want: []string{"GATEWAY_RETRY_MAX_ATTEMPTS must be an integer from 1 to 10"},
+		},
+		{
+			name: "invalid retry settings reported together",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_RETRY_MAX_ATTEMPTS": "three", "GATEWAY_RETRY_BASE_DELAY": "0s", "GATEWAY_RETRY_MAX_DELAY": "soon",
+			},
+			want: []string{
+				"GATEWAY_RETRY_MAX_ATTEMPTS must be an integer from 1 to 10",
+				"GATEWAY_RETRY_BASE_DELAY must be a positive duration",
+				"GATEWAY_RETRY_MAX_DELAY must be a positive duration",
+			},
+		},
+		{
+			name: "retry max delay below base delay",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_RETRY_BASE_DELAY": "2s", "GATEWAY_RETRY_MAX_DELAY": "1s",
+			},
+			want: []string{"GATEWAY_RETRY_MAX_DELAY must not be less than GATEWAY_RETRY_BASE_DELAY"},
 		},
 	}
 	for _, tt := range tests {

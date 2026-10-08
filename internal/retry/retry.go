@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -39,6 +40,7 @@ type Policy struct {
 type Provider struct {
 	next   llm.Provider
 	policy Policy
+	log    *slog.Logger
 
 	// jitter returns a random duration in [0, d]. sleep waits for d or
 	// until ctx is done. Tests replace both.
@@ -48,8 +50,9 @@ type Provider struct {
 
 var _ llm.Provider = (*Provider)(nil)
 
-// New returns a Provider that sends requests to next under policy.
-func New(next llm.Provider, policy Policy) (*Provider, error) {
+// New returns a Provider that sends requests to next under policy. Each
+// retry is logged to log; a nil log uses slog.Default.
+func New(next llm.Provider, policy Policy, log *slog.Logger) (*Provider, error) {
 	switch {
 	case next == nil:
 		return nil, errors.New("retry: nil provider")
@@ -60,7 +63,10 @@ func New(next llm.Provider, policy Policy) (*Provider, error) {
 	case policy.MaxDelay < policy.BaseDelay:
 		return nil, errors.New("retry: max delay must not be less than base delay")
 	}
-	return &Provider{next: next, policy: policy, jitter: fullJitter, sleep: sleep}, nil
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Provider{next: next, policy: policy, log: log, jitter: fullJitter, sleep: sleep}, nil
 }
 
 // Chat sends req to the wrapped provider, retrying retryable failures until
@@ -88,6 +94,7 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespo
 		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
 			return llm.ChatResponse{}, attempts(attempt, err)
 		}
+		p.logRetry(ctx, req.Model, attempt, delay, err)
 		if ctxErr := p.sleep(ctx, delay); ctxErr != nil {
 			return llm.ChatResponse{}, fmt.Errorf("%w while waiting to retry: %w", ctxErr, attempts(attempt, err))
 		}
@@ -123,6 +130,25 @@ func Retryable(err error) bool {
 	default:
 		return false
 	}
+}
+
+// logRetry records a failed attempt that will be retried. Like the
+// handler's failure log, it contains no prompt or completion content; err
+// is a *llm.ProviderError, which carries no upstream body.
+func (p *Provider) logRetry(ctx context.Context, model string, attempt int, delay time.Duration, err error) {
+	attrs := []slog.Attr{
+		slog.String("model", model),
+		slog.Int("attempt", attempt),
+		slog.Duration("retry_in", delay),
+	}
+	if pe, ok := errors.AsType[*llm.ProviderError](err); ok {
+		attrs = append(attrs,
+			slog.String("provider", pe.Provider),
+			slog.Int("upstream_status", pe.StatusCode),
+		)
+	}
+	attrs = append(attrs, slog.Any("error", err))
+	p.log.LogAttrs(ctx, slog.LevelWarn, "upstream attempt failed, retrying", attrs...)
 }
 
 // delay returns how long to wait after the given failed attempt:

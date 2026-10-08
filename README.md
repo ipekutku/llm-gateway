@@ -35,10 +35,10 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ### v0.2 — Timeouts and Retry Policy
 
-The second milestone makes calls to unreliable upstream providers safer:
+The second milestone makes calls to unreliable upstream providers safer. It is feature-complete:
 
 * explicit, configurable upstream timeouts: one time budget per request, plus connection-setup limits
-* bounded retries for transient failures: `429`, `502`, `503`, `504`, Anthropic's `529`, and failures to connect (`502` and `504` can come from a provider's proxy after the request reached the model, a small duplicate-generation risk that will be documented)
+* bounded retries for transient failures: `429`, `502`, `503`, `504`, Anthropic's `529`, and failures to connect (`502` and `504` can come from a provider's proxy after the request reached the model, a small duplicate-generation risk)
 * exponential backoff with jitter, honoring the provider's `Retry-After` header
 * no retries of timeouts or failures after the request was sent, because a chat completion is not idempotent and a retry could produce a second, separately billed generation
 * cancellation stops retries immediately; all attempts share the request's time budget
@@ -124,8 +124,11 @@ The `model` field must match a configured model exactly; the request is routed t
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
 | `GATEWAY_UPSTREAM_TIMEOUT` | Time limit for all upstream work on one request, as a Go duration such as `90s` or `2m`. Default `120s`. If it expires, the client gets `504 upstream_timeout`. |
 | `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Time limit for connecting to a provider (TCP dial and TLS handshake). Default `10s`. |
+| `GATEWAY_RETRY_MAX_ATTEMPTS` | Total attempts per request, including the first, from `1` to `10`. Default `3`. Set `1` to disable retries. |
+| `GATEWAY_RETRY_BASE_DELAY` | Longest wait before the first retry; it doubles for each further retry. The actual wait is random up to this value. Default `500ms`. |
+| `GATEWAY_RETRY_MAX_DELAY` | Cap on that doubling wait. Default `8s`. A provider's `Retry-After` can still ask for longer. |
 
-Startup fails if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, or if a timeout is not a positive duration. Error messages name the variables but never print their values.
+Startup fails if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, if a timeout or delay is not a positive duration, if the attempt count is outside 1–10, or if the maximum retry delay is less than the base delay. Error messages name the variables but never print their values.
 
 The model names above are examples. Any model the provider's API accepts can be configured. Both adapters are tested against fake servers built from the providers' documented API formats; they have not yet been verified against the live APIs.
 
@@ -147,7 +150,8 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 
 * One model per provider, matched by exact name; no aliases or wildcards.
 * Text only: no streaming, tool calls, images, or multiple choices.
-* No retries yet (planned for v0.2). A failed upstream call is returned to the client.
+* Retries can occasionally produce a duplicate, separately billed generation: a `502` or `504` from a provider's proxy may arrive after the model already answered. Other retried failures (`429`, `503`, `529`, connection failures) happen before the model runs. See [retry safety](docs/architecture.md#what-is-retried).
+* TLS handshake failures are not retried.
 * A request whose upstream timeout expires may still be billed by the provider for the work done before it was canceled.
 * No gateway authentication; run it only on a trusted network (planned for v0.4).
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
@@ -168,7 +172,7 @@ The same checks run automatically through GitHub Actions for pull requests and c
 
 ## Project Status
 
-🚧 **Early development** — v0.1 is feature-complete; v0.2 is in progress.
+🚧 **Early development** — v0.2 is feature-complete.
 
 ### v0.2
 
@@ -176,7 +180,7 @@ The same checks run automatically through GitHub Actions for pull requests and c
 |---|---|
 | Upstream timeouts: request time budget and connection-setup limits (`internal/httpapi`, `cmd/gateway`) | ✅ Done |
 | Retry policy: failure classification, backoff with jitter, `Retry-After` (`internal/retry`) | ✅ Done |
-| Retry configuration, wiring, and end-to-end tests (`cmd/gateway`) | ⏳ Next |
+| Retry configuration, wiring, and end-to-end tests (`cmd/gateway`) | ✅ Done |
 
 ### v0.1
 

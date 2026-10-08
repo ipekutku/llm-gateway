@@ -3,11 +3,13 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
+	"github.com/ipekutku/llm-gateway/internal/retry"
 )
 
 const (
@@ -21,6 +23,15 @@ const (
 	// defaultConnectTimeout bounds the TCP dial and, separately, the TLS
 	// handshake to an upstream when GATEWAY_UPSTREAM_CONNECT_TIMEOUT is unset.
 	defaultConnectTimeout = 10 * time.Second
+
+	// Retry defaults: up to two retries, waiting at most 0.5s and then 1s
+	// before them unless the upstream asks for longer.
+	defaultRetryMaxAttempts = 3
+	defaultRetryBaseDelay   = 500 * time.Millisecond
+	defaultRetryMaxDelay    = 8 * time.Second
+
+	// maxRetryAttempts bounds GATEWAY_RETRY_MAX_ATTEMPTS.
+	maxRetryAttempts = 10
 )
 
 // config is the gateway's startup configuration.
@@ -30,6 +41,8 @@ type config struct {
 	UpstreamTimeout time.Duration
 	// ConnectTimeout bounds establishing an upstream connection.
 	ConnectTimeout time.Duration
+	// Retry is applied to each provider.
+	Retry retry.Policy
 	// OpenAI and Anthropic are nil when the provider is disabled.
 	OpenAI    *providerConfig
 	Anthropic *providerConfig
@@ -57,6 +70,9 @@ func loadConfig(getenv func(string) string) (config, error) {
 		errs = append(errs, err)
 	}
 	if cfg.ConnectTimeout, err = loadDuration(getenv, "GATEWAY_UPSTREAM_CONNECT_TIMEOUT", defaultConnectTimeout); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.Retry, err = loadRetry(getenv); err != nil {
 		errs = append(errs, err)
 	}
 	if cfg.OpenAI, err = loadProvider(getenv, "OPENAI_MODEL", "OPENAI_API_KEY", openai.DefaultBaseURL); err != nil {
@@ -106,4 +122,42 @@ func loadDuration(getenv func(string) string, name string, def time.Duration) (t
 		return 0, fmt.Errorf("%s must be a positive duration such as 30s", name)
 	}
 	return d, nil
+}
+
+// loadRetry reads the retry policy. MaxDelay must not be less than
+// BaseDelay, which is checked only when both are valid.
+func loadRetry(getenv func(string) string) (retry.Policy, error) {
+	var p retry.Policy
+	var errs []error
+	var err error
+	if p.MaxAttempts, err = loadAttempts(getenv, "GATEWAY_RETRY_MAX_ATTEMPTS"); err != nil {
+		errs = append(errs, err)
+	}
+	baseDelay, baseErr := loadDuration(getenv, "GATEWAY_RETRY_BASE_DELAY", defaultRetryBaseDelay)
+	maxDelay, maxErr := loadDuration(getenv, "GATEWAY_RETRY_MAX_DELAY", defaultRetryMaxDelay)
+	switch {
+	case baseErr != nil || maxErr != nil:
+		errs = append(errs, baseErr, maxErr)
+	case maxDelay < baseDelay:
+		errs = append(errs, errors.New("GATEWAY_RETRY_MAX_DELAY must not be less than GATEWAY_RETRY_BASE_DELAY"))
+	}
+	if err := errors.Join(errs...); err != nil {
+		return retry.Policy{}, err
+	}
+	p.BaseDelay, p.MaxDelay = baseDelay, maxDelay
+	return p, nil
+}
+
+// loadAttempts parses an attempt count from 1 to maxRetryAttempts,
+// returning the default if the variable is absent.
+func loadAttempts(getenv func(string) string, name string) (int, error) {
+	v := strings.TrimSpace(getenv(name))
+	if v == "" {
+		return defaultRetryMaxAttempts, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > maxRetryAttempts {
+		return 0, fmt.Errorf("%s must be an integer from 1 to %d", name, maxRetryAttempts)
+	}
+	return n, nil
 }
