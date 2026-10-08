@@ -175,8 +175,8 @@ The same checks run automatically through GitHub Actions for pull requests and c
 | Component | Status |
 |---|---|
 | Upstream timeouts: request time budget and connection-setup limits (`internal/httpapi`, `cmd/gateway`) | ✅ Done |
-| Retry policy: failure classification, backoff with jitter, `Retry-After` (`internal/retry`) | ⏳ Next |
-| Retry configuration, wiring, end-to-end tests, and retry-safety documentation (`cmd/gateway`) | ⏳ Planned |
+| Retry policy: failure classification, backoff with jitter, `Retry-After` (`internal/retry`) | ✅ Done |
+| Retry configuration, wiring, and end-to-end tests (`cmd/gateway`) | ⏳ Next |
 
 ### v0.1
 
