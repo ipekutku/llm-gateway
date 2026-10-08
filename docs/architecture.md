@@ -1,12 +1,12 @@
 # Architecture
 
-This document describes the architecture as implemented in v0.1: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, and static routing. Milestone 2 (v0.2) work in progress adds upstream timeouts and a retry policy; the retry policy is implemented but not yet wired into the gateway.
+This document describes the architecture as implemented in v0.2: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing, upstream timeouts, and bounded retries.
 
 ## Request flow
 
 ```text
-HTTP request → httpapi → routing → provider adapter → upstream HTTP request
-                  └──────── shared internal/llm types ────────┘
+HTTP request → httpapi → routing → retry → provider adapter → upstream HTTP request
+                  └──────────── shared internal/llm types ────────────┘
 ```
 
 The incoming request's `context.Context` is passed through every step to the outbound upstream request. The handler derives it once, adding the upstream deadline (see [Upstream timeouts](#upstream-timeouts)); nothing below the handler replaces or detaches it.
@@ -208,15 +208,18 @@ Configuration is read once at startup from the environment in `cmd/gateway`. The
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`, so the unauthenticated gateway is not exposed by accident. |
 | `GATEWAY_UPSTREAM_TIMEOUT` | Upstream time budget per request, as a Go duration (`90s`, `2m`). Default `120s`. |
 | `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Limit on the upstream TCP dial and, separately, the TLS handshake. Default `10s`. |
+| `GATEWAY_RETRY_MAX_ATTEMPTS` | Total attempts per request, including the first, from 1 to 10. Default `3`; `1` disables retries. |
+| `GATEWAY_RETRY_BASE_DELAY` | Backoff ceiling before the first retry, doubling per retry. Default `500ms`. |
+| `GATEWAY_RETRY_MAX_DELAY` | Cap on the backoff ceiling; must not be less than the base delay. Default `8s`. |
 
 - **Absent means unset or blank.** A whitespace-only value counts as absent. Non-blank values, including model names, are used unchanged.
 - **Startup fails if no provider is enabled, if a pair is incomplete, or if both providers declare the same model.** All pair errors are reported together. Errors name the variables and never include their values. An enabled route is never silently dropped.
 - **Base URLs are fixed** to the providers' production HTTPS origins. Tests inject local fake servers through the same `config` struct, but there is no environment variable for them in v0.1.
 - **Model IDs are not defaulted.** A built-in model name would go stale; the operator always chooses.
-- **Durations must be positive.** An unparsable, zero, or negative duration fails startup and is reported together with any other configuration errors.
+- **Durations must be positive.** An unparsable, zero, or negative duration, or an attempt count outside 1–10, fails startup and is reported together with any other configuration errors.
 - The startup log names the configured models, never the keys.
 
-`newHandler` builds one shared upstream `http.Client`, one adapter per enabled provider, the router, and the HTTP handler.
+`newHandler` builds one shared upstream `http.Client`, one adapter per enabled provider wrapped in a `retry.Provider`, the router, and the HTTP handler. The startup log includes the timeouts and the retry policy.
 
 ## Upstream timeouts
 
@@ -237,7 +240,7 @@ Decisions:
 
 ## Retries
 
-`retry.Provider` wraps one provider and implements `llm.Provider` itself. It is not yet wired into `cmd/gateway`; that, with its configuration, is the next Milestone 2 change. The intended placement is around each adapter, below the router, so Milestone 3 fallback can sit above it without nesting retry loops inside each other.
+`retry.Provider` wraps one provider and implements `llm.Provider` itself. `cmd/gateway` wraps each adapter, below the router, with the policy from configuration. Retrying per provider keeps the policy next to the upstream it protects; Milestone 3 fallback can then sit above it without nesting retry loops inside each other.
 
 ### Policy
 
@@ -271,6 +274,7 @@ A chat completion is not idempotent. An attempt that reached the model may have 
 - **One budget.** All attempts and waits share the request context, so the handler's upstream timeout bounds the whole sequence. There is no per-attempt timeout: an attempt that times out is not retried, so a separate per-attempt limit would only shorten the budget.
 - **No hopeless waits.** A wait that would end at or after the context deadline is not started, and the last failure is returned at once. A 429 whose `Retry-After` exceeds the remaining budget therefore reaches the client as 429 immediately.
 - **Cancellation stops retries.** If the context is already done after an attempt, no wait starts. A cancellation or deadline during a wait ends it at once; the error then wraps both the context error and the last upstream failure, so the handler's mapping (client gone, or 504) is unchanged.
+- **Retries are logged.** Each retry logs one warn line, `upstream attempt failed, retrying`, with model, provider, attempt number, upstream status, the wait (`retry_in`), and the error. A request that recovers is therefore still visible. As with the handler's failure log, no prompt or completion content or upstream body is logged.
 - **Errors stay inspectable.** After more than one attempt, the error message reports the count (`after 3 attempts: …`) and wraps the last failure, so its `*llm.ProviderError`, status, and the handler's error mapping are preserved.
 
 ## Server lifecycle
@@ -290,6 +294,6 @@ All tests run without credentials or network access, using `httptest` servers.
 |---|---|
 | `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
-| `cmd/gateway` | Configuration rules, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, client cancellation and upstream timeouts reaching the upstream, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |
+| `cmd/gateway` | Configuration rules, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, retries (recovery for each retryable status, exhaustion, non-retryable statuses, `Retry-After` beyond the budget, refused connections, and client cancellation during a retry wait), client cancellation and upstream timeouts reaching the upstream, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |
 
 Tests coordinate with channels. Timeouts are used only as failure guards. CI runs `gofmt`, `go vet`, `go test -race`, and `go build ./cmd/gateway`.

@@ -10,10 +10,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ipekutku/llm-gateway/internal/retry"
 )
 
 // guard bounds how long a test waits for something that should happen
@@ -80,7 +84,11 @@ func gateway(t *testing.T, oa, an *upstream) *httptest.Server {
 	return gatewayWith(t, oa, an, func(*config) {})
 }
 
-// gatewayWith is gateway with the configuration adjusted by edit.
+// fastRetry keeps retry waits negligible in tests that do not exercise them.
+var fastRetry = retry.Policy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}
+
+// gatewayWith is gateway with the configuration adjusted by edit. Retries
+// use fastRetry unless edit changes them.
 func gatewayWith(t *testing.T, oa, an *upstream, edit func(*config)) *httptest.Server {
 	t.Helper()
 	cfg, err := loadConfig(env(map[string]string{
@@ -92,6 +100,7 @@ func gatewayWith(t *testing.T, oa, an *upstream, edit func(*config)) *httptest.S
 	}
 	cfg.OpenAI.BaseURL = oa.srv.URL
 	cfg.Anthropic.BaseURL = an.srv.URL
+	cfg.Retry = fastRetry
 	edit(&cfg)
 
 	h, err := newHandler(cfg, nil, slog.New(slog.DiscardHandler))
@@ -337,6 +346,160 @@ func TestRequestPathPropagatesClientCancellation(t *testing.T) {
 	}
 }
 
+// sequence returns a handler that answers the nth request with the nth
+// status, repeating the last one. 200 answers with body; other statuses
+// carry retryAfter, if set, as a Retry-After header.
+func sequence(body, retryAfter string, statuses ...int) http.HandlerFunc {
+	var n atomic.Int64
+	return func(w http.ResponseWriter, r *http.Request) {
+		status := statuses[min(int(n.Add(1))-1, len(statuses)-1)]
+		if status != http.StatusOK && retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		reply(status, body)(w, r)
+	}
+}
+
+func TestRequestPathRetries(t *testing.T) {
+	tests := []struct {
+		name       string
+		statuses   []int
+		retryAfter string
+		status     int
+		code       string
+		requests   int
+	}{
+		{"recovers from 503", []int{503, 503, 200}, "", http.StatusOK, "", 3},
+		{"recovers from 502", []int{502, 200}, "", http.StatusOK, "", 2},
+		{"recovers from 504", []int{504, 200}, "", http.StatusOK, "", 2},
+		{"recovers from 529", []int{529, 200}, "", http.StatusOK, "", 2},
+		{"recovers from 429", []int{429, 200}, "", http.StatusOK, "", 2},
+		{"exhausts attempts on 429", []int{429}, "", http.StatusTooManyRequests, "provider_rate_limited", 3},
+		{"exhausts attempts on 503", []int{503}, "", http.StatusBadGateway, "upstream_error", 3},
+		{"does not retry 400", []int{400, 200}, "", http.StatusBadRequest, "invalid_request", 1},
+		{"does not retry 500", []int{500, 200}, "", http.StatusBadGateway, "upstream_error", 1},
+		{"does not retry 401", []int{401, 200}, "", http.StatusBadGateway, "upstream_error", 1},
+		{"Retry-After beyond the budget returns at once", []int{429, 200}, "3600", http.StatusTooManyRequests, "provider_rate_limited", 1},
+	}
+	for _, provider := range []struct {
+		model, path, body string
+	}{
+		{"gpt-4o", "/v1/chat/completions", openaiReply},
+		{"claude-opus-5-5", "/v1/messages", anthropicReply},
+	} {
+		for _, tt := range tests {
+			t.Run(provider.model+"/"+tt.name, func(t *testing.T) {
+				oa := newUpstream(t, "/v1/chat/completions", reply(http.StatusOK, openaiReply))
+				an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+				target := newUpstream(t, provider.path, sequence(provider.body, tt.retryAfter, tt.statuses...))
+				if provider.path == "/v1/messages" {
+					an = target
+				} else {
+					oa = target
+				}
+				gw := gateway(t, oa, an)
+
+				resp, data, err := postChat(t, context.Background(), gw.URL, chatBody(provider.model))
+				if err != nil {
+					t.Fatalf("POST error = %v", err)
+				}
+				if resp.StatusCode != tt.status {
+					t.Errorf("status = %d, want %d (body %s)", resp.StatusCode, tt.status, data)
+				}
+				if tt.code != "" {
+					var got struct {
+						Error struct{ Code string } `json:"error"`
+					}
+					if err := json.Unmarshal(data, &got); err != nil || got.Error.Code != tt.code {
+						t.Errorf("body = %s, want error code %q", data, tt.code)
+					}
+				}
+				if got := len(target.received()); got != tt.requests {
+					t.Errorf("upstream received %d requests, want %d", got, tt.requests)
+				}
+				// Every attempt resends the same request.
+				for i, r := range target.received() {
+					if !reflect.DeepEqual(r.Body, target.received()[0].Body) {
+						t.Errorf("attempt %d body = %v, want the first attempt's body", i+1, r.Body)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRequestPathRetriesConnectionFailures(t *testing.T) {
+	// A closed listener refuses connections, so every attempt fails to
+	// dial. Attempts are counted through the retry log.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	refused := "http://" + ln.Addr().String()
+	ln.Close()
+
+	cfg := gatewayConfig(newUpstream(t, "/v1/chat/completions", reply(http.StatusOK, openaiReply)),
+		newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply)))
+	cfg.OpenAI.BaseURL = refused
+	var logs syncBuffer
+	h, err := newHandler(cfg, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("newHandler() error = %v", err)
+	}
+	gw := httptest.NewServer(h)
+	t.Cleanup(gw.Close)
+
+	resp, data, err := postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+	if err != nil {
+		t.Fatalf("POST error = %v", err)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 (body %s)", resp.StatusCode, data)
+	}
+	if n := strings.Count(logs.String(), "upstream attempt failed, retrying"); n != fastRetry.MaxAttempts-1 {
+		t.Errorf("logged %d retries, want %d:\n%s", n, fastRetry.MaxAttempts-1, logs.String())
+	}
+	if !strings.Contains(logs.String(), "after 3 attempts") {
+		t.Errorf("failure log does not report the attempt count:\n%s", logs.String())
+	}
+}
+
+func TestRequestPathClientCancellationStopsRetries(t *testing.T) {
+	// The upstream asks for a long wait, and the budget allows it, so the
+	// gateway is waiting to retry when the client goes away.
+	first := make(chan struct{})
+	var once sync.Once
+	oa := newUpstream(t, "/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(first) })
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+	cfg := gatewayConfig(oa, an)
+	cfg.UpstreamTimeout = 2 * time.Hour
+	h, err := newHandler(cfg, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("newHandler() error = %v", err)
+	}
+	handlerDone := make(chan struct{})
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		h.ServeHTTP(w, r)
+	}))
+	t.Cleanup(gw.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _, _, _ = postChat(t, ctx, gw.URL, chatBody("gpt-4o")) }()
+
+	waitFor(t, first, "the first upstream attempt")
+	cancel()
+	waitFor(t, handlerDone, "the gateway to stop waiting and return")
+	if got := len(oa.received()); got != 1 {
+		t.Errorf("upstream received %d requests, want 1", got)
+	}
+}
+
 func TestRequestPathTimesOutSlowUpstream(t *testing.T) {
 	for _, tt := range []struct {
 		model, path string
@@ -551,6 +714,7 @@ func gatewayConfig(oa, an *upstream) config {
 		Addr:            "127.0.0.1:0",
 		UpstreamTimeout: defaultUpstreamTimeout,
 		ConnectTimeout:  defaultConnectTimeout,
+		Retry:           fastRetry,
 		OpenAI:          &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: oa.srv.URL},
 		Anthropic:       &providerConfig{Model: "claude-opus-5-5", APIKey: anthropicKey, BaseURL: an.srv.URL},
 	}

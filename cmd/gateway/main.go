@@ -19,6 +19,7 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/llm"
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
+	"github.com/ipekutku/llm-gateway/internal/retry"
 	"github.com/ipekutku/llm-gateway/internal/routing"
 )
 
@@ -74,6 +75,9 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) e
 	attrs = append(attrs,
 		slog.Duration("upstream_timeout", cfg.UpstreamTimeout),
 		slog.Duration("upstream_connect_timeout", cfg.ConnectTimeout),
+		slog.Int("retry_max_attempts", cfg.Retry.MaxAttempts),
+		slog.Duration("retry_base_delay", cfg.Retry.BaseDelay),
+		slog.Duration("retry_max_delay", cfg.Retry.MaxDelay),
 	)
 	logger.Info("gateway listening", attrs...)
 
@@ -88,6 +92,7 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) e
 }
 
 // newHandler builds the provider clients, router, and HTTP handler for cfg.
+// Each provider client is wrapped with the retry policy, below the router.
 // A nil httpClient uses a client built by newUpstreamClient.
 func newHandler(cfg config, httpClient *http.Client, logger *slog.Logger) (http.Handler, error) {
 	if httpClient == nil {
@@ -99,14 +104,18 @@ func newHandler(cfg config, httpClient *http.Client, logger *slog.Logger) (http.
 		if err != nil {
 			return nil, err
 		}
-		routes[p.Model] = c
+		if routes[p.Model], err = retry.New(c, cfg.Retry, logger); err != nil {
+			return nil, err
+		}
 	}
 	if p := cfg.Anthropic; p != nil {
 		c, err := anthropic.New(p.APIKey, p.BaseURL, httpClient)
 		if err != nil {
 			return nil, err
 		}
-		routes[p.Model] = c
+		if routes[p.Model], err = retry.New(c, cfg.Retry, logger); err != nil {
+			return nil, err
+		}
 	}
 
 	router, err := routing.New(routes)
