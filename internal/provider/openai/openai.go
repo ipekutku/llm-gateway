@@ -30,6 +30,10 @@ const (
 	// maxResponseBytes bounds how much of an upstream response is read.
 	maxResponseBytes = 4 << 20
 
+	// maxDrainBytes bounds how much of an error response is read and
+	// discarded so the connection can be reused. Larger bodies close it.
+	maxDrainBytes = 64 << 10
+
 	// maxRetryAfterSeconds caps a parsed Retry-After value.
 	maxRetryAfterSeconds = 24 * 60 * 60
 )
@@ -141,8 +145,10 @@ func (c *Client) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespons
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		// The body is not read: it may echo request content and must not
-		// reach errors or logs.
+		// The body may echo request content and must not reach errors or
+		// logs. It is only drained, so the connection can be reused by a
+		// retry instead of paying for a new TCP and TLS handshake.
+		_, _ = io.CopyN(io.Discard, resp.Body, maxDrainBytes)
 		pe := upstreamError(ctx, resp.StatusCode, errors.New("unexpected status"))
 		pe.RetryAfter = retryAfter(resp.Header)
 		return llm.ChatResponse{}, pe
