@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
@@ -23,6 +24,12 @@ func TestLoadConfig(t *testing.T) {
 	openaiCfg := &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: openai.DefaultBaseURL}
 	anthropicCfg := &providerConfig{Model: "claude-opus-5-5", APIKey: anthropicKey, BaseURL: anthropic.DefaultBaseURL}
 
+	// withDefaults fills in the default timeouts.
+	withDefaults := func(c config) config {
+		c.UpstreamTimeout, c.ConnectTimeout = defaultUpstreamTimeout, defaultConnectTimeout
+		return c
+	}
+
 	tests := []struct {
 		name string
 		vars map[string]string
@@ -31,12 +38,12 @@ func TestLoadConfig(t *testing.T) {
 		{
 			name: "openai only",
 			vars: map[string]string{"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey},
-			want: config{Addr: defaultAddr, OpenAI: openaiCfg},
+			want: withDefaults(config{Addr: defaultAddr, OpenAI: openaiCfg}),
 		},
 		{
 			name: "anthropic only",
 			vars: map[string]string{"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey},
-			want: config{Addr: defaultAddr, Anthropic: anthropicCfg},
+			want: withDefaults(config{Addr: defaultAddr, Anthropic: anthropicCfg}),
 		},
 		{
 			name: "both providers and custom address",
@@ -45,7 +52,7 @@ func TestLoadConfig(t *testing.T) {
 				"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey,
 				"GATEWAY_ADDR": ":9090",
 			},
-			want: config{Addr: ":9090", OpenAI: openaiCfg, Anthropic: anthropicCfg},
+			want: withDefaults(config{Addr: ":9090", OpenAI: openaiCfg, Anthropic: anthropicCfg}),
 		},
 		{
 			name: "blank variables count as absent",
@@ -54,12 +61,28 @@ func TestLoadConfig(t *testing.T) {
 				"ANTHROPIC_MODEL": " ", "ANTHROPIC_API_KEY": "",
 				"GATEWAY_ADDR": "  ",
 			},
-			want: config{Addr: defaultAddr, OpenAI: openaiCfg},
+			want: withDefaults(config{Addr: defaultAddr, OpenAI: openaiCfg}),
 		},
 		{
 			name: "model forwarded unchanged",
 			vars: map[string]string{"OPENAI_MODEL": " gpt-4o ", "OPENAI_API_KEY": openaiKey},
-			want: config{Addr: defaultAddr, OpenAI: &providerConfig{Model: " gpt-4o ", APIKey: openaiKey, BaseURL: openai.DefaultBaseURL}},
+			want: withDefaults(config{Addr: defaultAddr, OpenAI: &providerConfig{Model: " gpt-4o ", APIKey: openaiKey, BaseURL: openai.DefaultBaseURL}}),
+		},
+		{
+			name: "custom timeouts",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_UPSTREAM_TIMEOUT": "45s", "GATEWAY_UPSTREAM_CONNECT_TIMEOUT": " 1500ms ",
+			},
+			want: config{Addr: defaultAddr, OpenAI: openaiCfg, UpstreamTimeout: 45 * time.Second, ConnectTimeout: 1500 * time.Millisecond},
+		},
+		{
+			name: "blank timeouts use defaults",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_UPSTREAM_TIMEOUT": " ", "GATEWAY_UPSTREAM_CONNECT_TIMEOUT": "",
+			},
+			want: withDefaults(config{Addr: defaultAddr, OpenAI: openaiCfg}),
 		},
 	}
 	for _, tt := range tests {
@@ -124,6 +147,26 @@ func TestLoadConfigErrors(t *testing.T) {
 				"ANTHROPIC_MODEL": "same-model", "ANTHROPIC_API_KEY": anthropicKey,
 			},
 			want: []string{"OPENAI_MODEL and ANTHROPIC_MODEL must be different"},
+		},
+		{
+			name: "unparsable upstream timeout",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_UPSTREAM_TIMEOUT": "120",
+			},
+			want: []string{"GATEWAY_UPSTREAM_TIMEOUT must be a positive duration"},
+		},
+		{
+			name: "non-positive timeouts reported with other errors",
+			vars: map[string]string{
+				"OPENAI_MODEL":             "gpt-4o",
+				"GATEWAY_UPSTREAM_TIMEOUT": "0s", "GATEWAY_UPSTREAM_CONNECT_TIMEOUT": "-1s",
+			},
+			want: []string{
+				"GATEWAY_UPSTREAM_TIMEOUT must be a positive duration",
+				"GATEWAY_UPSTREAM_CONNECT_TIMEOUT must be a positive duration",
+				"OPENAI_MODEL is set but OPENAI_API_KEY is missing",
+			},
 		},
 	}
 	for _, tt := range tests {

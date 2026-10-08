@@ -4,17 +4,32 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
 )
 
-// defaultAddr is the listen address when GATEWAY_ADDR is unset.
-const defaultAddr = "127.0.0.1:8080"
+const (
+	// defaultAddr is the listen address when GATEWAY_ADDR is unset.
+	defaultAddr = "127.0.0.1:8080"
+
+	// defaultUpstreamTimeout bounds all upstream work for one request when
+	// GATEWAY_UPSTREAM_TIMEOUT is unset.
+	defaultUpstreamTimeout = 120 * time.Second
+
+	// defaultConnectTimeout bounds the TCP dial and, separately, the TLS
+	// handshake to an upstream when GATEWAY_UPSTREAM_CONNECT_TIMEOUT is unset.
+	defaultConnectTimeout = 10 * time.Second
+)
 
 // config is the gateway's startup configuration.
 type config struct {
 	Addr string
+	// UpstreamTimeout bounds all upstream work for one request.
+	UpstreamTimeout time.Duration
+	// ConnectTimeout bounds establishing an upstream connection.
+	ConnectTimeout time.Duration
 	// OpenAI and Anthropic are nil when the provider is disabled.
 	OpenAI    *providerConfig
 	Anthropic *providerConfig
@@ -38,6 +53,12 @@ func loadConfig(getenv func(string) string) (config, error) {
 
 	var errs []error
 	var err error
+	if cfg.UpstreamTimeout, err = loadDuration(getenv, "GATEWAY_UPSTREAM_TIMEOUT", defaultUpstreamTimeout); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.ConnectTimeout, err = loadDuration(getenv, "GATEWAY_UPSTREAM_CONNECT_TIMEOUT", defaultConnectTimeout); err != nil {
+		errs = append(errs, err)
+	}
 	if cfg.OpenAI, err = loadProvider(getenv, "OPENAI_MODEL", "OPENAI_API_KEY", openai.DefaultBaseURL); err != nil {
 		errs = append(errs, err)
 	}
@@ -71,4 +92,18 @@ func loadProvider(getenv func(string) string, modelVar, keyVar, baseURL string) 
 		return nil, fmt.Errorf("%s is set but %s is missing", modelVar, keyVar)
 	}
 	return &providerConfig{Model: model, APIKey: key, BaseURL: baseURL}, nil
+}
+
+// loadDuration parses a positive Go duration such as "90s", returning def
+// if the variable is absent.
+func loadDuration(getenv func(string) string, name string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(getenv(name))
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration such as 30s", name)
+	}
+	return d, nil
 }

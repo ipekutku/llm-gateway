@@ -77,6 +77,12 @@ func reply(status int, body string) http.HandlerFunc {
 // at the given fake upstreams, behind an httptest.Server.
 func gateway(t *testing.T, oa, an *upstream) *httptest.Server {
 	t.Helper()
+	return gatewayWith(t, oa, an, func(*config) {})
+}
+
+// gatewayWith is gateway with the configuration adjusted by edit.
+func gatewayWith(t *testing.T, oa, an *upstream, edit func(*config)) *httptest.Server {
+	t.Helper()
 	cfg, err := loadConfig(env(map[string]string{
 		"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
 		"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey,
@@ -86,6 +92,7 @@ func gateway(t *testing.T, oa, an *upstream) *httptest.Server {
 	}
 	cfg.OpenAI.BaseURL = oa.srv.URL
 	cfg.Anthropic.BaseURL = an.srv.URL
+	edit(&cfg)
 
 	h, err := newHandler(cfg, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
@@ -330,6 +337,118 @@ func TestRequestPathPropagatesClientCancellation(t *testing.T) {
 	}
 }
 
+func TestRequestPathTimesOutSlowUpstream(t *testing.T) {
+	for _, tt := range []struct {
+		model, path string
+	}{
+		{"gpt-4o", "/v1/chat/completions"},
+		{"claude-opus-5-5", "/v1/messages"},
+	} {
+		t.Run(tt.model, func(t *testing.T) {
+			slow := newBlockingHandler(t, "")
+			oa := newUpstream(t, "/v1/chat/completions", reply(http.StatusOK, openaiReply))
+			an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+			if tt.path == "/v1/messages" {
+				an = newUpstream(t, tt.path, slow.ServeHTTP)
+			} else {
+				oa = newUpstream(t, tt.path, slow.ServeHTTP)
+			}
+			gw := gatewayWith(t, oa, an, func(c *config) { c.UpstreamTimeout = 50 * time.Millisecond })
+
+			resp, data, err := postChat(t, context.Background(), gw.URL, chatBody(tt.model))
+			if err != nil {
+				t.Fatalf("POST error = %v", err)
+			}
+			if resp.StatusCode != http.StatusGatewayTimeout {
+				t.Errorf("status = %d, want 504 (body %s)", resp.StatusCode, data)
+			}
+			var got struct {
+				Error struct{ Code string } `json:"error"`
+			}
+			if err := json.Unmarshal(data, &got); err != nil || got.Error.Code != "upstream_timeout" {
+				t.Errorf("body = %s, want error code upstream_timeout", data)
+			}
+			// The timed-out upstream request is canceled, not left running.
+			waitFor(t, slow.canceled, "cancellation to reach the upstream")
+		})
+	}
+}
+
+func TestUpstreamClientBoundsConnectionSetup(t *testing.T) {
+	c := newUpstreamClient(config{ConnectTimeout: 3 * time.Second})
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport = %T, want *http.Transport", c.Transport)
+	}
+	if tr == http.DefaultTransport {
+		t.Error("upstream client shares http.DefaultTransport")
+	}
+	if tr.DialContext == nil || tr.TLSHandshakeTimeout != 3*time.Second || tr.IdleConnTimeout != idleConnTimeout {
+		t.Errorf("transport timeouts: dialer set %v, TLS %v, idle %v; want dialer, 3s, %v",
+			tr.DialContext != nil, tr.TLSHandshakeTimeout, tr.IdleConnTimeout, idleConnTimeout)
+	}
+	if c.Timeout != 0 {
+		t.Errorf("client Timeout = %v, want 0: the request context carries the deadline", c.Timeout)
+	}
+}
+
+func TestUpstreamClientTimesOutStalledTLSHandshake(t *testing.T) {
+	// The listener accepts TCP connections but never answers the TLS
+	// handshake, like an overloaded or broken upstream.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	accepted := make(chan struct{}, 1)
+	var conns []net.Conn
+	var mu sync.Mutex
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			select {
+			case accepted <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+
+	c := newUpstreamClient(config{ConnectTimeout: 50 * time.Millisecond})
+	// guard is only a failure guard: the handshake timeout must fire first.
+	ctx, cancel := context.WithTimeout(context.Background(), guard)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+ln.Addr().String()+"/v1/messages", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+
+	resp, err := c.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("Do() error = nil, want TLS handshake timeout")
+	}
+	waitFor(t, accepted, "the TCP connection to be accepted")
+	if !strings.Contains(err.Error(), "TLS handshake timeout") {
+		t.Errorf("Do() error = %v, want TLS handshake timeout", err)
+	}
+	if ctx.Err() != nil {
+		t.Errorf("request context expired (%v); the connect timeout did not fire", ctx.Err())
+	}
+}
+
 // startServe runs serve with the gateway handler on a free local port. The
 // shuttingDown channel is closed once graceful shutdown has begun.
 func startServe(t *testing.T, handler http.Handler, timeout time.Duration) (url string, cancel context.CancelFunc, shuttingDown <-chan struct{}, result <-chan error) {
@@ -429,9 +548,11 @@ func TestServeCutsOffRequestsAfterShutdownTimeout(t *testing.T) {
 
 func gatewayConfig(oa, an *upstream) config {
 	return config{
-		Addr:      "127.0.0.1:0",
-		OpenAI:    &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: oa.srv.URL},
-		Anthropic: &providerConfig{Model: "claude-opus-5-5", APIKey: anthropicKey, BaseURL: an.srv.URL},
+		Addr:            "127.0.0.1:0",
+		UpstreamTimeout: defaultUpstreamTimeout,
+		ConnectTimeout:  defaultConnectTimeout,
+		OpenAI:          &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: oa.srv.URL},
+		Anthropic:       &providerConfig{Model: "claude-opus-5-5", APIKey: anthropicKey, BaseURL: an.srv.URL},
 	}
 }
 

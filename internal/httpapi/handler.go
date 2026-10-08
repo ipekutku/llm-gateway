@@ -4,6 +4,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -19,24 +20,32 @@ import (
 const ChatCompletionsPath = "/v1/chat/completions"
 
 type handler struct {
-	provider llm.Provider
-	log      *slog.Logger
+	provider        llm.Provider
+	upstreamTimeout time.Duration
+	log             *slog.Logger
 }
 
 // New returns the gateway's HTTP handler. It serves POST
 // /v1/chat/completions and sends every request to provider, which is
 // normally the router. A nil log uses slog.Default.
 //
+// upstreamTimeout bounds each provider call, covering all upstream work for
+// one request. It must be positive. When it expires while the client is
+// still connected, the response is 504.
+//
 // Requests to other paths receive 404, and other methods on the endpoint
 // receive 405 with an Allow header.
-func New(provider llm.Provider, log *slog.Logger) (http.Handler, error) {
+func New(provider llm.Provider, upstreamTimeout time.Duration, log *slog.Logger) (http.Handler, error) {
 	if provider == nil {
 		return nil, errors.New("httpapi: nil provider")
+	}
+	if upstreamTimeout <= 0 {
+		return nil, errors.New("httpapi: upstream timeout must be positive")
 	}
 	if log == nil {
 		log = slog.Default()
 	}
-	h := &handler{provider: provider, log: log}
+	h := &handler{provider: provider, upstreamTimeout: upstreamTimeout, log: log}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+ChatCompletionsPath, h.chatCompletions)
@@ -63,7 +72,10 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatRequest) {
-	resp, err := h.provider.Chat(r.Context(), req)
+	ctx, cancel := context.WithTimeout(r.Context(), h.upstreamTimeout)
+	defer cancel()
+
+	resp, err := h.provider.Chat(ctx, req)
 	if err != nil {
 		if r.Context().Err() != nil {
 			// The client is gone; there is nobody to write a response to.
