@@ -154,6 +154,7 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 * TLS handshake failures are not retried.
 * A request whose upstream timeout expires may still be billed by the provider for the work done before it was canceled.
 * No gateway authentication; run it only on a trusted network (planned for v0.4).
+* Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
 
 ## Development
@@ -206,11 +207,11 @@ v0.3  Provider fallback + circuit breakers
   ↓
 v0.4  Authentication + rate limiting
   ↓
-v0.5  Usage + cost tracking
+v0.5  Usage + cost tracking + PostgreSQL
   ↓
 v0.6  Prometheus + OpenTelemetry
   ↓
-v0.7  PostgreSQL + Redis
+v0.7  Redis + multi-instance behavior
   ↓
 v0.8  Load testing + performance work
   ↓
