@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -380,6 +381,31 @@ func TestChatUpstreamStatus(t *testing.T) {
 				t.Errorf("error exposes upstream body or key: %v", err)
 			}
 		})
+	}
+}
+
+func TestChatReusesConnectionAfterErrorStatus(t *testing.T) {
+	var conns atomic.Int64
+	srv := httptest.NewUnstartedServer(respond(http.StatusServiceUnavailable, `{"error":"overloaded"}`))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	c, err := New(testKey, srv.URL, srv.Client())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	for range 3 {
+		_, err := c.Chat(context.Background(), testRequest)
+		assertProviderError(t, err, http.StatusServiceUnavailable)
+	}
+
+	if got := conns.Load(); got != 1 {
+		t.Errorf("3 failed requests used %d connections, want 1", got)
 	}
 }
 
