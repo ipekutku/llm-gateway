@@ -76,7 +76,7 @@ This project prioritizes:
 
 ## Running Locally
 
-Requires Go 1.26 or later. Configure at least one provider and start the gateway:
+Requires Go 1.26.9 or later. Configure at least one provider and start the gateway:
 
 ```bash
 export OPENAI_MODEL=gpt-4o
@@ -159,11 +159,12 @@ Run the verification suite locally with:
 ```bash
 gofmt -l .
 go vet ./...
-go test -race ./...
+go test -race -timeout 2m ./...
 go build ./cmd/gateway
+go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 ```
 
-The same checks run automatically through GitHub Actions for pull requests and changes to `main`. Tests use local fake provider servers and need no API keys or network access.
+The same checks run automatically through GitHub Actions for pull requests and changes to `main`. Tests use local fake provider servers and need no API keys or network access; only the vulnerability check downloads its tool and the vulnerability database.
 
 ## Project Status
 
