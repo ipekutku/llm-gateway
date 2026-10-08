@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its outdated run. Runs on main are
+# never canceled, so every merge is verified.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: Test
@@ -22,7 +28,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.mod
@@ -46,3 +52,8 @@ jobs:
 
       - name: Build
         run: go build ./cmd/gateway
+
+      # Reports known vulnerabilities, including in the Go standard library,
+      # that the code can reach. Pinned for reproducible results.
+      - name: Vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
