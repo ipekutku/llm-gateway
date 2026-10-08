@@ -55,11 +55,20 @@ func (p *recordingProvider) Chat(ctx context.Context, req llm.ChatRequest) (llm.
 	return okProvider(ctx, req)
 }
 
+// testTimeout is the upstream timeout for tests that do not exercise it. It
+// is long enough never to expire.
+const testTimeout = time.Minute
+
 // newHandler returns a handler for p and a buffer that collects its logs.
 func newHandler(t *testing.T, p llm.Provider) (http.Handler, *bytes.Buffer) {
 	t.Helper()
+	return newHandlerWithTimeout(t, p, testTimeout)
+}
+
+func newHandlerWithTimeout(t *testing.T, p llm.Provider, timeout time.Duration) (http.Handler, *bytes.Buffer) {
+	t.Helper()
 	var logs bytes.Buffer
-	h, err := New(p, slog.New(slog.NewTextHandler(&logs, nil)))
+	h, err := New(p, timeout, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -102,8 +111,16 @@ func assertError(t *testing.T, rec *httptest.ResponseRecorder, status int, typ, 
 const validBody = `{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`
 
 func TestNewRejectsNilProvider(t *testing.T) {
-	if _, err := New(nil, nil); err == nil {
+	if _, err := New(nil, testTimeout, nil); err == nil {
 		t.Fatal("New(nil) error = nil, want error")
+	}
+}
+
+func TestNewRejectsNonPositiveTimeout(t *testing.T) {
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		if _, err := New(okProvider, timeout, nil); err == nil {
+			t.Errorf("New(timeout %v) error = nil, want error", timeout)
+		}
 	}
 }
 
@@ -535,6 +552,30 @@ func TestChatCompletionsPropagatesRequestContext(t *testing.T) {
 
 	if got != "request-scoped" {
 		t.Errorf("provider context value = %v, want request-scoped", got)
+	}
+}
+
+func TestChatCompletionsBoundsProviderCallWithUpstreamTimeout(t *testing.T) {
+	const timeout = 20 * time.Millisecond
+	var remaining time.Duration
+	h, logs := newHandlerWithTimeout(t, providerFunc(func(ctx context.Context, req llm.ChatRequest) (llm.ChatResponse, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			return llm.ChatResponse{}, errors.New("provider context has no deadline")
+		}
+		remaining = time.Until(deadline)
+		<-ctx.Done() // A slow upstream that never answers.
+		return llm.ChatResponse{}, &llm.ProviderError{Provider: "openai", Err: ctx.Err()}
+	}), timeout)
+
+	rec := post(t, h, validBody)
+
+	assertError(t, rec, http.StatusGatewayTimeout, typeServer, codeUpstreamTimeout)
+	if remaining <= 0 || remaining > timeout {
+		t.Errorf("provider deadline in %v, want within (0, %v]", remaining, timeout)
+	}
+	if strings.Contains(logs.String(), "client canceled request") {
+		t.Errorf("upstream timeout logged as a client cancellation:\n%s", logs)
 	}
 }
 

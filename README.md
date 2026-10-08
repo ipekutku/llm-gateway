@@ -33,9 +33,21 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Current Milestone
 
-### v0.1 — Provider Abstraction and Routing
+### v0.2 — Timeouts and Retry Policy
 
-The first milestone focuses only on the core gateway architecture:
+The second milestone makes calls to unreliable upstream providers safer:
+
+* explicit, configurable upstream timeouts: one time budget per request, plus connection-setup limits
+* bounded retries for transient failures: `429`, `502`, `503`, `504`, Anthropic's `529`, and failures to connect (`502` and `504` can come from a provider's proxy after the request reached the model, a small duplicate-generation risk that will be documented)
+* exponential backoff with jitter, honoring the provider's `Retry-After` header
+* no retries of timeouts or failures after the request was sent, because a chat completion is not idempotent and a retry could produce a second, separately billed generation
+* cancellation stops retries immediately; all attempts share the request's time budget
+
+Provider fallback and circuit breakers are deferred to v0.3.
+
+### v0.1 — Provider Abstraction and Routing ✅
+
+The first milestone focused only on the core gateway architecture:
 
 * Go HTTP service
 * OpenAI-compatible `/v1/chat/completions` endpoint
@@ -110,8 +122,10 @@ The `model` field must match a configured model exactly; the request is routed t
 | `OPENAI_MODEL`, `OPENAI_API_KEY` | Enable OpenAI for one model. Set both or neither. |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Enable Anthropic for one model. Set both or neither. |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
+| `GATEWAY_UPSTREAM_TIMEOUT` | Time limit for all upstream work on one request, as a Go duration such as `90s` or `2m`. Default `120s`. If it expires, the client gets `504 upstream_timeout`. |
+| `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Time limit for connecting to a provider (TCP dial and TLS handshake). Default `10s`. |
 
-Startup fails if no provider is configured, if only one variable of a pair is set, or if both providers use the same model name. Error messages name the variables but never print their values.
+Startup fails if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, or if a timeout is not a positive duration. Error messages name the variables but never print their values.
 
 The model names above are examples. Any model the provider's API accepts can be configured. Both adapters are tested against fake servers built from the providers' documented API formats; they have not yet been verified against the live APIs.
 
@@ -133,7 +147,8 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 
 * One model per provider, matched by exact name; no aliases or wildcards.
 * Text only: no streaming, tool calls, images, or multiple choices.
-* No upstream timeouts or retries yet; a slow provider is waited on until the client disconnects (planned for v0.2).
+* No retries yet (planned for v0.2). A failed upstream call is returned to the client.
+* A request whose upstream timeout expires may still be billed by the provider for the work done before it was canceled.
 * No gateway authentication; run it only on a trusted network (planned for v0.4).
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
 
@@ -152,7 +167,17 @@ The same checks run automatically through GitHub Actions for pull requests and c
 
 ## Project Status
 
-🚧 **Early development** — v0.1 is feature-complete.
+🚧 **Early development** — v0.1 is feature-complete; v0.2 is in progress.
+
+### v0.2
+
+| Component | Status |
+|---|---|
+| Upstream timeouts: request time budget and connection-setup limits (`internal/httpapi`, `cmd/gateway`) | ✅ Done |
+| Retry policy: failure classification, backoff with jitter, `Retry-After` (`internal/retry`) | ⏳ Next |
+| Retry configuration, wiring, end-to-end tests, and retry-safety documentation (`cmd/gateway`) | ⏳ Planned |
+
+### v0.1
 
 | Component | Status |
 |---|---|
