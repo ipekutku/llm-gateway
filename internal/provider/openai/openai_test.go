@@ -314,6 +314,40 @@ func TestChatUpstreamStatus(t *testing.T) {
 	}
 }
 
+func TestChatRetryAfter(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		want   time.Duration
+	}{
+		{"absent", "", 0},
+		{"seconds", "7", 7 * time.Second},
+		{"surrounding whitespace", " 30 ", 30 * time.Second},
+		{"zero", "0", 0},
+		{"negative", "-5", 0},
+		{"fraction", "1.5", 0},
+		{"HTTP date", "Wed, 21 Oct 2015 07:28:00 GMT", 0},
+		{"capped", "999999999999", 24 * time.Hour},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if tt.header != "" {
+					w.Header().Set("Retry-After", tt.header)
+				}
+				w.WriteHeader(http.StatusTooManyRequests)
+			})
+
+			_, err := c.Chat(context.Background(), testRequest)
+
+			pe := assertProviderError(t, err, http.StatusTooManyRequests)
+			if pe.RetryAfter != tt.want {
+				t.Errorf("RetryAfter = %v, want %v", pe.RetryAfter, tt.want)
+			}
+		})
+	}
+}
+
 func TestChatInvalidResponses(t *testing.T) {
 	tests := []struct {
 		name string

@@ -11,7 +11,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/llm"
 )
@@ -30,6 +32,9 @@ const (
 
 	// maxResponseBytes bounds how much of an upstream response is read.
 	maxResponseBytes = 4 << 20
+
+	// maxRetryAfterSeconds caps a parsed Retry-After value.
+	maxRetryAfterSeconds = 24 * 60 * 60
 )
 
 // Client calls the Anthropic Messages API. It is safe for concurrent use.
@@ -139,7 +144,9 @@ func (c *Client) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespons
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		// The body is not read: it may echo request content and must not
 		// reach errors or logs.
-		return llm.ChatResponse{}, upstreamError(ctx, resp.StatusCode, errors.New("unexpected status"))
+		pe := upstreamError(ctx, resp.StatusCode, errors.New("unexpected status"))
+		pe.RetryAfter = retryAfter(resp.Header)
+		return llm.ChatResponse{}, pe
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
@@ -276,9 +283,20 @@ func finishReason(reason string) (string, error) {
 // upstreamError wraps cause in an *llm.ProviderError. If ctx is done, the
 // context error is wrapped as well, so callers can detect cancellation even
 // when the transport reports it differently.
-func upstreamError(ctx context.Context, status int, cause error) error {
+func upstreamError(ctx context.Context, status int, cause error) *llm.ProviderError {
 	if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(cause, ctxErr) {
 		cause = fmt.Errorf("%w: %w", ctxErr, cause)
 	}
 	return &llm.ProviderError{Provider: ProviderName, StatusCode: status, Err: cause}
+}
+
+// retryAfter parses a Retry-After header in its delay-seconds form. An
+// absent, non-positive, or unparsable value, including the HTTP-date form,
+// counts as no request to wait.
+func retryAfter(h http.Header) time.Duration {
+	secs, err := strconv.ParseInt(strings.TrimSpace(h.Get("Retry-After")), 10, 64)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(min(secs, maxRetryAfterSeconds)) * time.Second
 }

@@ -3,6 +3,7 @@ package llm
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ErrUnknownModel reports that no provider is configured for a model.
@@ -17,6 +18,9 @@ type ProviderError struct {
 	Provider string
 	// StatusCode is the upstream HTTP status, or 0 if no response was received.
 	StatusCode int
+	// RetryAfter is the delay the upstream asked for before a new attempt,
+	// or 0 if it did not ask for one.
+	RetryAfter time.Duration
 	// Err is the underlying cause, if any.
 	Err error
 }

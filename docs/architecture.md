@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the architecture as implemented in v0.1: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, and static routing. Milestone 2 (v0.2) work in progress adds upstream timeouts; retries are not implemented yet.
+This document describes the architecture as implemented in v0.1: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, and static routing. Milestone 2 (v0.2) work in progress adds upstream timeouts and a retry policy; the retry policy is implemented but not yet wired into the gateway.
 
 ## Request flow
 
@@ -17,6 +17,7 @@ The incoming request's `context.Context` is passed through every step to the out
 |---|---|
 | `internal/llm` | Vendor-neutral types (`ChatRequest`, `ChatResponse`, `Message`, `Usage`), the `Provider` interface, and shared errors. |
 | `internal/routing` | Exact-match static model router. |
+| `internal/retry` | Bounded retries of transient upstream failures, as an `llm.Provider` that wraps another. |
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
 | `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
 | `internal/provider/anthropic` | Anthropic Messages client with private wire types. |
@@ -53,7 +54,7 @@ Implementations must honor context cancellation, support concurrent calls, and m
 | Error | Meaning |
 |---|---|
 | `llm.ErrUnknownModel` | No provider is configured for the requested model. |
-| `*llm.ProviderError` | An upstream call failed: non-2xx status, transport failure, or an unreadable or unusable response. It carries the provider name, the upstream status (0 if there was no response), and a wrapped cause. |
+| `*llm.ProviderError` | An upstream call failed: non-2xx status, transport failure, or an unreadable or unusable response. It carries the provider name, the upstream status (0 if there was no response), the delay the upstream asked for in `Retry-After` (0 if none), and a wrapped cause. |
 
 `ProviderError` implements `Unwrap`, so `errors.Is(err, context.Canceled)` and `errors.Is(err, context.DeadlineExceeded)` still work through it. It never carries credentials or raw upstream bodies.
 
@@ -142,7 +143,7 @@ Each adapter's constructor takes an API key, a base URL, and an `*http.Client`.
 - **HTTP client.** `nil` means `http.DefaultClient`. The adapter adds no timeout or retry policy of its own: deadlines arrive through the request context, and connection-setup limits through the injected client's transport.
 - **Requests.** Built with `http.NewRequestWithContext`, so the incoming context reaches the upstream call.
 - **Responses.** Bodies are closed on every path. Successful responses are read up to 4 MiB; anything larger is an upstream failure. Non-2xx response bodies are not read at all, so they cannot leak into errors or logs.
-- **Errors.** Every upstream failure is a `*llm.ProviderError`: non-2xx status, transport failure, unreadable or oversized body, malformed JSON, or a structurally unusable response. When the context is done, the context error is always wrapped, so `errors.Is(err, context.Canceled)` holds even if cancellation interrupts the body read. A request the gateway should never produce (blank model, non-positive `MaxTokens`, no messages, unknown role) returns a plain error without calling the upstream. The handler treats that as an internal error.
+- **Errors.** Every upstream failure is a `*llm.ProviderError`: non-2xx status, transport failure, unreadable or oversized body, malformed JSON, or a structurally unusable response. When the context is done, the context error is always wrapped, so `errors.Is(err, context.Canceled)` holds even if cancellation interrupts the body read. For non-2xx responses, the delay-seconds form of `Retry-After` is recorded in `RetryAfter`, capped at 24 hours; the HTTP-date form, invalid values, and non-positive values count as absent. A request the gateway should never produce (blank model, non-positive `MaxTokens`, no messages, unknown role) returns a plain error without calling the upstream. The handler treats that as an internal error.
 - **Usage.** Never fabricated. A response without both token counts is a protocol error.
 - **Empty text.** A structurally valid response with empty text is a success.
 
@@ -233,6 +234,44 @@ Decisions:
 - **Deadline versus client cancellation.** If the client disconnects, the handler logs the cancellation and writes nothing, as before. If only the derived deadline fired, the response is 504 `upstream_timeout`.
 - **Expired requests are canceled upstream.** The deadline cancels the outbound HTTP request, so the provider is not left generating for nobody. The provider may still charge for work done before cancellation.
 - **Idle connections** are kept for 90 seconds (a fixed constant, `idleConnTimeout`). Other transport settings, including the proxy from the environment, are those of `http.DefaultTransport`.
+
+## Retries
+
+`retry.Provider` wraps one provider and implements `llm.Provider` itself. It is not yet wired into `cmd/gateway`; that, with its configuration, is the next Milestone 2 change. The intended placement is around each adapter, below the router, so Milestone 3 fallback can sit above it without nesting retry loops inside each other.
+
+### Policy
+
+| Setting | Meaning |
+|---|---|
+| `MaxAttempts` | Total attempts including the first; `1` disables retries. |
+| `BaseDelay` | Backoff ceiling before the second attempt. It doubles per attempt. |
+| `MaxDelay` | Cap on the backoff ceiling. |
+
+The wait before attempt *n + 1* is a uniformly random duration in `[0, min(BaseDelay × 2^(n−1), MaxDelay)]` ("full jitter"), so many clients failing together do not retry in lockstep. If the upstream sent `Retry-After`, the wait is at least that long, even above `MaxDelay`.
+
+### What is retried
+
+A chat completion is not idempotent. An attempt that reached the model may have produced a generation the provider bills for, and a retry produces another. Only failures where the upstream normally did no work are retried:
+
+| Failure | Retried | Reason |
+|---|---|---|
+| 429 Too Many Requests | Yes | Rejected before generation. |
+| 503 Service Unavailable, Anthropic 529 overloaded | Yes | Rejected before generation. |
+| 502 Bad Gateway, 504 Gateway Timeout | Yes | Usually a failure in front of the model. **A provider proxy can also return these after the model generated, so a retry can duplicate a billed generation.** This risk is accepted for these transient failures. |
+| Dial failure: DNS lookup, connection refused, TCP connect timeout | Yes | No request byte was sent. |
+| TLS handshake failure | No | Not distinguishable from later transport failures without tracing; kept out for simplicity. |
+| Transport failure after the connection was established (reset, EOF) | No | The request may have reached the model. |
+| Upstream timeout or cancellation | No | The request may still be generating; the budget is spent or the client is gone. |
+| Other statuses (400, 401, 403, 404, 500, …) | No | Retrying cannot fix a client or configuration error; a 500 may follow a generation. |
+| Unusable 2xx response (malformed, oversized, unsupported shape) | No | The generation already happened. |
+| Gateway errors (unknown model, invalid internal request) | No | Not an upstream failure. |
+
+### Time budget and cancellation
+
+- **One budget.** All attempts and waits share the request context, so the handler's upstream timeout bounds the whole sequence. There is no per-attempt timeout: an attempt that times out is not retried, so a separate per-attempt limit would only shorten the budget.
+- **No hopeless waits.** A wait that would end at or after the context deadline is not started, and the last failure is returned at once. A 429 whose `Retry-After` exceeds the remaining budget therefore reaches the client as 429 immediately.
+- **Cancellation stops retries.** If the context is already done after an attempt, no wait starts. A cancellation or deadline during a wait ends it at once; the error then wraps both the context error and the last upstream failure, so the handler's mapping (client gone, or 504) is unchanged.
+- **Errors stay inspectable.** After more than one attempt, the error message reports the count (`after 3 attempts: …`) and wraps the last failure, so its `*llm.ProviderError`, status, and the handler's error mapping are preserved.
 
 ## Server lifecycle
 
