@@ -241,14 +241,23 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 Run the verification suite locally with:
 
 ```bash
-gofmt -l .
-go vet ./...
-go test -race -timeout 2m ./...
-go build ./cmd/gateway
-go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+make check
 ```
 
-The same checks run automatically through GitHub Actions for pull requests and changes to `main`. Tests use local fake provider servers and need no API keys or network access; only the vulnerability check downloads its tool and the vulnerability database.
+It runs the same checks as GitHub Actions, one `make` target each: `fmt` (gofmt), `vet`, `test` (`go test -race`), `build`, and `vuln` (govulncheck). CI runs these targets for pull requests and changes to `main`. Tests use local fake provider servers and need no API keys or network access; only the vulnerability check downloads its tool and the vulnerability database.
+
+### Smoke test against the real APIs
+
+The automated tests never call a real provider. To check the adapters against the live APIs, run:
+
+```bash
+read -s OPENAI_API_KEY; export OPENAI_API_KEY        # typed silently, kept out of shell history
+read -s ANTHROPIC_API_KEY; export ANTHROPIC_API_KEY
+export OPENAI_MODEL=gpt-4o ANTHROPIC_MODEL=claude-opus-5-5
+make smoke
+```
+
+**This makes real, billed API calls** (a few short completions per provider, typically well under one cent). Configure one or both providers. For each model it checks a normal completion and a `length` stop, both with token usage. It also checks that unknown and missing gateway keys get `401`, and that a client over its limit gets `429` with `Retry-After`. It uses fresh random gateway keys and ignores other `GATEWAY_*` settings in the environment. It prints the model each provider reported and fails on any mismatch. It never runs in CI.
 
 ## Project Status
 
