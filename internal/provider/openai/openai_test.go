@@ -215,6 +215,7 @@ func TestChatTranslatesResponse(t *testing.T) {
 		t.Fatalf("Chat() error = %v", err)
 	}
 	want := llm.ChatResponse{
+		Provider:     ProviderName,
 		Model:        "gpt-4o-2024-08-06",
 		Message:      llm.Message{Role: llm.RoleAssistant, Content: "TCP provides reliable, ordered delivery."},
 		FinishReason: llm.FinishReasonStop,
@@ -290,6 +291,7 @@ func TestChatRefusal(t *testing.T) {
 		t.Fatalf("Chat() error = %v", err)
 	}
 	want := llm.ChatResponse{
+		Provider:     ProviderName,
 		Model:        "gpt-4o",
 		Message:      llm.Message{Role: llm.RoleAssistant, Content: "I can't help with that."},
 		FinishReason: llm.FinishReasonContentFilter,
@@ -297,6 +299,36 @@ func TestChatRefusal(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("Chat() = %+v, want %+v", got, want)
+	}
+}
+
+func TestChatUsageCachedTokens(t *testing.T) {
+	tests := []struct {
+		name  string
+		usage string
+		want  llm.Usage
+	}{
+		{"cached", `{"prompt_tokens":2006,"completion_tokens":300,"total_tokens":2306,"prompt_tokens_details":{"cached_tokens":1920,"audio_tokens":0}}`,
+			llm.Usage{InputTokens: 2006, CacheReadInputTokens: 1920, OutputTokens: 300}},
+		{"all cached", `{"prompt_tokens":1024,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":1024}}`,
+			llm.Usage{InputTokens: 1024, CacheReadInputTokens: 1024, OutputTokens: 1}},
+		{"no details", okUsage, llm.Usage{InputTokens: 3, OutputTokens: 4}},
+		{"null details", `{"prompt_tokens":3,"completion_tokens":4,"prompt_tokens_details":null}`, llm.Usage{InputTokens: 3, OutputTokens: 4}},
+		{"details without cached tokens", `{"prompt_tokens":3,"completion_tokens":4,"prompt_tokens_details":{"audio_tokens":0}}`, llm.Usage{InputTokens: 3, OutputTokens: 4}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newServer(t, respond(http.StatusOK,
+				responseWith(`{"role":"assistant","content":"hi"}`, "stop", tt.usage)))
+
+			got, err := c.Chat(context.Background(), testRequest)
+			if err != nil {
+				t.Fatalf("Chat() error = %v", err)
+			}
+			if got.Usage != tt.want {
+				t.Errorf("Usage = %+v, want %+v", got.Usage, tt.want)
+			}
+		})
 	}
 }
 
@@ -399,6 +431,9 @@ func TestChatInvalidResponses(t *testing.T) {
 		{"missing usage", `{"model":"gpt-4o","choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`},
 		{"null usage", responseWith(`{"role":"assistant","content":"hi"}`, "stop", `null`)},
 		{"partial usage", responseWith(`{"role":"assistant","content":"hi"}`, "stop", `{"prompt_tokens":3}`)},
+		{"negative usage", responseWith(`{"role":"assistant","content":"hi"}`, "stop", `{"prompt_tokens":3,"completion_tokens":-1}`)},
+		{"negative cached tokens", responseWith(`{"role":"assistant","content":"hi"}`, "stop", `{"prompt_tokens":3,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":-1}}`)},
+		{"more cached than prompt tokens", responseWith(`{"role":"assistant","content":"hi"}`, "stop", `{"prompt_tokens":3,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":4}}`)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

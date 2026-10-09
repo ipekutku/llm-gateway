@@ -180,7 +180,8 @@ Each adapter's constructor takes an API key, a base URL, and an `*http.Client`.
 - **Requests.** Built with `http.NewRequestWithContext`, so the incoming context reaches the upstream call.
 - **Responses.** Bodies are closed on every path. Successful responses are read up to 4 MiB; anything larger is an upstream failure. Non-2xx response bodies are never parsed or kept, so they cannot leak into errors or logs. Up to 64 KiB is read and discarded so the connection returns to the pool and a retry can reuse it instead of opening a new TCP and TLS connection; a larger error body closes the connection. The read observes the request context like any other.
 - **Errors.** Every upstream failure is a `*llm.ProviderError`: non-2xx status, transport failure, unreadable or oversized body, malformed JSON, or a structurally unusable response. When the context is done, the context error is always wrapped, so `errors.Is(err, context.Canceled)` holds even if cancellation interrupts the body read. For non-2xx responses, the delay-seconds form of `Retry-After` is recorded in `RetryAfter`, capped at 24 hours; the HTTP-date form, invalid values, and non-positive values count as absent. A request the gateway should never produce (blank model, non-positive `MaxTokens`, no messages, unknown role) returns a plain error without calling the upstream. The handler treats that as an internal error.
-- **Usage.** Never fabricated. A response without both token counts is a protocol error.
+- **Usage.** Never fabricated. A response without both token counts, or with a negative count, is a protocol error. `InputTokens` is always the whole prompt; `CacheReadInputTokens` and `CacheWriteInputTokens` say how much of it was read from or written to the provider's prompt cache, which providers price differently. A missing cache field counts as zero.
+- **Provider.** A successful response names the adapter in `Provider`, the same name a `ProviderError` carries, so callers above the router know which provider answered after a fallback.
 - **Empty text.** A structurally valid response with empty text is a success.
 
 ### OpenAI
@@ -194,6 +195,8 @@ Each adapter's constructor takes an API key, a base URL, and an `*http.Client`.
 | `MaxTokens` | `max_completion_tokens` |
 | response `Model` | `model` |
 | `Usage.InputTokens` / `OutputTokens` | `usage.prompt_tokens` / `usage.completion_tokens` |
+| `Usage.CacheReadInputTokens` | `usage.prompt_tokens_details.cached_tokens`; more than `prompt_tokens` is a protocol error |
+| `Usage.CacheWriteInputTokens` | always 0; OpenAI reports no cache writes |
 
 - **`max_completion_tokens`, not `max_tokens`.** OpenAI's API specification marks `max_tokens` as deprecated and "not compatible with o-series models". `max_completion_tokens` is accepted by current models. On reasoning models it also counts reasoning tokens, so a small limit can produce an empty, length-truncated answer.
 - **Exactly one choice.** The response must contain one choice with an `assistant` message and string `content`. Zero or several choices, a missing message, `null` content, `tool_calls`, and `function_call` are protocol errors.
@@ -214,11 +217,13 @@ Response fixtures follow the example in OpenAI's published OpenAPI specification
 | `MaxTokens` | `max_tokens`, always sent with no provider-specific default |
 | response `Model` | `model` |
 | `Usage.InputTokens` | `usage.input_tokens + cache_creation_input_tokens + cache_read_input_tokens` |
+| `Usage.CacheReadInputTokens` | `usage.cache_read_input_tokens` |
+| `Usage.CacheWriteInputTokens` | `usage.cache_creation_input_tokens` |
 | `Usage.OutputTokens` | `usage.output_tokens` |
 
 - **Conversation rules are left to the upstream.** Anthropic constraints such as role alternation or a final assistant turn (prefill, rejected by current models) are not pre-validated. They surface as an upstream 400, which the gateway maps to 400.
 - **Response content.** `text` blocks are concatenated in order with no separator. `thinking` and `redacted_thinking` blocks are reasoning, not output, and are skipped; current models such as Claude Opus 5.5 always think, so rejecting them would fail every request. Any other block type (`tool_use`, `server_tool_use`, tool results, unknown types) is a protocol error. An empty `content` array or empty text is a valid empty answer.
-- **Input usage includes cached tokens.** `input_tokens` excludes prompt-cache reads and writes, while OpenAI's `prompt_tokens` includes cached tokens. Adding the cache fields keeps the neutral count comparable. The gateway does not request caching itself.
+- **Input usage includes cached tokens.** `input_tokens` excludes prompt-cache reads and writes, while OpenAI's `prompt_tokens` includes cached tokens. Adding the cache fields keeps the neutral count comparable. The gateway does not request caching itself. Cache writes are one count; the 5-minute and 1-hour cache lifetimes, which Anthropic prices differently, are not distinguished.
 
 Stop reasons, as documented for API version `2023-06-01`:
 

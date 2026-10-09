@@ -118,8 +118,13 @@ type responseMessage struct {
 }
 
 type chatUsage struct {
-	PromptTokens     *int `json:"prompt_tokens"`
-	CompletionTokens *int `json:"completion_tokens"`
+	PromptTokens        *int                `json:"prompt_tokens"`
+	CompletionTokens    *int                `json:"completion_tokens"`
+	PromptTokensDetails *promptTokensDetail `json:"prompt_tokens_details"`
+}
+
+type promptTokensDetail struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 // Chat sends req to the Chat Completions endpoint. Every upstream failure,
@@ -240,18 +245,38 @@ func decodeResponse(data []byte) (llm.ChatResponse, error) {
 		return llm.ChatResponse{}, errors.New("response message has no text content")
 	}
 
-	if resp.Usage == nil || resp.Usage.PromptTokens == nil || resp.Usage.CompletionTokens == nil {
-		return llm.ChatResponse{}, errors.New("response has no token usage")
+	usage, err := translateUsage(resp.Usage)
+	if err != nil {
+		return llm.ChatResponse{}, err
 	}
 
 	return llm.ChatResponse{
+		Provider:     ProviderName,
 		Model:        resp.Model,
 		Message:      llm.Message{Role: llm.RoleAssistant, Content: text},
 		FinishReason: finish,
-		Usage: llm.Usage{
-			InputTokens:  *resp.Usage.PromptTokens,
-			OutputTokens: *resp.Usage.CompletionTokens,
-		},
+		Usage:        usage,
+	}, nil
+}
+
+// translateUsage requires both token counts. prompt_tokens includes cached
+// tokens, which OpenAI reports as cache reads; it has no cache writes. A
+// missing cached_tokens counts as none.
+func translateUsage(u *chatUsage) (llm.Usage, error) {
+	if u == nil || u.PromptTokens == nil || u.CompletionTokens == nil {
+		return llm.Usage{}, errors.New("response has no token usage")
+	}
+	var cached int
+	if u.PromptTokensDetails != nil {
+		cached = u.PromptTokensDetails.CachedTokens
+	}
+	if *u.PromptTokens < 0 || *u.CompletionTokens < 0 || cached < 0 || cached > *u.PromptTokens {
+		return llm.Usage{}, errors.New("response has inconsistent token usage")
+	}
+	return llm.Usage{
+		InputTokens:          *u.PromptTokens,
+		CacheReadInputTokens: cached,
+		OutputTokens:         *u.CompletionTokens,
 	}, nil
 }
 

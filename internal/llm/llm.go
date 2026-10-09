@@ -34,12 +34,22 @@ type ChatRequest struct {
 
 // Usage holds the token counts reported by the upstream provider.
 type Usage struct {
-	InputTokens  int
-	OutputTokens int
+	// InputTokens is the whole prompt, including cached tokens.
+	InputTokens int
+	// CacheReadInputTokens is the part of InputTokens read from the
+	// provider's prompt cache.
+	CacheReadInputTokens int
+	// CacheWriteInputTokens is the part of InputTokens written to the
+	// provider's prompt cache.
+	CacheWriteInputTokens int
+	OutputTokens          int
 }
 
 // ChatResponse is a single assistant completion.
 type ChatResponse struct {
+	// Provider identifies the upstream that answered, e.g. "openai", as in
+	// ProviderError.
+	Provider     string
 	Model        string
 	Message      Message
 	FinishReason string
