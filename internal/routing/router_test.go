@@ -3,6 +3,7 @@ package routing
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"reflect"
 	"testing"
 
@@ -27,9 +28,21 @@ func replyWith(content string, calls *int) llm.Provider {
 	})
 }
 
-func mustNew(t *testing.T, routes map[string]llm.Provider) *Router {
+// direct turns a model-to-provider table into routes without fallbacks.
+func direct(providers map[string]llm.Provider) map[string]Route {
+	if providers == nil {
+		return nil
+	}
+	routes := make(map[string]Route, len(providers))
+	for model, p := range providers {
+		routes[model] = Route{Provider: p}
+	}
+	return routes
+}
+
+func mustNew(t *testing.T, providers map[string]llm.Provider) *Router {
 	t.Helper()
-	r, err := New(routes)
+	r, err := New(direct(providers), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -175,7 +188,7 @@ func TestNewRejectsInvalidRoutes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r, err := New(tt.routes)
+			r, err := New(direct(tt.routes), nil)
 			if err == nil {
 				t.Fatal("New() error = nil, want error")
 			}

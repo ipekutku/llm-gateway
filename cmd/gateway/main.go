@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/httpapi"
-	"github.com/ipekutku/llm-gateway/internal/llm"
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
 	"github.com/ipekutku/llm-gateway/internal/retry"
@@ -98,27 +97,31 @@ func newHandler(cfg config, httpClient *http.Client, logger *slog.Logger) (http.
 	if httpClient == nil {
 		httpClient = newUpstreamClient(cfg)
 	}
-	routes := make(map[string]llm.Provider)
+	routes := make(map[string]routing.Route)
 	if p := cfg.OpenAI; p != nil {
 		c, err := openai.New(p.APIKey, p.BaseURL, httpClient)
 		if err != nil {
 			return nil, err
 		}
-		if routes[p.Model], err = retry.New(c, cfg.Retry, logger); err != nil {
+		r, err := retry.New(c, cfg.Retry, logger)
+		if err != nil {
 			return nil, err
 		}
+		routes[p.Model] = routing.Route{Provider: r}
 	}
 	if p := cfg.Anthropic; p != nil {
 		c, err := anthropic.New(p.APIKey, p.BaseURL, httpClient)
 		if err != nil {
 			return nil, err
 		}
-		if routes[p.Model], err = retry.New(c, cfg.Retry, logger); err != nil {
+		r, err := retry.New(c, cfg.Retry, logger)
+		if err != nil {
 			return nil, err
 		}
+		routes[p.Model] = routing.Route{Provider: r}
 	}
 
-	router, err := routing.New(routes)
+	router, err := routing.New(routes, logger)
 	if err != nil {
 		return nil, err
 	}

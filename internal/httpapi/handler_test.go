@@ -329,7 +329,7 @@ func TestChatCompletionsMaxTokens(t *testing.T) {
 
 func TestChatCompletionsDefaultMaxTokensIsSharedAcrossRoutes(t *testing.T) {
 	a, b := &recordingProvider{}, &recordingProvider{}
-	router, err := routing.New(map[string]llm.Provider{"model-a": a, "model-b": b})
+	router, err := routing.New(map[string]routing.Route{"model-a": {Provider: a}, "model-b": {Provider: b}}, nil)
 	if err != nil {
 		t.Fatalf("routing.New() error = %v", err)
 	}

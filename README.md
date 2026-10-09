@@ -190,8 +190,8 @@ The same checks run automatically through GitHub Actions for pull requests and c
 | Component | Status |
 |---|---|
 | Circuit breaker per provider (`internal/breaker`) | ✅ Done |
-| Provider fallback and failure classification (`internal/routing`) | ⏳ Next |
-| Failover configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ⏳ Planned |
+| Provider fallback and failure classification (`internal/routing`) | ✅ Done |
+| Failover configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ⏳ Next |
 
 ### v0.2
 

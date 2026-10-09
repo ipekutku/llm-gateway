@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the architecture as implemented in v0.2: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing, upstream timeouts, and bounded retries. Milestone 3 (v0.3) work in progress adds a circuit breaker, which is implemented but not yet wired into the gateway.
+This document describes the architecture as implemented in v0.2: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing, upstream timeouts, and bounded retries. Milestone 3 (v0.3) work in progress adds a circuit breaker and provider fallback in the router; both are implemented but not yet configurable or wired into the gateway.
 
 ## Request flow
 
@@ -43,12 +43,36 @@ Implementations must honor context cancellation, support concurrent calls, and m
 
 ## Routing
 
-`routing.Router` holds a static `model → provider` table and itself implements `llm.Provider`. The handler therefore needs no separate router interface, and later milestones (fallback, circuit breaking) can wrap providers or the router without changing the handler.
+`routing.Router` holds a static `model → Route` table and itself implements `llm.Provider`. The handler therefore needs no separate router interface. A `Route` has a provider and an optional `Fallback`: a second provider, the model name to send it, and a `PrimaryTimeout`.
 
-- **Exact match only.** There are no aliases, prefixes, wildcards, or model rewriting. The model name is forwarded to the provider unchanged.
-- **Validated at construction.** `routing.New` rejects an empty table, blank model names, and nil providers.
-- **Immutable.** The table is copied at construction and never modified afterwards, so concurrent requests need no locking.
-- An unknown model returns an error wrapping `llm.ErrUnknownModel`. Provider errors are returned unchanged.
+- **Exact match only.** There are no aliases, prefixes, or wildcards. The requested model name is forwarded unchanged to the route's provider. The only rewriting is the configured fallback model, sent to the fallback provider.
+- **Validated at construction.** `routing.New` rejects an empty table, blank model names, nil providers, and fallbacks with a blank model, a nil provider, or a non-positive primary timeout.
+- **Immutable.** The table, including each fallback, is copied at construction and never modified afterwards, so concurrent requests need no locking.
+- An unknown model returns an error wrapping `llm.ErrUnknownModel`. Without a fallback, the context and request are forwarded unchanged and provider errors are returned unchanged.
+
+### Fallback
+
+With a fallback, the router:
+
+1. Calls the primary with the request unchanged, under a context limited to `PrimaryTimeout` (or the request's own deadline, if earlier).
+2. If the primary fails and the failure qualifies, logs `primary provider failed, falling back` at warn (provider, upstream status, model, fallback model, error) and calls the fallback once, with a copy of the request carrying the fallback model and the request's own context, so it gets all the remaining time.
+3. Never calls the primary again. Retries happen only inside each provider, so no retry or fallback loop is possible.
+
+| Primary failure | Falls back | Reason |
+|---|---|---|
+| Rate limiting (429), server errors (5xx, 529), transport failures, unusable responses | Yes | Another provider may be healthy. |
+| Primary timeout | Yes | The fallback still has the rest of the request's time. **A primary canceled mid-generation may still bill for it.** |
+| Other 4xx (401, 403, 404, 413, …) | Yes | Mostly configuration problems or limits of the primary, which another provider may not share. |
+| Open circuit breaker (`llm.ErrCircuitOpen`) | Yes | The primary is known to be failing. |
+| Upstream 400 | No | The request itself was rejected; the client should fix it. |
+| The incoming request is canceled or out of time | No | Nobody would receive the answer. |
+| Errors from neither an upstream nor a breaker | No | They indicate a gateway bug. |
+
+Decisions:
+
+- **The client sees the last provider's result.** If the fallback fails too, its error is returned and decides the HTTP status. The primary's failure is included only as text in the error message, so for example a primary timeout cannot turn a fallback's 503 into a 504.
+- **The response names the model that answered.** The provider-reported model is returned. If the fallback's upstream reports none, the router reports the fallback model, never the requested one.
+- **The primary timeout applies only with a fallback.** Without one, the primary keeps the whole request budget, as in v0.2.
 
 ## Errors
 
@@ -281,7 +305,7 @@ A chat completion is not idempotent. An attempt that reached the model may have 
 
 ## Circuit breaker
 
-`breaker.Breaker` wraps one provider and implements `llm.Provider`. It is not yet wired into `cmd/gateway`. The planned placement is one breaker per provider, above that provider's `retry.Provider` and below fallback routing:
+`breaker.Breaker` wraps one provider and implements `llm.Provider`. It is not yet wired into `cmd/gateway`. The planned placement is one breaker per provider, above that provider's `retry.Provider` and below the router's fallback:
 
 ```text
 router → fallback → breaker → retry → adapter
