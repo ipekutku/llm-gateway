@@ -16,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ipekutku/llm-gateway/internal/auth"
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/routing"
 )
 
@@ -59,6 +61,38 @@ func (p *recordingProvider) Chat(ctx context.Context, req llm.ChatRequest) (llm.
 // is long enough never to expire.
 const testTimeout = time.Minute
 
+// Gateway API keys of the test clients.
+const (
+	keyA        = "test-key-team-a"
+	keyB        = "test-key-team-b"
+	keyDisabled = "test-key-team-old"
+)
+
+func testAuthenticator(t *testing.T) *auth.Authenticator {
+	t.Helper()
+	a, err := auth.New([]auth.Client{
+		{ID: "team-a", KeyHash: auth.HashKey(keyA)},
+		{ID: "team-b", KeyHash: auth.HashKey(keyB)},
+		{ID: "team-old", KeyHash: auth.HashKey(keyDisabled), Disabled: true},
+	})
+	if err != nil {
+		t.Fatalf("auth.New() error = %v", err)
+	}
+	return a
+}
+
+// generous are limits that tests not about rate limiting never reach.
+var generous = ratelimit.Limits{RequestsPerMinute: ratelimit.MaxLimit, Burst: ratelimit.MaxLimit, MaxConcurrent: ratelimit.MaxLimit}
+
+func testLimiter(t *testing.T, limits map[string]ratelimit.Limits) *ratelimit.Limiter {
+	t.Helper()
+	l, err := ratelimit.New(limits)
+	if err != nil {
+		t.Fatalf("ratelimit.New() error = %v", err)
+	}
+	return l
+}
+
 // newHandler returns a handler for p and a buffer that collects its logs.
 func newHandler(t *testing.T, p llm.Provider) (http.Handler, *bytes.Buffer) {
 	t.Helper()
@@ -67,8 +101,14 @@ func newHandler(t *testing.T, p llm.Provider) (http.Handler, *bytes.Buffer) {
 
 func newHandlerWithTimeout(t *testing.T, p llm.Provider, timeout time.Duration) (http.Handler, *bytes.Buffer) {
 	t.Helper()
+	limiter := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous, "team-b": generous, "team-old": generous})
+	return newHandlerWith(t, p, limiter, timeout)
+}
+
+func newHandlerWith(t *testing.T, p llm.Provider, limiter *ratelimit.Limiter, timeout time.Duration) (http.Handler, *bytes.Buffer) {
+	t.Helper()
 	var logs bytes.Buffer
-	h, err := New(p, timeout, slog.New(slog.NewTextHandler(&logs, nil)))
+	h, err := New(p, testAuthenticator(t), limiter, timeout, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -80,8 +120,18 @@ func post(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder 
 	return serve(t, h, httptest.NewRequest(http.MethodPost, ChatCompletionsPath, strings.NewReader(body)))
 }
 
+// serve serves r, authenticated as team-a unless r already has an
+// Authorization header.
 func serve(t *testing.T, h http.Handler, r *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
+	if _, ok := r.Header["Authorization"]; !ok {
+		r.Header.Set("Authorization", "Bearer "+keyA)
+	}
+	return serveRaw(h, r)
+}
+
+// serveRaw serves r with its headers unchanged.
+func serveRaw(h http.Handler, r *http.Request) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
 	return rec
@@ -110,15 +160,25 @@ func assertError(t *testing.T, rec *httptest.ResponseRecorder, status int, typ, 
 
 const validBody = `{"model":"model-a","messages":[{"role":"user","content":"hi"}]}`
 
-func TestNewRejectsNilProvider(t *testing.T) {
-	if _, err := New(nil, testTimeout, nil); err == nil {
-		t.Fatal("New(nil) error = nil, want error")
+func TestNewRejectsNilDependencies(t *testing.T) {
+	a := testAuthenticator(t)
+	l := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
+	if _, err := New(nil, a, l, testTimeout, nil); err == nil {
+		t.Error("New(nil provider) error = nil, want error")
+	}
+	if _, err := New(okProvider, nil, l, testTimeout, nil); err == nil {
+		t.Error("New(nil authenticator) error = nil, want error")
+	}
+	if _, err := New(okProvider, a, nil, testTimeout, nil); err == nil {
+		t.Error("New(nil limiter) error = nil, want error")
 	}
 }
 
 func TestNewRejectsNonPositiveTimeout(t *testing.T) {
+	a := testAuthenticator(t)
+	l := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
 	for _, timeout := range []time.Duration{0, -time.Second} {
-		if _, err := New(okProvider, timeout, nil); err == nil {
+		if _, err := New(okProvider, a, l, timeout, nil); err == nil {
 			t.Errorf("New(timeout %v) error = nil, want error", timeout)
 		}
 	}

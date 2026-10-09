@@ -11,9 +11,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/ipekutku/llm-gateway/internal/auth"
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 )
 
 // ChatCompletionsPath is the path of the chat completions endpoint.
@@ -21,6 +25,8 @@ const ChatCompletionsPath = "/v1/chat/completions"
 
 type handler struct {
 	provider        llm.Provider
+	auth            *auth.Authenticator
+	limiter         *ratelimit.Limiter
 	upstreamTimeout time.Duration
 	log             *slog.Logger
 }
@@ -29,23 +35,33 @@ type handler struct {
 // /v1/chat/completions and sends every request to provider, which is
 // normally the router. A nil log uses slog.Default.
 //
+// Every request must carry a gateway API key accepted by authenticator, as
+// "Authorization: Bearer <key>", and is then subject to the client's limits
+// in limiter, which must have limits for every client. Both checks happen
+// before the request body is read. The client's auth.Identity is in the
+// context passed to provider.
+//
 // upstreamTimeout bounds each provider call, covering all upstream work for
 // one request. It must be positive. When it expires while the client is
 // still connected, the response is 504.
 //
 // Requests to other paths receive 404, and other methods on the endpoint
 // receive 405 with an Allow header.
-func New(provider llm.Provider, upstreamTimeout time.Duration, log *slog.Logger) (http.Handler, error) {
-	if provider == nil {
+func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *ratelimit.Limiter, upstreamTimeout time.Duration, log *slog.Logger) (http.Handler, error) {
+	switch {
+	case provider == nil:
 		return nil, errors.New("httpapi: nil provider")
-	}
-	if upstreamTimeout <= 0 {
+	case authenticator == nil:
+		return nil, errors.New("httpapi: nil authenticator")
+	case limiter == nil:
+		return nil, errors.New("httpapi: nil limiter")
+	case upstreamTimeout <= 0:
 		return nil, errors.New("httpapi: upstream timeout must be positive")
 	}
 	if log == nil {
 		log = slog.Default()
 	}
-	h := &handler{provider: provider, upstreamTimeout: upstreamTimeout, log: log}
+	h := &handler{provider: provider, auth: authenticator, limiter: limiter, upstreamTimeout: upstreamTimeout, log: log}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+ChatCompletionsPath, h.chatCompletions)
@@ -53,6 +69,18 @@ func New(provider llm.Provider, upstreamTimeout time.Duration, log *slog.Logger)
 }
 
 func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+	r = r.WithContext(auth.NewContext(r.Context(), id))
+
+	release, ok := h.acquire(w, r, id)
+	if !ok {
+		return
+	}
+	defer release()
+
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 	if err != nil {
 		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
@@ -71,6 +99,72 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	h.complete(w, r, req)
 }
 
+// authenticate identifies the client from the Authorization header. On
+// failure it writes a 401 and returns false.
+func (h *handler) authenticate(w http.ResponseWriter, r *http.Request) (auth.Identity, bool) {
+	key, err := bearerToken(r.Header)
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		h.fail(w, r, errMissingAPIKey, err)
+		return auth.Identity{}, false
+	}
+	id, err := h.auth.Authenticate(key)
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+		h.fail(w, r, errInvalidAPIKey, err)
+		return auth.Identity{}, false
+	}
+	return id, true
+}
+
+// bearerToken returns the token of a single "Authorization: Bearer <token>"
+// header. The scheme is case-insensitive. Errors never contain the header's
+// value.
+func bearerToken(header http.Header) (string, error) {
+	values := header.Values("Authorization")
+	switch len(values) {
+	case 0:
+		return "", errors.New("missing Authorization header")
+	case 1:
+	default:
+		return "", errors.New("multiple Authorization headers")
+	}
+	scheme, token, _ := strings.Cut(values[0], " ")
+	token = strings.TrimLeft(token, " ")
+	if !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t") {
+		return "", errors.New("Authorization header is not 'Bearer <key>'")
+	}
+	return token, nil
+}
+
+// acquire admits the request under the client's limits. On success the
+// caller must call release when the request has finished. On failure it
+// writes a 429, or a 500 for a client without limits, and returns false.
+func (h *handler) acquire(w http.ResponseWriter, r *http.Request, id auth.Identity) (release func(), ok bool) {
+	release, err := h.limiter.Acquire(id.ClientID)
+	if err == nil {
+		return release, true
+	}
+	le, isLimit := errors.AsType[*ratelimit.Error](err)
+	switch {
+	case !isLimit:
+		h.fail(w, r, errInternal, err)
+	case le.Limit == ratelimit.ConcurrentRequests:
+		h.fail(w, r, errConcurrencyLimitExceeded, err)
+	default:
+		w.Header().Set("Retry-After", retryAfterSeconds(le.RetryAfter))
+		h.fail(w, r, errRateLimitExceeded, err, slog.Duration("retry_after", le.RetryAfter))
+	}
+	return nil, false
+}
+
+// retryAfterSeconds formats d for the Retry-After header: whole seconds,
+// rounded up so a client that waits that long is admitted, and at least 1.
+func retryAfterSeconds(d time.Duration) string {
+	secs := max(1, int64((d+time.Second-1)/time.Second))
+	return strconv.FormatInt(secs, 10)
+}
+
 func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatRequest) {
 	ctx, cancel := context.WithTimeout(r.Context(), h.upstreamTimeout)
 	defer cancel()
@@ -79,7 +173,8 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 	if err != nil {
 		if r.Context().Err() != nil {
 			// The client is gone; there is nobody to write a response to.
-			h.log.InfoContext(r.Context(), "client canceled request",
+			h.log.LogAttrs(r.Context(), slog.LevelInfo, "client canceled request",
+				clientAttr(r),
 				slog.String("model", req.Model),
 				slog.Any("error", err),
 			)
@@ -119,6 +214,7 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 // bodies; err must follow the same rule, as llm.ProviderError does.
 func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err error, attrs ...slog.Attr) {
 	attrs = append(attrs,
+		clientAttr(r),
 		slog.Int("status", e.status),
 		slog.String("code", e.code),
 	)
@@ -143,6 +239,16 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err e
 		Type:    e.typ,
 		Code:    e.code,
 	}})
+}
+
+// clientAttr is the authenticated client's ID for logs. Before
+// authentication it is the empty Attr, which slog omits.
+func clientAttr(r *http.Request) slog.Attr {
+	id, ok := auth.FromContext(r.Context())
+	if !ok {
+		return slog.Attr{}
+	}
+	return slog.String("client_id", id.ClientID)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -15,11 +15,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ipekutku/llm-gateway/internal/auth"
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/httpapi"
 	"github.com/ipekutku/llm-gateway/internal/llm"
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
+	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/retry"
 	"github.com/ipekutku/llm-gateway/internal/routing"
 )
@@ -53,7 +55,7 @@ func main() {
 // run loads the configuration, starts the server, and serves until ctx is
 // canceled.
 func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) error {
-	cfg, err := loadConfig(getenv)
+	cfg, err := loadConfig(getenv, os.ReadFile)
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}
@@ -91,6 +93,13 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) e
 	if (cfg.OpenAI != nil && cfg.OpenAI.FallbackTo != "") || (cfg.Anthropic != nil && cfg.Anthropic.FallbackTo != "") {
 		attrs = append(attrs, slog.Duration("provider_timeout", cfg.ProviderTimeout))
 	}
+	disabled := 0
+	for _, c := range cfg.Clients {
+		if c.Disabled {
+			disabled++
+		}
+	}
+	attrs = append(attrs, slog.Int("clients", len(cfg.Clients)-disabled), slog.Int("disabled_clients", disabled))
 	logger.Info("gateway listening", attrs...)
 
 	srv := &http.Server{
@@ -103,10 +112,11 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) e
 	return err
 }
 
-// newHandler builds the provider clients, router, and HTTP handler for cfg.
-// Each provider client is wrapped with retries and, above them, a circuit
-// breaker; the router's fallback sits above both. A nil httpClient uses a
-// client built by newUpstreamClient.
+// newHandler builds the provider clients, router, client authentication,
+// rate limiter, and HTTP handler for cfg. Each provider client is wrapped
+// with retries and, above them, a circuit breaker; the router's fallback
+// sits above both. A nil httpClient uses a client built by
+// newUpstreamClient.
 func newHandler(cfg config, httpClient *http.Client, logger *slog.Logger) (http.Handler, error) {
 	if httpClient == nil {
 		httpClient = newUpstreamClient(cfg)
@@ -156,7 +166,15 @@ func newHandler(cfg config, httpClient *http.Client, logger *slog.Logger) (http.
 	if err != nil {
 		return nil, err
 	}
-	return httpapi.New(router, cfg.UpstreamTimeout, logger)
+	authenticator, err := auth.New(cfg.Clients)
+	if err != nil {
+		return nil, err
+	}
+	limiter, err := ratelimit.New(cfg.RateLimits)
+	if err != nil {
+		return nil, err
+	}
+	return httpapi.New(router, authenticator, limiter, cfg.UpstreamTimeout, logger)
 }
 
 // resilient wraps a provider client with the retry policy and, above it,

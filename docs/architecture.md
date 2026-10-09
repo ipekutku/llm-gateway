@@ -1,15 +1,15 @@
 # Architecture
 
-This document describes the architecture as implemented in v0.3: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, and a circuit breaker per provider. Milestone 4 (v0.4) work in progress adds client authentication and per-client rate limiting, which are implemented but not yet wired into the gateway.
+This document describes the architecture as implemented in v0.4: an HTTP endpoint with client authentication and per-client rate limits, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, and a circuit breaker per provider.
 
 ## Request flow
 
 ```text
-HTTP request → httpapi → routing (fallback) → breaker → retry → provider adapter → upstream HTTP request
-                  └──────────────────── shared internal/llm types ────────────────────┘
+HTTP request → httpapi (auth → rate limit) → routing (fallback) → breaker → retry → provider adapter → upstream HTTP request
+                  └──────────────────────────── shared internal/llm types ────────────────────────────┘
 ```
 
-The incoming request's `context.Context` is passed through every step to the outbound upstream request. The handler derives it once, adding the upstream deadline (see [Upstream timeouts](#upstream-timeouts)); nothing below the handler replaces or detaches it.
+The handler authenticates the client and applies its rate limits before reading the request body (see [Client authentication](#client-authentication) and [Rate limiting](#rate-limiting)). The incoming request's `context.Context`, carrying the client's identity, is passed through every step to the outbound upstream request. The handler derives it once, adding the upstream deadline (see [Upstream timeouts](#upstream-timeouts)); nothing below the handler replaces or detaches it.
 
 ## Packages and dependency boundaries
 
@@ -90,7 +90,7 @@ Provider adapters must return every failure, including transport errors and canc
 
 ## HTTP API
 
-`httpapi.New(provider, upstreamTimeout, logger)` returns an `http.Handler` serving `POST /v1/chat/completions`. The provider is normally the router. Other methods on the endpoint receive 405 with `Allow: POST`, and other paths receive 404; both use the standard `ServeMux` responses.
+`httpapi.New(provider, authenticator, limiter, upstreamTimeout, logger)` returns an `http.Handler` serving `POST /v1/chat/completions`. The provider is normally the router. Other methods on the endpoint receive 405 with `Allow: POST`, and other paths receive 404; both use the standard `ServeMux` responses.
 
 The endpoint implements a deliberately small subset of the OpenAI Chat Completions format. It does not claim full API or SDK compatibility. Public wire types are unexported in `httpapi` and are translated to and from the neutral `llm` types.
 
@@ -144,6 +144,10 @@ Errors use a gateway-owned envelope:
 
 | Condition | Status | `code` | `type` |
 |---|---|---|---|
+| No `Authorization` header, several, or not `Bearer <key>` | 401 | `missing_api_key` | `authentication_error` |
+| Unknown or disabled key (`auth.ErrInvalidKey`, `auth.ErrDisabledKey`) | 401 | `invalid_api_key` | `authentication_error` |
+| Client over its request rate | 429 | `rate_limit_exceeded` | `rate_limit_error` |
+| Client at its concurrent request limit | 429 | `concurrency_limit_exceeded` | `rate_limit_error` |
 | Invalid JSON, validation failure, streaming requested | 400 | `invalid_request` | `invalid_request_error` |
 | Body exceeds 1 MiB | 413 | `request_too_large` | `invalid_request_error` |
 | Unknown model (`llm.ErrUnknownModel`) | 404 | `model_not_found` | `invalid_request_error` |
@@ -153,14 +157,15 @@ Errors use a gateway-owned envelope:
 | Transport failure, or a malformed, oversized, or unusable upstream response | 502 | `upstream_error` | `server_error` |
 | `context.DeadlineExceeded` while the incoming request is still active | 504 | `upstream_timeout` | `server_error` |
 | Circuit breaker open (`llm.ErrCircuitOpen`) and no fallback answered | 503 | `provider_unavailable` | `server_error` |
-| Any other error | 500 | `internal_error` | `server_error` |
+| Any other error, including an authenticated client without rate limits | 500 | `internal_error` | `server_error` |
 
 Decisions:
 
 - **Context errors are checked first.** If the incoming request's context is done, the client is gone. The handler logs the cancellation and writes nothing. Otherwise a wrapped `DeadlineExceeded` maps to 504, and a wrapped `Canceled` maps to 502, because a canceled provider operation alone does not prove that the client disconnected.
+- **Gateway-client failures are distinct from provider failures.** A client's own 429 is `rate_limit_exceeded` or `concurrency_limit_exceeded`; a provider rate limiting the gateway stays `provider_rate_limited`. A gateway 401 is always about the client's gateway key, never a provider key.
 - **Upstream 401 and 403 map to 502.** They indicate a gateway credential problem, not a client mistake.
 - **Messages are fixed per category.** Validation messages are gateway-authored and describe the client's mistake. Upstream messages and bodies are never returned to the caller.
-- **Each failure is logged once** at the handler with `slog`: status, code, model, provider, upstream status, and the error. Logs never include credentials, prompt or completion content, or raw upstream bodies. 5xx responses log at error level and 4xx responses at warn.
+- **Each failure is logged once** at the handler with `slog`: status, code, the authenticated `client_id`, model, provider, upstream status, and the error. Logs never include credentials, prompt or completion content, or raw upstream bodies. 5xx responses log at error level and 4xx responses at warn.
 
 A slow upstream that exceeds the upstream timeout produces 504 `upstream_timeout`, as long as the client is still connected.
 
@@ -228,13 +233,14 @@ Response fixtures follow Anthropic's documented response shape. No live model ha
 
 ## Configuration
 
-Configuration is read once at startup from the environment in `cmd/gateway`. There is no configuration file or framework.
+Configuration is read once at startup in `cmd/gateway`: settings from the environment, and the gateway clients from the JSON file named by `GATEWAY_CLIENTS_FILE`. There is no configuration framework. Changing clients requires a restart.
 
 | Variable | Rule |
 |---|---|
 | `OPENAI_MODEL`, `OPENAI_API_KEY` | Both absent disables OpenAI. Both present routes that one model to OpenAI. Only one present fails startup. |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Same rule for Anthropic. |
-| `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`, so the unauthenticated gateway is not exposed by accident. |
+| `GATEWAY_CLIENTS_FILE` | Required. Path of the clients file (see below). |
+| `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. The gateway serves plain HTTP, so gateway keys would cross the network unencrypted; exposing it beyond the host needs TLS terminated in front of it. |
 | `GATEWAY_UPSTREAM_TIMEOUT` | Upstream time budget per request, as a Go duration (`90s`, `2m`). Default `120s`. |
 | `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Limit on the upstream TCP dial and, separately, the TLS handshake. Default `10s`. |
 | `GATEWAY_RETRY_MAX_ATTEMPTS` | Total attempts per request, including the first, from 1 to 10. Default `3`; `1` disables retries. |
@@ -251,9 +257,33 @@ Configuration is read once at startup from the environment in `cmd/gateway`. The
 - **Model IDs are not defaulted.** A built-in model name would go stale; the operator always chooses.
 - **Durations must be positive.** An unparsable, zero, or negative duration, an attempt count outside 1–10, or a breaker failure count outside 1–100 fails startup and is reported together with any other configuration errors.
 - **Fallbacks must be usable.** A `*_FALLBACK` value other than the other provider's name, a fallback on a disabled provider, or a fallback to a disabled provider fails startup.
-- The startup log names the configured models, never the keys.
+- The startup log names the configured models and counts the enabled and disabled clients, never logging keys or key hashes.
 
-`newHandler` builds one shared upstream `http.Client`, one adapter per enabled provider wrapped in a `retry.Provider` and then a `breaker.Breaker`, the routes with their fallbacks, the router, and the HTTP handler. A fallback reuses the other provider's wrapped client, so each provider has exactly one breaker, whether a request reaches it through its own model or as a fallback. The startup log includes the fallbacks, timeouts, retry policy, and breaker settings.
+### Clients file
+
+```json
+{
+  "clients": [
+    {"id": "team-a", "key_sha256": "<64 hex characters>"},
+    {"id": "team-b", "key_sha256": "<64 hex characters>", "requests_per_minute": 120, "burst": 20, "max_concurrent": 10},
+    {"id": "team-old", "key_sha256": "<64 hex characters>", "disabled": true}
+  ]
+}
+```
+
+| Field | Rule |
+|---|---|
+| `id` | Required client ID: 1 to 64 ASCII letters, digits, `-`, `_`, or `.`; unique. |
+| `key_sha256` | Required hex SHA-256 hash of the client's key, in either case; unique across clients. |
+| `disabled` | Optional. `true` rejects the key with 401. Default `false`. |
+| `requests_per_minute`, `burst`, `max_concurrent` | Optional limits from 1 to 1,000,000. Defaults `60`, `10`, and `5`. |
+
+- **Strict.** The file must be one JSON object. Unknown fields, such as a plaintext `key`, wrong types, and trailing data fail startup, so a typo cannot silently drop a limit.
+- **At least one enabled client.** Otherwise every request would be rejected, so startup fails instead.
+- **Errors name the client's position and ID**, never a hash. All entry errors are reported together.
+- **Hashes are not secrets**, but the file decides who may use the gateway and should be writable only by the operator.
+
+`newHandler` builds one shared upstream `http.Client`, one adapter per enabled provider wrapped in a `retry.Provider` and then a `breaker.Breaker`, the routes with their fallbacks, the router, the authenticator and rate limiter from the clients, and the HTTP handler. A fallback reuses the other provider's wrapped client, so each provider has exactly one breaker, whether a request reaches it through its own model or as a fallback. The startup log includes the fallbacks, timeouts, retry policy, and breaker settings.
 
 ## Upstream timeouts
 
@@ -349,7 +379,7 @@ Decisions:
 
 ## Client authentication
 
-`auth.Authenticator` maps gateway API keys to clients. It is not yet wired into `cmd/gateway` or `internal/httpapi`; the planned flow is:
+`auth.Authenticator` maps gateway API keys to clients. Every request to the chat completions endpoint is authenticated first:
 
 ```text
 Authorization: Bearer <gateway key> → httpapi → Authenticator → client identity in the request context → rate limit → router
@@ -370,12 +400,15 @@ Decisions:
 - **Only hashes are stored.** The gateway holds the SHA-256 hash of each key, never the key, so the key configuration cannot be used to authenticate.
 - **Unsalted SHA-256, because keys are random.** A slow password hash (bcrypt, Argon2) protects low-entropy secrets against guessing. Gateway keys must be high-entropy random values (for example `openssl rand -base64 32`), which a fast hash already protects, and a fast hash keeps per-request authentication cheap.
 - **Lookup by hash, not by comparing keys.** The presented key is hashed and looked up in a map. Lookup timing depends only on the hash, which an attacker cannot steer toward a valid key's hash, so no comparison over the secret runs at all. This replaces a constant-time comparison against every stored key.
-- **Disabled is distinct from invalid internally.** The two errors let the gateway log why a key was rejected; the public response is decided when the HTTP layer is wired.
+- **Disabled looks invalid to the client.** Both get the same 401 `invalid_api_key` response, so a response never reveals whether a key once existed. The log records the reason and, for a disabled key, the client.
+- **Authenticate before anything else.** Authentication and rate limiting run before the body is read, so an unauthenticated or limited request costs the gateway almost nothing and never reaches a provider. Requests to unknown paths or with other methods still get 404 or 405 from the `ServeMux` without authentication; those reveal only which endpoint exists.
+- **Header rules.** Exactly one `Authorization` header with the scheme `Bearer` (any case), one or more spaces, and a key without whitespace. Anything else is `missing_api_key`. Every 401 carries `WWW-Authenticate: Bearer`, with `error="invalid_token"` for a rejected key, as RFC 6750 describes.
+- **Identity in the context.** The handler stores the client's `auth.Identity` in the request context passed to the router, so every layer below can identify the client. For now only the handler's logs use it.
 - **One key per client.** Key rotation with several keys per client is deferred; replacing a key means replacing its hash.
 
 ## Rate limiting
 
-`ratelimit.Limiter` enforces each client's limits. It is not yet wired into the gateway; it is planned to run in the HTTP layer right after authentication, before the request body is read, so a limited client costs the gateway as little as possible.
+`ratelimit.Limiter` enforces each client's limits. The handler applies it right after authentication, before the request body is read, so a limited client costs the gateway as little as possible. The concurrency slot is held until the handler returns, whatever the outcome.
 
 Every client has two independent limits, configured as `ratelimit.Limits`:
 
@@ -394,7 +427,8 @@ Decisions:
 - **Fixed clients, per-client locks.** The set of clients is fixed when the limiter is built, so its memory does not grow with traffic, and each client has its own lock, so clients never wait on each other.
 - **Values from 1 to 1,000,000.** The bound keeps the arithmetic far from overflow. There is no "unlimited" value.
 - **State is per process.** Several gateway instances each enforce their own limits, so a client can use up to N times its limit across N instances. Shared limits are a Milestone 7 (Redis) concern.
-- **No logging.** The HTTP layer will log each rejection once, like any other failed request.
+- **Retry-After for the request rate.** A `rate_limit_exceeded` response sets `Retry-After` to `RetryAfter` in whole seconds, rounded up and at least 1, so a client that waits that long is admitted. A `concurrency_limit_exceeded` response has no `Retry-After`.
+- **Logged at the handler.** Each rejection is logged once with the client and the limit, like any other failed request; the limiter itself does not log.
 
 ## Server lifecycle
 
@@ -413,8 +447,8 @@ All tests run without credentials or network access, using `httptest` servers.
 |---|---|
 | `internal/auth` | Key lookup, invalid, empty, and disabled keys, client validation, and concurrent use. |
 | `internal/ratelimit` | Burst, refill, and sustained rates with exact `RetryAfter`, concurrency limits and release, independent clients, and concurrent use, against a manual clock. |
-| `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers. |
+| `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers; in `httpapi` also the `Authorization` header rules, 401 and 429 responses, identity in the provider's context, concurrency slots released on every outcome, and `client_id` in logs. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
-| `cmd/gateway` | Configuration rules, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, retries (recovery for each retryable status, exhaustion, non-retryable statuses, `Retry-After` beyond the budget, refused connections, and client cancellation during a retry wait), fallback (on failures and on a primary timeout, not on a rejected request, both providers failing), circuit breaking (opening, failing fast without calling the upstream, routing straight to the fallback, and one breaker shared by a provider's own route and fallback use), client cancellation and upstream timeouts reaching the upstream, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |
+| `cmd/gateway` | Configuration rules, including the clients file, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, retries (recovery for each retryable status, exhaustion, non-retryable statuses, `Retry-After` beyond the budget, refused connections, and client cancellation during a retry wait), fallback (on failures and on a primary timeout, not on a rejected request, both providers failing), circuit breaking (opening, failing fast without calling the upstream, routing straight to the fallback, and one breaker shared by a provider's own route and fallback use), client cancellation and upstream timeouts reaching the upstream, authentication (anonymous, malformed, unknown, provider, and disabled keys rejected before any upstream call; gateway and provider credentials never crossing), per-client rate limits with `Retry-After`, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |
 
 Tests coordinate with channels. Timeouts are used only as failure guards. CI runs `gofmt`, `go vet`, `go test -race`, and `go build ./cmd/gateway`.
