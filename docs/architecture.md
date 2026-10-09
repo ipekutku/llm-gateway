@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the architecture as implemented in v0.3: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, and a circuit breaker per provider. Milestone 4 (v0.4) work in progress adds client authentication, which is implemented but not yet wired into the gateway.
+This document describes the architecture as implemented in v0.3: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, and a circuit breaker per provider. Milestone 4 (v0.4) work in progress adds client authentication and per-client rate limiting, which are implemented but not yet wired into the gateway.
 
 ## Request flow
 
@@ -20,6 +20,7 @@ The incoming request's `context.Context` is passed through every step to the out
 | `internal/retry` | Bounded retries of transient upstream failures, as an `llm.Provider` that wraps another. |
 | `internal/breaker` | Circuit breaker for one provider, as an `llm.Provider` that wraps another. |
 | `internal/auth` | Gateway client API keys and the request's client identity. |
+| `internal/ratelimit` | Per-client request rate and concurrency limits. |
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
 | `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
 | `internal/provider/anthropic` | Anthropic Messages client with private wire types. |
@@ -372,6 +373,29 @@ Decisions:
 - **Disabled is distinct from invalid internally.** The two errors let the gateway log why a key was rejected; the public response is decided when the HTTP layer is wired.
 - **One key per client.** Key rotation with several keys per client is deferred; replacing a key means replacing its hash.
 
+## Rate limiting
+
+`ratelimit.Limiter` enforces each client's limits. It is not yet wired into the gateway; it is planned to run in the HTTP layer right after authentication, before the request body is read, so a limited client costs the gateway as little as possible.
+
+Every client has two independent limits, configured as `ratelimit.Limits`:
+
+| Limit | Setting | Behavior |
+|---|---|---|
+| Request rate (`request_rate`) | `RequestsPerMinute`, `Burst` | A token bucket of `Burst` requests, refilled at `RequestsPerMinute`. A request with no token left is rejected with `RetryAfter`, the exact time until the next token. |
+| Concurrent requests (`concurrent_requests`) | `MaxConcurrent` | At most this many of the client's requests in progress. A request beyond it is rejected; `RetryAfter` is 0, because a slot frees when another request finishes, not at a known time. |
+
+`Acquire(clientID)` either admits a request and returns a `release` function, which the caller must call once when the request has finished, or returns a `*ratelimit.Error` naming the client and the limit. The error matches `ratelimit.ErrLimitExceeded`. A client without configured limits returns an error wrapping `ratelimit.ErrUnknownClient`; that indicates a gateway bug, not a client mistake.
+
+Decisions:
+
+- **Reject, never queue.** A limited request fails at once instead of waiting. Waiting would hold connections and request time for a client that is already over its share.
+- **A rejected request consumes nothing.** It neither takes a token nor counts as concurrent, so a client retrying too eagerly does not push its own recovery further away.
+- **GCRA form of the token bucket.** Instead of a token count, each client stores the time its bucket would be full again. This is equivalent to a token bucket but needs only integer time arithmetic, so refills and `RetryAfter` are exact and tests are deterministic. The one rounding is the time between requests, `1m / RequestsPerMinute`, truncated to whole nanoseconds. When the rate does not divide a minute evenly (for example 7 per minute), the effective rate is higher by less than one nanosecond per request, which is negligible.
+- **Fixed clients, per-client locks.** The set of clients is fixed when the limiter is built, so its memory does not grow with traffic, and each client has its own lock, so clients never wait on each other.
+- **Values from 1 to 1,000,000.** The bound keeps the arithmetic far from overflow. There is no "unlimited" value.
+- **State is per process.** Several gateway instances each enforce their own limits, so a client can use up to N times its limit across N instances. Shared limits are a Milestone 7 (Redis) concern.
+- **No logging.** The HTTP layer will log each rejection once, like any other failed request.
+
 ## Server lifecycle
 
 - `http.Server` sets `ReadHeaderTimeout` to 5 seconds. Other server timeouts are left unset; handler time is bounded by the upstream timeout instead.
@@ -388,6 +412,7 @@ All tests run without credentials or network access, using `httptest` servers.
 | Level | What it proves |
 |---|---|
 | `internal/auth` | Key lookup, invalid, empty, and disabled keys, client validation, and concurrent use. |
+| `internal/ratelimit` | Burst, refill, and sustained rates with exact `RetryAfter`, concurrency limits and release, independent clients, and concurrent use, against a manual clock. |
 | `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
 | `cmd/gateway` | Configuration rules, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, retries (recovery for each retryable status, exhaustion, non-retryable statuses, `Retry-After` beyond the budget, refused connections, and client cancellation during a retry wait), fallback (on failures and on a primary timeout, not on a rejected request, both providers failing), circuit breaking (opening, failing fast without calling the upstream, routing straight to the fallback, and one breaker shared by a provider's own route and fallback use), client cancellation and upstream timeouts reaching the upstream, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |

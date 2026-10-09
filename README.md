@@ -215,8 +215,8 @@ The same checks run automatically through GitHub Actions for pull requests and c
 | Component | Status |
 |---|---|
 | Client API keys and identity (`internal/auth`) | ✅ Done |
-| Per-client rate limiting (`internal/ratelimit`) | ⏳ Next |
-| Clients file configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ⏳ Planned |
+| Per-client rate limiting (`internal/ratelimit`) | ✅ Done |
+| Clients file configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ⏳ Next |
 
 ### v0.3
 
