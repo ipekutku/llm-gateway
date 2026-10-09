@@ -200,7 +200,7 @@ Each adapter's constructor takes an API key, a base URL, and an `*http.Client`.
 - **Refusals map to `content_filter`.** A refusal arrives as a `refusal` string instead of `content`. It is returned as the message text with finish reason `content_filter`, matching the Anthropic adapter.
 - **Finish reasons.** `stop`, `length`, and `content_filter` map to the neutral values of the same name. `tool_calls`, `function_call`, and any undocumented reason are protocol errors.
 
-Response fixtures follow the example in OpenAI's published OpenAPI specification. No live model has been verified yet; the README will list tested model IDs.
+Response fixtures follow the example in OpenAI's published OpenAPI specification. The smoke test verified `gpt-4o` (reported as `gpt-4o-2024-08-06`) live on 2026-10-09: completion, `stop` and `length` finish reasons, and usage. The README lists live-verified models and what the live run did not cover.
 
 ### Anthropic
 
@@ -231,7 +231,7 @@ Stop reasons, as documented for API version `2023-06-01`:
 
 On models that always think, thinking tokens count toward `max_tokens`. A small limit, including the gateway default of 1024, can therefore end with `length` and little or no text. The same applies to OpenAI reasoning models.
 
-Response fixtures follow Anthropic's documented response shape. No live model has been verified yet.
+Response fixtures follow Anthropic's documented response shape. The smoke test verified `claude-opus-5-5` live on 2026-10-09: completion, the `stop` and `length` finish reasons, and usage.
 
 ## Configuration
 
