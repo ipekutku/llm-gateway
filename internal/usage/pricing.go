@@ -12,9 +12,12 @@
 package usage
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -172,4 +175,11 @@ func (p *Pricing) Cost(m Model, u llm.Usage) (Cost, error) {
 		return 0, fmt.Errorf("%w for %s/%s", ErrNoPrice, m.Provider, m.Model)
 	}
 	return price.Cost(u)
+}
+
+// Models returns the priced models, sorted by provider and then model.
+func (p *Pricing) Models() []Model {
+	return slices.SortedFunc(maps.Keys(p.prices), func(a, b Model) int {
+		return cmp.Or(cmp.Compare(a.Provider, b.Provider), cmp.Compare(a.Model, b.Model))
+	})
 }

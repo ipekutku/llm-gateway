@@ -42,7 +42,7 @@ Milestone 5 is feature-complete. It adds per-client usage records and estimated 
 * every request gets a gateway-assigned ID, returned in the `X-Request-ID` header and logged with failures
 * cost estimation from per-model prices for input, cached input read and written, and output tokens, with exact integer arithmetic; a model without a price has an unknown cost, never zero
 * a PostgreSQL connection pool and usage store, with embedded forward-only migrations protected by an advisory lock, exact cost storage, and integration tests against disposable databases
-* an asynchronous recorder with a bounded queue, batch writes, write timeouts, and shutdown draining; queue overflow and failed writes are logged, and accepted records survive request cancellation
+* an asynchronous recorder with a bounded queue, batch writes, write timeouts, and shutdown draining; queue overflow is logged as a periodic count and failed writes are logged, and accepted records survive request cancellation
 * required database and pricing-file configuration, an explicit migration command, startup schema checks, and one usage record for each validated request, including failures and cancellations
 * documented SQL reports for usage and estimated cost per client, answering model, and UTC day, with coverage counts for unknown usage and cost
 
@@ -143,7 +143,7 @@ Save a pricing file as `prices.json`. Prices are non-negative decimal strings in
 }
 ```
 
-The file must contain a `prices` array; every entry requires the provider, configured model name, and all four prices. Unknown fields and duplicate provider/model entries are rejected. A model absent from the file has an unknown cost (`NULL`), while its token usage is still recorded. `{"prices": []}` is valid if all costs should be unknown. Prices are read once at startup; restart after changing them.
+The file must contain a `prices` array; every entry requires the provider, configured model name, and all four prices. Unknown fields and duplicate provider/model entries are rejected. A model absent from the file has an unknown cost (`NULL`), while its token usage is still recorded. At startup the gateway logs a warning for each configured model without a price and for each price that matches no configured model, which usually means a typo in the provider or model name. `{"prices": []}` is valid if all costs should be unknown. Prices are read once at startup; restart after changing them.
 
 Then configure at least one provider and start the gateway:
 
@@ -194,8 +194,8 @@ The `model` field must match a configured model exactly; the request is routed t
 | Variable | Description |
 |---|---|
 | `GATEWAY_CLIENTS_FILE` | Required. Path of the JSON file listing the gateway's clients (see below). |
-| `GATEWAY_DATABASE_URL` | Required. PostgreSQL URL or connection string. Startup requires a reachable database with the current schema; `go run ./cmd/gateway migrate` applies pending migrations. Never log or commit this setting if it contains credentials. |
-| `GATEWAY_PRICING_FILE` | Required. Path of the JSON pricing file, read once at startup. Missing model prices produce unknown costs. |
+| `GATEWAY_DATABASE_URL` | Required. PostgreSQL URL or connection string. Startup requires a reachable database with the current schema; `go run ./cmd/gateway migrate` applies pending migrations. Never log or commit this setting if it contains credentials. For any database not on the local host, add `sslmode=verify-full` (with `sslrootcert` if the server's CA is not in the system store): the default, `prefer`, uses TLS when offered but does not verify the server, so the password and records could be intercepted. |
+| `GATEWAY_PRICING_FILE` | Required. Path of the JSON pricing file, read once at startup. Missing model prices produce unknown costs and a startup warning. |
 | `OPENAI_MODEL`, `OPENAI_API_KEY` | Enable OpenAI for one model. Set both or neither. |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Enable Anthropic for one model. Set both or neither. |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
@@ -290,7 +290,8 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 * Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
 * Usage records cover requests that pass body validation, including unknown models and upstream failures. Authentication, gateway rate-limit, malformed-body, and body-size rejections are excluded. A disconnected client is recorded as status `499` with `client_closed`; this status is never sent as a response.
-* Accounting is asynchronous: a full queue drops new records, failed batches are logged and discarded, and a shutdown deadline can lose pending records. Database failure after startup does not fail otherwise successful requests. Records contain metadata, tokens, and estimated costs, never prompt or completion content.
+* Accounting is asynchronous: a full queue drops new records, a failed batch is retried once and then logged and discarded, and a shutdown deadline can lose pending records. Database failure after startup does not fail otherwise successful requests. Records contain metadata, tokens, and estimated costs, never prompt or completion content.
+* Usage records are never deleted automatically; the table grows with traffic. Delete old rows on your own schedule; [docs/usage.md](docs/usage.md#retention) shows how.
 * Estimated costs cover only provider-reported usage, including a successful generation whose client disconnected before receiving it. Failed retries and a failed primary before fallback may incur charges without reporting usage. Unknown usage and cost are stored as `NULL`, never as fabricated zeros.
 
 ### Querying usage

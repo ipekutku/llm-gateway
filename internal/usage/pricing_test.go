@@ -3,6 +3,7 @@ package usage
 import (
 	"errors"
 	"math"
+	"slices"
 	"sync"
 	"testing"
 
@@ -245,4 +246,27 @@ func TestPricingConcurrentUse(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+func TestPricingModels(t *testing.T) {
+	p, err := NewPricing(map[Model]Price{
+		{"openai", "gpt-4o"}:              gpt4o,
+		{"anthropic", "claude-opus-5-5"}:  opus,
+		{"anthropic", "claude-haiku-5-5"}: opus,
+	})
+	if err != nil {
+		t.Fatalf("NewPricing() error = %v", err)
+	}
+	want := []Model{{"anthropic", "claude-haiku-5-5"}, {"anthropic", "claude-opus-5-5"}, {"openai", "gpt-4o"}}
+	if got := p.Models(); !slices.Equal(got, want) {
+		t.Errorf("Models() = %v, want %v", got, want)
+	}
+
+	empty, err := NewPricing(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := empty.Models(); len(got) != 0 {
+		t.Errorf("Models() of an empty Pricing = %v, want none", got)
+	}
 }

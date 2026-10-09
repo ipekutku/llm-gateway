@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -76,6 +77,53 @@ func TestLoadPricingRejectsMalformedFiles(t *testing.T) {
 	}
 	if _, err := loadPricing(env(map[string]string{pricingFileVar: pricingPath}), files(nil)); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("missing file error = %v, want preserved filesystem cause", err)
+	}
+}
+
+func TestWarnPricingGaps(t *testing.T) {
+	const prices = `{"prices":[
+		{"provider":"openai","model":"gpt-4o","input":"2.5","cache_read":"1.25","cache_write":"0","output":"10"},
+		{"provider":"anthropic","model":"claude-opus-5.5","input":"5","cache_read":"0.5","cache_write":"6.25","output":"25"}
+	]}`
+	cfg, err := loadConfig(env(map[string]string{
+		"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+		"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey,
+		clientsFileVar: clientsPath, databaseURLVar: testDatabaseURL, pricingFileVar: pricingPath,
+	}), files(map[string]string{clientsPath: testClientsFile, pricingPath: prices}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	warnPricingGaps(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	// The Anthropic price has a typo: a dot instead of a hyphen.
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d warnings, want 2:\n%s", len(lines), logs.String())
+	}
+	if !strings.Contains(lines[0], "not configured") || !strings.Contains(lines[0], "model=claude-opus-5.5") {
+		t.Errorf("first warning = %q, want the unused price", lines[0])
+	}
+	if !strings.Contains(lines[1], "will be unknown") || !strings.Contains(lines[1], "model=claude-opus-5-5") {
+		t.Errorf("second warning = %q, want the unpriced configured model", lines[1])
+	}
+	if strings.Contains(logs.String(), "gpt-4o") {
+		t.Errorf("warned about the correctly priced model:\n%s", logs.String())
+	}
+}
+
+func TestWarnPricingGapsQuietWhenComplete(t *testing.T) {
+	cfg, err := loadConfig(env(map[string]string{
+		"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+		clientsFileVar: clientsPath, databaseURLVar: testDatabaseURL, pricingFileVar: pricingPath,
+	}), files(map[string]string{clientsPath: testClientsFile, pricingPath: `{"prices":[` + priceEntry + `]}`}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	warnPricingGaps(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+	if logs.Len() != 0 {
+		t.Errorf("warnings for complete pricing:\n%s", logs.String())
 	}
 }
 
