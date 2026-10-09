@@ -33,9 +33,19 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Current Milestone
 
-### v0.4 — Authentication and Rate Limiting
+### v0.5 — Usage and Cost Accounting
 
-The fourth milestone turns the gateway from an anonymous proxy into a multi-client service. It is feature-complete:
+The fifth milestone measures how the gateway is used and what that costs: every request's token usage and estimated cost, stored in PostgreSQL. It is in progress. So far:
+
+* token usage keeps the prompt-cache detail providers price differently: cached input read (OpenAI and Anthropic) and written (Anthropic), as part of the input count
+* the provider that answered is known for every response, including one served by a fallback
+* every request gets a gateway-assigned ID, returned in the `X-Request-ID` header and logged with failures
+
+Cost estimation and persisting usage records are not implemented yet.
+
+### v0.4 — Authentication and Rate Limiting ✅
+
+The fourth milestone turned the gateway from an anonymous proxy into a multi-client service:
 
 * every request needs a gateway-issued API key, sent as `Authorization: Bearer <key>`; anonymous requests get `401`
 * gateway keys are separate from the provider keys, which stay server-side and never reach clients
@@ -225,7 +235,7 @@ The live run did not cover refusals (`content_filter`), prompt-cache token accou
 | `stream` | Only `false` or absent. Streaming is not supported. |
 | anything else | Accepted but ignored (for example `temperature`, `tools`, `n`). |
 
-The response contains exactly one choice with `finish_reason` `stop`, `length`, or `content_filter`, plus token usage. Errors use the envelope `{"error": {"message", "type", "code"}}`; see [docs/architecture.md](docs/architecture.md#error-mapping) for the full status mapping.
+The response contains exactly one choice with `finish_reason` `stop`, `length`, or `content_filter`, plus token usage. Every response, including errors, carries an `X-Request-ID` header; quote it when reporting a problem. A successful response's `id` is `chatcmpl-` followed by the same ID. An `X-Request-ID` sent by the client is ignored. Errors use the envelope `{"error": {"message", "type", "code"}}`; see [docs/architecture.md](docs/architecture.md#error-mapping) for the full status mapping.
 
 ### Limitations
 
@@ -270,7 +280,19 @@ make smoke
 
 ## Project Status
 
-🚧 **Early development** — v0.4 is feature-complete.
+🚧 **Early development** — v0.5 is in progress.
+
+### v0.5
+
+| Component | Status |
+|---|---|
+| Provider and prompt-cache tokens in neutral usage (`internal/llm`, `internal/provider/*`) | ✅ Done |
+| Request IDs (`internal/httpapi`) | ✅ Done |
+| Pricing and cost estimation (`internal/usage`) | ⏳ Next |
+| PostgreSQL store and migrations | ⏳ Planned |
+| Asynchronous usage recorder | ⏳ Planned |
+| Usage accounting configuration, wiring, and end-to-end tests | ⏳ Planned |
+| Usage queries and documentation | ⏳ Planned |
 
 ### v0.4
 

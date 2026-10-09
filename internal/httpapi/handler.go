@@ -24,6 +24,10 @@ import (
 // ChatCompletionsPath is the path of the chat completions endpoint.
 const ChatCompletionsPath = "/v1/chat/completions"
 
+// RequestIDHeader is the response header carrying the ID the gateway
+// assigned to the request.
+const RequestIDHeader = "X-Request-ID"
+
 // bodyReadTimeout bounds how long a client may take to send a request body,
 // counted from when its headers have been read. It also bounds how long the
 // server spends discarding the unread body of a rejected request. Replaced
@@ -55,6 +59,11 @@ type handler struct {
 // Requests to other paths receive 404, and other methods on the endpoint
 // receive 405 with an Allow header.
 //
+// Every request is given a random ID when it arrives, returned in the
+// RequestIDHeader response header and logged with failures. A successful
+// completion's id is "chatcmpl-" followed by it. An X-Request-ID sent by the
+// client is ignored.
+//
 // Request bodies must arrive within bodyReadTimeout, or the response is
 // 408. The time to wait for the upstream is not limited by it.
 func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *ratelimit.Limiter, upstreamTimeout time.Duration, log *slog.Logger) (http.Handler, error) {
@@ -84,7 +93,10 @@ func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *rate
 		// TestBodyReadDeadlineDoesNotLimitUpstreamWait. An unsupported
 		// writer, such as a test recorder, gets no deadline.
 		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
-		mux.ServeHTTP(w, r)
+
+		id := rand.Text()
+		w.Header().Set(RequestIDHeader, id)
+		mux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
 	}), nil
 }
 
@@ -198,6 +210,7 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 		if r.Context().Err() != nil {
 			// The client is gone; there is nobody to write a response to.
 			h.log.LogAttrs(r.Context(), slog.LevelInfo, "client canceled request",
+				requestIDAttr(r),
 				clientAttr(r),
 				slog.String("model", req.Model),
 				slog.Any("error", err),
@@ -213,7 +226,7 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 		model = req.Model
 	}
 	writeJSON(w, http.StatusOK, chatResponse{
-		ID:      "chatcmpl-" + rand.Text(),
+		ID:      "chatcmpl-" + requestID(r),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   model,
@@ -238,6 +251,7 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 // bodies; err must follow the same rule, as llm.ProviderError does.
 func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err error, attrs ...slog.Attr) {
 	attrs = append(attrs,
+		requestIDAttr(r),
 		clientAttr(r),
 		slog.Int("status", e.status),
 		slog.String("code", e.code),
@@ -263,6 +277,18 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err e
 		Type:    e.typ,
 		Code:    e.code,
 	}})
+}
+
+type requestIDKey struct{}
+
+// requestID is the ID assigned to r when it arrived.
+func requestID(r *http.Request) string {
+	id, _ := r.Context().Value(requestIDKey{}).(string)
+	return id
+}
+
+func requestIDAttr(r *http.Request) slog.Attr {
+	return slog.String("request_id", requestID(r))
 }
 
 // clientAttr is the authenticated client's ID for logs. Before

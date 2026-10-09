@@ -94,6 +94,10 @@ Provider adapters must return every failure, including transport errors and canc
 
 The endpoint implements a deliberately small subset of the OpenAI Chat Completions format. It does not claim full API or SDK compatibility. Public wire types are unexported in `httpapi` and are translated to and from the neutral `llm` types.
 
+### Request IDs
+
+Every request, including one rejected with 401, 404, or 405, gets an ID of 26 random base32 characters from `crypto/rand` when it arrives. It is returned in the `X-Request-ID` response header, logged as `request_id` with the request's failure or cancellation, and carried in the request context. A successful completion's `id` is `chatcmpl-` followed by it. An `X-Request-ID` header sent by the client is ignored: the ID is gateway-owned, so a client cannot make two requests share one or inject arbitrary text into logs. Usage records will be keyed by it.
+
 ### Request
 
 | Field | Rule |
@@ -118,7 +122,7 @@ A success returns 200 with exactly one choice:
 
 ```json
 {
-  "id": "chatcmpl-<26 random base32 characters>",
+  "id": "chatcmpl-<request ID>",
   "object": "chat.completion",
   "created": 1700000000,
   "model": "<provider-reported model, or the requested model>",
@@ -133,7 +137,7 @@ A success returns 200 with exactly one choice:
 }
 ```
 
-`id` (from `crypto/rand`) and `created` (Unix seconds) are gateway metadata, not upstream identifiers. `total_tokens` is the sum of the neutral input and output counts. Finish reasons are `stop`, `length`, or `content_filter`.
+`id` (the request ID with a `chatcmpl-` prefix) and `created` (Unix seconds) are gateway metadata, not upstream identifiers. `total_tokens` is the sum of the neutral input and output counts. Finish reasons are `stop`, `length`, or `content_filter`.
 
 ### Error mapping
 
@@ -167,7 +171,7 @@ Decisions:
 - **Gateway-client failures are distinct from provider failures.** A client's own 429 is `rate_limit_exceeded` or `concurrency_limit_exceeded`; a provider rate limiting the gateway stays `provider_rate_limited`. A gateway 401 is always about the client's gateway key, never a provider key.
 - **Upstream 401 and 403 map to 502.** They indicate a gateway credential problem, not a client mistake.
 - **Messages are fixed per category.** Validation messages are gateway-authored and describe the client's mistake. Upstream messages and bodies are never returned to the caller.
-- **Each failure is logged once** at the handler with `slog`: status, code, the authenticated `client_id`, model, provider, upstream status, and the error. Logs never include credentials, prompt or completion content, or raw upstream bodies. 5xx responses log at error level and 4xx responses at warn.
+- **Each failure is logged once** at the handler with `slog`: status, code, `request_id`, the authenticated `client_id`, model, provider, upstream status, and the error. Logs never include credentials, prompt or completion content, or raw upstream bodies. 5xx responses log at error level and 4xx responses at warn.
 
 A slow upstream that exceeds the upstream timeout produces 504 `upstream_timeout`, as long as the client is still connected.
 
@@ -456,7 +460,7 @@ All tests run without credentials or network access, using `httptest` servers.
 |---|---|
 | `internal/auth` | Key lookup, invalid, empty, and disabled keys, client validation, and concurrent use. |
 | `internal/ratelimit` | Burst, refill, and sustained rates with exact `RetryAfter`, concurrency limits and release, independent clients, and concurrent use, against a manual clock. |
-| `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers; in `httpapi` also the `Authorization` header rules, 401 and 429 responses, identity in the provider's context, concurrency slots released on every outcome, and `client_id` in logs. |
+| `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers; in `httpapi` also the `Authorization` header rules, 401 and 429 responses, identity in the provider's context, concurrency slots released on every outcome, `client_id` in logs, and a gateway-assigned request ID on every response and in logs. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
 | `cmd/gateway` | Configuration rules, including the clients file, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, retries (recovery for each retryable status, exhaustion, non-retryable statuses, `Retry-After` beyond the budget, refused connections, and client cancellation during a retry wait), fallback (on failures and on a primary timeout, not on a rejected request, both providers failing), circuit breaking (opening, failing fast without calling the upstream, routing straight to the fallback, and one breaker shared by a provider's own route and fallback use), client cancellation and upstream timeouts reaching the upstream, authentication (anonymous, malformed, unknown, provider, and disabled keys rejected before any upstream call; gateway and provider credentials never crossing), per-client rate limits with `Retry-After`, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |
 
