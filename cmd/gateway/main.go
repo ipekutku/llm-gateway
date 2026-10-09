@@ -78,6 +78,7 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}
+	warnPricingGaps(cfg, logger)
 	startupCtx, cancel := context.WithTimeout(ctx, databaseStartupTimeout)
 	store, err := openStore(startupCtx, cfg.DatabaseURL)
 	if err != nil {

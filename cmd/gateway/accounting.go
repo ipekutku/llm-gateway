@@ -9,11 +9,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/postgres"
+	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
+	"github.com/ipekutku/llm-gateway/internal/provider/openai"
 	"github.com/ipekutku/llm-gateway/internal/usage"
 )
 
@@ -100,6 +103,33 @@ func loadPricing(getenv func(string) string, readFile func(string) ([]byte, erro
 		prices[model] = price
 	}
 	return usage.NewPricing(prices)
+}
+
+// warnPricingGaps logs each configured model without a price, whose costs
+// will be unknown, and each price that matches no configured model, which is
+// probably a typo for one. Missing prices are allowed, so a mistake would
+// otherwise only show as NULL costs in the database.
+func warnPricingGaps(cfg config, logger *slog.Logger) {
+	var configured []usage.Model
+	if p := cfg.OpenAI; p != nil {
+		configured = append(configured, usage.Model{Provider: openai.ProviderName, Model: p.Model})
+	}
+	if p := cfg.Anthropic; p != nil {
+		configured = append(configured, usage.Model{Provider: anthropic.ProviderName, Model: p.Model})
+	}
+	priced := cfg.Pricing.Models()
+	for _, m := range priced {
+		if !slices.Contains(configured, m) {
+			logger.Warn("price for a model that is not configured; it is never used",
+				slog.String("provider", m.Provider), slog.String("model", m.Model))
+		}
+	}
+	for _, m := range configured {
+		if !slices.Contains(priced, m) {
+			logger.Warn("no price configured; costs for this model will be unknown",
+				slog.String("provider", m.Provider), slog.String("model", m.Model))
+		}
+	}
 }
 
 // migrate needs only database configuration and never calls a provider.

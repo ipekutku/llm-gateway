@@ -143,7 +143,7 @@ Save a pricing file as `prices.json`. Prices are non-negative decimal strings in
 }
 ```
 
-The file must contain a `prices` array; every entry requires the provider, configured model name, and all four prices. Unknown fields and duplicate provider/model entries are rejected. A model absent from the file has an unknown cost (`NULL`), while its token usage is still recorded. `{"prices": []}` is valid if all costs should be unknown. Prices are read once at startup; restart after changing them.
+The file must contain a `prices` array; every entry requires the provider, configured model name, and all four prices. Unknown fields and duplicate provider/model entries are rejected. A model absent from the file has an unknown cost (`NULL`), while its token usage is still recorded. At startup the gateway logs a warning for each configured model without a price and for each price that matches no configured model, which usually means a typo in the provider or model name. `{"prices": []}` is valid if all costs should be unknown. Prices are read once at startup; restart after changing them.
 
 Then configure at least one provider and start the gateway:
 
@@ -195,7 +195,7 @@ The `model` field must match a configured model exactly; the request is routed t
 |---|---|
 | `GATEWAY_CLIENTS_FILE` | Required. Path of the JSON file listing the gateway's clients (see below). |
 | `GATEWAY_DATABASE_URL` | Required. PostgreSQL URL or connection string. Startup requires a reachable database with the current schema; `go run ./cmd/gateway migrate` applies pending migrations. Never log or commit this setting if it contains credentials. |
-| `GATEWAY_PRICING_FILE` | Required. Path of the JSON pricing file, read once at startup. Missing model prices produce unknown costs. |
+| `GATEWAY_PRICING_FILE` | Required. Path of the JSON pricing file, read once at startup. Missing model prices produce unknown costs and a startup warning. |
 | `OPENAI_MODEL`, `OPENAI_API_KEY` | Enable OpenAI for one model. Set both or neither. |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Enable Anthropic for one model. Set both or neither. |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
