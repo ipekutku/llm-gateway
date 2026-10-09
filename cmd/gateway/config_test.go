@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
 	"github.com/ipekutku/llm-gateway/internal/retry"
@@ -25,10 +26,13 @@ func TestLoadConfig(t *testing.T) {
 	openaiCfg := &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: openai.DefaultBaseURL}
 	anthropicCfg := &providerConfig{Model: "claude-opus-5-5", APIKey: anthropicKey, BaseURL: anthropic.DefaultBaseURL}
 
-	// withDefaults fills in the default timeouts and retry policy.
+	// withDefaults fills in the default timeouts, retry policy, and
+	// breaker settings.
 	withDefaults := func(c config) config {
 		c.UpstreamTimeout, c.ConnectTimeout = defaultUpstreamTimeout, defaultConnectTimeout
+		c.ProviderTimeout = defaultUpstreamTimeout / 2
 		c.Retry = defaultRetry
+		c.Breaker = breaker.Settings{Failures: defaultBreakerFailures, Cooldown: defaultBreakerCooldown}
 		return c
 	}
 
@@ -76,7 +80,13 @@ func TestLoadConfig(t *testing.T) {
 				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
 				"GATEWAY_UPSTREAM_TIMEOUT": "45s", "GATEWAY_UPSTREAM_CONNECT_TIMEOUT": " 1500ms ",
 			},
-			want: config{Addr: defaultAddr, OpenAI: openaiCfg, UpstreamTimeout: 45 * time.Second, ConnectTimeout: 1500 * time.Millisecond, Retry: defaultRetry},
+			want: config{
+				Addr: defaultAddr, OpenAI: openaiCfg,
+				UpstreamTimeout: 45 * time.Second, ConnectTimeout: 1500 * time.Millisecond,
+				ProviderTimeout: 22500 * time.Millisecond, // half the upstream timeout
+				Retry:           defaultRetry,
+				Breaker:         breaker.Settings{Failures: defaultBreakerFailures, Cooldown: defaultBreakerCooldown},
+			},
 		},
 		{
 			name: "custom retry policy",
@@ -85,6 +95,25 @@ func TestLoadConfig(t *testing.T) {
 				"GATEWAY_RETRY_MAX_ATTEMPTS": " 5 ", "GATEWAY_RETRY_BASE_DELAY": "200ms", "GATEWAY_RETRY_MAX_DELAY": "200ms",
 			},
 			want: withDefaults(config{Addr: defaultAddr, OpenAI: openaiCfg}).withRetry(retry.Policy{MaxAttempts: 5, BaseDelay: 200 * time.Millisecond, MaxDelay: 200 * time.Millisecond}),
+		},
+		{
+			name: "fallbacks both ways with custom provider timeout and breaker",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey, "OPENAI_FALLBACK": "anthropic",
+				"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey, "ANTHROPIC_FALLBACK": " openai ",
+				"GATEWAY_PROVIDER_TIMEOUT": "90s",
+				"GATEWAY_BREAKER_FAILURES": "2", "GATEWAY_BREAKER_COOLDOWN": "1m",
+			},
+			want: func() config {
+				c := withDefaults(config{
+					Addr:      defaultAddr,
+					OpenAI:    &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: openai.DefaultBaseURL, FallbackTo: "anthropic"},
+					Anthropic: &providerConfig{Model: "claude-opus-5-5", APIKey: anthropicKey, BaseURL: anthropic.DefaultBaseURL, FallbackTo: "openai"},
+				})
+				c.ProviderTimeout = 90 * time.Second
+				c.Breaker = breaker.Settings{Failures: 2, Cooldown: time.Minute}
+				return c
+			}(),
 		},
 		{
 			name: "retries disabled",
@@ -232,6 +261,55 @@ func TestLoadConfigErrors(t *testing.T) {
 				"GATEWAY_RETRY_BASE_DELAY": "2s", "GATEWAY_RETRY_MAX_DELAY": "1s",
 			},
 			want: []string{"GATEWAY_RETRY_MAX_DELAY must not be less than GATEWAY_RETRY_BASE_DELAY"},
+		},
+		{
+			name: "fallback to itself",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey, "OPENAI_FALLBACK": "openai",
+			},
+			want: []string{"OPENAI_FALLBACK must be anthropic"},
+		},
+		{
+			name: "unknown fallback",
+			vars: map[string]string{
+				"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey, "ANTHROPIC_FALLBACK": "OpenAI",
+			},
+			want: []string{"ANTHROPIC_FALLBACK must be openai"},
+		},
+		{
+			name: "fallback to an unconfigured provider",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey, "OPENAI_FALLBACK": "anthropic",
+			},
+			want: []string{"OPENAI_FALLBACK=anthropic requires ANTHROPIC_MODEL and ANTHROPIC_API_KEY"},
+		},
+		{
+			name: "fallback on an unconfigured provider",
+			vars: map[string]string{
+				"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey, "OPENAI_FALLBACK": "anthropic",
+			},
+			want: []string{"OPENAI_FALLBACK is set but OPENAI_MODEL and OPENAI_API_KEY are missing"},
+		},
+		{
+			name: "provider timeout not below upstream timeout",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_UPSTREAM_TIMEOUT": "60s", "GATEWAY_PROVIDER_TIMEOUT": "60s",
+			},
+			want: []string{"GATEWAY_PROVIDER_TIMEOUT must be less than GATEWAY_UPSTREAM_TIMEOUT"},
+		},
+		{
+			name: "invalid breaker settings",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_BREAKER_FAILURES": "0", "GATEWAY_BREAKER_COOLDOWN": "forever",
+				"GATEWAY_PROVIDER_TIMEOUT": "-5s",
+			},
+			want: []string{
+				"GATEWAY_BREAKER_FAILURES must be an integer from 1 to 100",
+				"GATEWAY_BREAKER_COOLDOWN must be a positive duration",
+				"GATEWAY_PROVIDER_TIMEOUT must be a positive duration",
+			},
 		},
 	}
 	for _, tt := range tests {

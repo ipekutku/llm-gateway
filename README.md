@@ -35,7 +35,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ### v0.3 — Provider Failover and Circuit Breaking
 
-The third milestone lets requests survive the degradation of one provider:
+The third milestone lets requests survive the degradation of one provider. It is feature-complete:
 
 * fallback pairs: a configured model can fall back to the other provider's configured model, tried once and never back again
 * fallback on provider failures (timeouts, unavailability, rate limiting, server errors), not on rejected requests or client cancellations
@@ -137,8 +137,21 @@ The `model` field must match a configured model exactly; the request is routed t
 | `GATEWAY_RETRY_MAX_ATTEMPTS` | Total attempts per request, including the first, from `1` to `10`. Default `3`. Set `1` to disable retries. |
 | `GATEWAY_RETRY_BASE_DELAY` | Longest wait before the first retry; it doubles for each further retry. The actual wait is random up to this value. Default `500ms`. |
 | `GATEWAY_RETRY_MAX_DELAY` | Cap on that doubling wait. Default `8s`. A provider's `Retry-After` can still ask for longer. |
+| `OPENAI_FALLBACK` | Set to `anthropic` to send failed `OPENAI_MODEL` requests to `ANTHROPIC_MODEL`. |
+| `ANTHROPIC_FALLBACK` | Set to `openai` to send failed `ANTHROPIC_MODEL` requests to `OPENAI_MODEL`. |
+| `GATEWAY_PROVIDER_TIMEOUT` | Time a provider with a fallback gets before the fallback takes over. Default half of `GATEWAY_UPSTREAM_TIMEOUT` (`60s`). |
+| `GATEWAY_BREAKER_FAILURES` | Failed requests in a row after which a provider is skipped, from `1` to `100`. Default `5`. |
+| `GATEWAY_BREAKER_COOLDOWN` | How long a provider is skipped before one test request is let through. Default `30s`. |
 
-Startup fails if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, if a timeout or delay is not a positive duration, if the attempt count is outside 1–10, or if the maximum retry delay is less than the base delay. Error messages name the variables but never print their values.
+For example, to fall back from OpenAI to Anthropic:
+
+```bash
+export OPENAI_FALLBACK=anthropic
+```
+
+A request for `gpt-4o` that OpenAI cannot serve is then answered by `claude-opus-5-5`; the response's `model` field shows which model answered. While a provider is skipped and no fallback can answer, requests fail with `503 provider_unavailable`.
+
+Startup fails if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, if a timeout or delay is not a positive duration, if the attempt count is outside 1–10, if the maximum retry delay is less than the base delay, if the provider timeout is not less than the upstream timeout, or if a fallback names a provider that is not configured. Error messages name the variables but never print their values.
 
 The model names above are examples. Any model the provider's API accepts can be configured. Both adapters are tested against fake servers built from the providers' documented API formats; they have not yet been verified against the live APIs.
 
@@ -162,6 +175,9 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 * Text only: no streaming, tool calls, images, or multiple choices.
 * Retries can occasionally produce a duplicate, separately billed generation: a `502` or `504` from a provider's proxy may arrive after the model already answered. Other retried failures (`429`, `503`, `529`, connection failures) happen before the model runs. See [retry safety](docs/architecture.md#what-is-retried).
 * TLS handshake failures are not retried.
+* With a fallback configured, a request can be answered by a different model than the one requested. A primary that times out is canceled, but may still bill for the partial generation.
+* Fallback works only between the two configured models; there are no logical model names yet.
+* Circuit breaker state is kept per gateway process; several instances do not share it (planned for v0.7).
 * A request whose upstream timeout expires may still be billed by the provider for the work done before it was canceled.
 * No gateway authentication; run it only on a trusted network (planned for v0.4).
 * Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
@@ -183,7 +199,7 @@ The same checks run automatically through GitHub Actions for pull requests and c
 
 ## Project Status
 
-🚧 **Early development** — v0.2 is feature-complete; v0.3 is in progress.
+🚧 **Early development** — v0.3 is feature-complete.
 
 ### v0.3
 
@@ -191,7 +207,7 @@ The same checks run automatically through GitHub Actions for pull requests and c
 |---|---|
 | Circuit breaker per provider (`internal/breaker`) | ✅ Done |
 | Provider fallback and failure classification (`internal/routing`) | ✅ Done |
-| Failover configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ⏳ Next |
+| Failover configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ✅ Done |
 
 ### v0.2
 

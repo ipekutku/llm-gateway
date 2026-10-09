@@ -1,12 +1,12 @@
 # Architecture
 
-This document describes the architecture as implemented in v0.2: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing, upstream timeouts, and bounded retries. Milestone 3 (v0.3) work in progress adds a circuit breaker and provider fallback in the router; both are implemented but not yet configurable or wired into the gateway.
+This document describes the architecture as implemented in v0.3: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, and a circuit breaker per provider.
 
 ## Request flow
 
 ```text
-HTTP request → httpapi → routing → retry → provider adapter → upstream HTTP request
-                  └──────────── shared internal/llm types ────────────┘
+HTTP request → httpapi → routing (fallback) → breaker → retry → provider adapter → upstream HTTP request
+                  └──────────────────── shared internal/llm types ────────────────────┘
 ```
 
 The incoming request's `context.Context` is passed through every step to the outbound upstream request. The handler derives it once, adding the upstream deadline (see [Upstream timeouts](#upstream-timeouts)); nothing below the handler replaces or detaches it.
@@ -150,6 +150,7 @@ Errors use a gateway-owned envelope:
 | Other upstream status, including 401 and 403 | 502 | `upstream_error` | `server_error` |
 | Transport failure, or a malformed, oversized, or unusable upstream response | 502 | `upstream_error` | `server_error` |
 | `context.DeadlineExceeded` while the incoming request is still active | 504 | `upstream_timeout` | `server_error` |
+| Circuit breaker open (`llm.ErrCircuitOpen`) and no fallback answered | 503 | `provider_unavailable` | `server_error` |
 | Any other error | 500 | `internal_error` | `server_error` |
 
 Decisions:
@@ -237,15 +238,20 @@ Configuration is read once at startup from the environment in `cmd/gateway`. The
 | `GATEWAY_RETRY_MAX_ATTEMPTS` | Total attempts per request, including the first, from 1 to 10. Default `3`; `1` disables retries. |
 | `GATEWAY_RETRY_BASE_DELAY` | Backoff ceiling before the first retry, doubling per retry. Default `500ms`. |
 | `GATEWAY_RETRY_MAX_DELAY` | Cap on the backoff ceiling; must not be less than the base delay. Default `8s`. |
+| `OPENAI_FALLBACK`, `ANTHROPIC_FALLBACK` | The other provider's name (`anthropic` or `openai`): that provider's configured model serves this provider's failed requests. Unset means no fallback. Both directions may be set. |
+| `GATEWAY_PROVIDER_TIMEOUT` | Time limit for a primary provider that has a fallback. Default half of `GATEWAY_UPSTREAM_TIMEOUT`; an explicit value must be less than it. |
+| `GATEWAY_BREAKER_FAILURES` | Consecutive failed requests that open a provider's circuit, from 1 to 100. Default `5`. |
+| `GATEWAY_BREAKER_COOLDOWN` | How long an open circuit rejects requests before probing. Default `30s`. |
 
 - **Absent means unset or blank.** A whitespace-only value counts as absent. Non-blank values, including model names, are used unchanged.
 - **Startup fails if no provider is enabled, if a pair is incomplete, or if both providers declare the same model.** All pair errors are reported together. Errors name the variables and never include their values. An enabled route is never silently dropped.
 - **Base URLs are fixed** to the providers' production HTTPS origins. Tests inject local fake servers through the same `config` struct, but there is no environment variable for them, so a manual run of the gateway always talks to the real providers. This keeps upstream destinations under server control and avoids sending provider keys to an arbitrary host through misconfiguration.
 - **Model IDs are not defaulted.** A built-in model name would go stale; the operator always chooses.
-- **Durations must be positive.** An unparsable, zero, or negative duration, or an attempt count outside 1–10, fails startup and is reported together with any other configuration errors.
+- **Durations must be positive.** An unparsable, zero, or negative duration, an attempt count outside 1–10, or a breaker failure count outside 1–100 fails startup and is reported together with any other configuration errors.
+- **Fallbacks must be usable.** A `*_FALLBACK` value other than the other provider's name, a fallback on a disabled provider, or a fallback to a disabled provider fails startup.
 - The startup log names the configured models, never the keys.
 
-`newHandler` builds one shared upstream `http.Client`, one adapter per enabled provider wrapped in a `retry.Provider`, the router, and the HTTP handler. The startup log includes the timeouts and the retry policy.
+`newHandler` builds one shared upstream `http.Client`, one adapter per enabled provider wrapped in a `retry.Provider` and then a `breaker.Breaker`, the routes with their fallbacks, the router, and the HTTP handler. A fallback reuses the other provider's wrapped client, so each provider has exactly one breaker, whether a request reaches it through its own model or as a fallback. The startup log includes the fallbacks, timeouts, retry policy, and breaker settings.
 
 ## Upstream timeouts
 
@@ -266,7 +272,7 @@ Decisions:
 
 ## Retries
 
-`retry.Provider` wraps one provider and implements `llm.Provider` itself. `cmd/gateway` wraps each adapter, below the router, with the policy from configuration. Retrying per provider keeps the policy next to the upstream it protects; Milestone 3 fallback can then sit above it without nesting retry loops inside each other.
+`retry.Provider` wraps one provider and implements `llm.Provider` itself. `cmd/gateway` wraps each adapter with the policy from configuration, below its circuit breaker and the router's fallback. Retrying per provider keeps the policy next to the upstream it protects, and fallback above it never nests retry loops inside each other.
 
 ### Policy
 
@@ -305,7 +311,7 @@ A chat completion is not idempotent. An attempt that reached the model may have 
 
 ## Circuit breaker
 
-`breaker.Breaker` wraps one provider and implements `llm.Provider`. It is not yet wired into `cmd/gateway`. The planned placement is one breaker per provider, above that provider's `retry.Provider` and below the router's fallback:
+`breaker.Breaker` wraps one provider and implements `llm.Provider`. `cmd/gateway` places one breaker per provider, above that provider's `retry.Provider` and below the router's fallback:
 
 ```text
 router → fallback → breaker → retry → adapter
@@ -356,6 +362,6 @@ All tests run without credentials or network access, using `httptest` servers.
 |---|---|
 | `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
-| `cmd/gateway` | Configuration rules, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, retries (recovery for each retryable status, exhaustion, non-retryable statuses, `Retry-After` beyond the budget, refused connections, and client cancellation during a retry wait), client cancellation and upstream timeouts reaching the upstream, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |
+| `cmd/gateway` | Configuration rules, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, retries (recovery for each retryable status, exhaustion, non-retryable statuses, `Retry-After` beyond the budget, refused connections, and client cancellation during a retry wait), fallback (on failures and on a primary timeout, not on a rejected request, both providers failing), circuit breaking (opening, failing fast without calling the upstream, routing straight to the fallback, and one breaker shared by a provider's own route and fallback use), client cancellation and upstream timeouts reaching the upstream, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |
 
 Tests coordinate with channels. Timeouts are used only as failure guards. CI runs `gofmt`, `go vet`, `go test -race`, and `go build ./cmd/gateway`.

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
 	"github.com/ipekutku/llm-gateway/internal/retry"
@@ -32,6 +33,14 @@ const (
 
 	// maxRetryAttempts bounds GATEWAY_RETRY_MAX_ATTEMPTS.
 	maxRetryAttempts = 10
+
+	// Circuit breaker defaults: a provider is skipped for 30s after five
+	// consecutive failed requests.
+	defaultBreakerFailures = 5
+	defaultBreakerCooldown = 30 * time.Second
+
+	// maxBreakerFailures bounds GATEWAY_BREAKER_FAILURES.
+	maxBreakerFailures = 100
 )
 
 // config is the gateway's startup configuration.
@@ -41,8 +50,13 @@ type config struct {
 	UpstreamTimeout time.Duration
 	// ConnectTimeout bounds establishing an upstream connection.
 	ConnectTimeout time.Duration
+	// ProviderTimeout bounds a primary provider that has a fallback, so the
+	// fallback has time left. It is less than UpstreamTimeout.
+	ProviderTimeout time.Duration
 	// Retry is applied to each provider.
 	Retry retry.Policy
+	// Breaker configures each provider's circuit breaker.
+	Breaker breaker.Settings
 	// OpenAI and Anthropic are nil when the provider is disabled.
 	OpenAI    *providerConfig
 	Anthropic *providerConfig
@@ -53,6 +67,9 @@ type providerConfig struct {
 	Model   string
 	APIKey  string
 	BaseURL string
+	// FallbackTo names the provider whose model serves this provider's
+	// failed requests, or is empty for no fallback.
+	FallbackTo string
 }
 
 // loadConfig reads the configuration from getenv, normally os.Getenv. A
@@ -75,10 +92,34 @@ func loadConfig(getenv func(string) string) (config, error) {
 	if cfg.Retry, err = loadRetry(getenv); err != nil {
 		errs = append(errs, err)
 	}
+	if cfg.Breaker.Failures, err = loadInt(getenv, "GATEWAY_BREAKER_FAILURES", defaultBreakerFailures, maxBreakerFailures); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.Breaker.Cooldown, err = loadDuration(getenv, "GATEWAY_BREAKER_COOLDOWN", defaultBreakerCooldown); err != nil {
+		errs = append(errs, err)
+	}
+	// The default leaves half of the request's time for a fallback. An
+	// explicit value is checked against the upstream timeout below.
+	providerTimeoutSet := strings.TrimSpace(getenv("GATEWAY_PROVIDER_TIMEOUT")) != ""
+	if cfg.ProviderTimeout, err = loadDuration(getenv, "GATEWAY_PROVIDER_TIMEOUT", cfg.UpstreamTimeout/2); err != nil {
+		errs = append(errs, err)
+	}
 	if cfg.OpenAI, err = loadProvider(getenv, "OPENAI_MODEL", "OPENAI_API_KEY", openai.DefaultBaseURL); err != nil {
 		errs = append(errs, err)
 	}
 	if cfg.Anthropic, err = loadProvider(getenv, "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY", anthropic.DefaultBaseURL); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return config{}, errors.Join(errs...)
+	}
+	if providerTimeoutSet && cfg.ProviderTimeout >= cfg.UpstreamTimeout {
+		errs = append(errs, errors.New("GATEWAY_PROVIDER_TIMEOUT must be less than GATEWAY_UPSTREAM_TIMEOUT"))
+	}
+	if err := loadFallback(getenv, cfg.OpenAI, "OPENAI", cfg.Anthropic, "ANTHROPIC", anthropic.ProviderName); err != nil {
+		errs = append(errs, err)
+	}
+	if err := loadFallback(getenv, cfg.Anthropic, "ANTHROPIC", cfg.OpenAI, "OPENAI", openai.ProviderName); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -110,6 +151,26 @@ func loadProvider(getenv func(string) string, modelVar, keyVar, baseURL string) 
 	return &providerConfig{Model: model, APIKey: key, BaseURL: baseURL}, nil
 }
 
+// loadFallback reads <prefix>_FALLBACK for provider p, whose only possible
+// fallback is the other provider. It sets p.FallbackTo when the fallback is
+// valid and enabled.
+func loadFallback(getenv func(string) string, p *providerConfig, prefix string, other *providerConfig, otherPrefix, otherName string) error {
+	varName := prefix + "_FALLBACK"
+	v := strings.TrimSpace(getenv(varName))
+	switch {
+	case v == "":
+		return nil
+	case v != otherName:
+		return fmt.Errorf("%s must be %s", varName, otherName)
+	case p == nil:
+		return fmt.Errorf("%s is set but %s_MODEL and %s_API_KEY are missing", varName, prefix, prefix)
+	case other == nil:
+		return fmt.Errorf("%s=%s requires %s_MODEL and %s_API_KEY", varName, otherName, otherPrefix, otherPrefix)
+	}
+	p.FallbackTo = otherName
+	return nil
+}
+
 // loadDuration parses a positive Go duration such as "90s", returning def
 // if the variable is absent.
 func loadDuration(getenv func(string) string, name string, def time.Duration) (time.Duration, error) {
@@ -130,7 +191,7 @@ func loadRetry(getenv func(string) string) (retry.Policy, error) {
 	var p retry.Policy
 	var errs []error
 	var err error
-	if p.MaxAttempts, err = loadAttempts(getenv, "GATEWAY_RETRY_MAX_ATTEMPTS"); err != nil {
+	if p.MaxAttempts, err = loadInt(getenv, "GATEWAY_RETRY_MAX_ATTEMPTS", defaultRetryMaxAttempts, maxRetryAttempts); err != nil {
 		errs = append(errs, err)
 	}
 	baseDelay, baseErr := loadDuration(getenv, "GATEWAY_RETRY_BASE_DELAY", defaultRetryBaseDelay)
@@ -148,16 +209,16 @@ func loadRetry(getenv func(string) string) (retry.Policy, error) {
 	return p, nil
 }
 
-// loadAttempts parses an attempt count from 1 to maxRetryAttempts,
-// returning the default if the variable is absent.
-func loadAttempts(getenv func(string) string, name string) (int, error) {
+// loadInt parses an integer from 1 to max, returning def if the variable
+// is absent.
+func loadInt(getenv func(string) string, name string, def, max int) (int, error) {
 	v := strings.TrimSpace(getenv(name))
 	if v == "" {
-		return defaultRetryMaxAttempts, nil
+		return def, nil
 	}
 	n, err := strconv.Atoi(v)
-	if err != nil || n < 1 || n > maxRetryAttempts {
-		return 0, fmt.Errorf("%s must be an integer from 1 to %d", name, maxRetryAttempts)
+	if err != nil || n < 1 || n > max {
+		return 0, fmt.Errorf("%s must be an integer from 1 to %d", name, max)
 	}
 	return n, nil
 }

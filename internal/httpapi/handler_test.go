@@ -491,6 +491,8 @@ func TestChatCompletionsErrorMapping(t *testing.T) {
 		{"upstream deadline", providerErr(0, context.DeadlineExceeded), 504, typeServer, codeUpstreamTimeout},
 		{"bare deadline", fmt.Errorf("wrapped: %w", context.DeadlineExceeded), 504, typeServer, codeUpstreamTimeout},
 		{"provider-only cancellation", providerErr(0, context.Canceled), 502, typeServer, codeUpstreamError},
+		{"open circuit", fmt.Errorf("openai: %w", llm.ErrCircuitOpen), 503, typeServer, codeProviderUnavailable},
+		{"open circuit on fallback", fmt.Errorf("fallback to %q failed: %w (primary failure: openai: upstream status 503)", "m", fmt.Errorf("anthropic: %w", llm.ErrCircuitOpen)), 503, typeServer, codeProviderUnavailable},
 		{"unexpected error", errors.New("boom"), 500, typeServer, codeInternalError},
 	}
 	for _, tt := range tests {
