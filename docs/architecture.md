@@ -237,7 +237,7 @@ Configuration is read once at startup from the environment in `cmd/gateway`. The
 | `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Limit on the upstream TCP dial and, separately, the TLS handshake. Default `10s`. |
 | `GATEWAY_RETRY_MAX_ATTEMPTS` | Total attempts per request, including the first, from 1 to 10. Default `3`; `1` disables retries. |
 | `GATEWAY_RETRY_BASE_DELAY` | Backoff ceiling before the first retry, doubling per retry. Default `500ms`. |
-| `GATEWAY_RETRY_MAX_DELAY` | Cap on the backoff ceiling; must not be less than the base delay. Default `8s`. |
+| `GATEWAY_RETRY_MAX_DELAY` | Cap on the backoff ceiling and on the `Retry-After` the gateway will wait for; must not be less than the base delay. Default `8s`. |
 | `OPENAI_FALLBACK`, `ANTHROPIC_FALLBACK` | The other provider's name (`anthropic` or `openai`): that provider's configured model serves this provider's failed requests. Unset means no fallback. Both directions may be set. |
 | `GATEWAY_PROVIDER_TIMEOUT` | Time limit for a primary provider that has a fallback. Default half of `GATEWAY_UPSTREAM_TIMEOUT`; an explicit value must be less than it. |
 | `GATEWAY_BREAKER_FAILURES` | Consecutive failed requests that open a provider's circuit, from 1 to 100. Default `5`. |
@@ -280,9 +280,9 @@ Decisions:
 |---|---|
 | `MaxAttempts` | Total attempts including the first; `1` disables retries. |
 | `BaseDelay` | Backoff ceiling before the second attempt. It doubles per attempt. |
-| `MaxDelay` | Cap on the backoff ceiling. |
+| `MaxDelay` | Cap on the backoff ceiling, and the longest `Retry-After` that is waited for. |
 
-The wait before attempt *n + 1* is a uniformly random duration in `[0, min(BaseDelay × 2^(n−1), MaxDelay)]` ("full jitter"), so many clients failing together do not retry in lockstep. If the upstream sent `Retry-After`, the wait is at least that long, even above `MaxDelay`.
+The wait before attempt *n + 1* is a uniformly random duration in `[0, min(BaseDelay × 2^(n−1), MaxDelay)]` ("full jitter"), so many clients failing together do not retry in lockstep. If the upstream sent `Retry-After`, the wait is at least that long. If it asks for more than `MaxDelay`, retrying stops and the failure is returned at once: holding the request for a long provider-requested delay would keep a healthy fallback, or the client's own retry logic, waiting.
 
 ### What is retried
 
@@ -304,7 +304,7 @@ A chat completion is not idempotent. An attempt that reached the model may have 
 ### Time budget and cancellation
 
 - **One budget.** All attempts and waits share the request context, so the handler's upstream timeout bounds the whole sequence. There is no per-attempt timeout: an attempt that times out is not retried, so a separate per-attempt limit would only shorten the budget.
-- **No hopeless waits.** A wait that would end at or after the context deadline is not started, and the last failure is returned at once. A 429 whose `Retry-After` exceeds the remaining budget therefore reaches the client as 429 immediately.
+- **No hopeless or long waits.** A wait that would end at or after the context deadline, or a `Retry-After` above `MaxDelay`, is not started, and the last failure is returned at once. A 429 asking for a long wait therefore goes straight to the fallback if there is one, and otherwise reaches the client as 429 immediately.
 - **Cancellation stops retries.** If the context is already done after an attempt, no wait starts. A cancellation or deadline during a wait ends it at once; the error then wraps both the context error and the last upstream failure, so the handler's mapping (client gone, or 504) is unchanged.
 - **Retries are logged.** Each retry logs one warn line, `upstream attempt failed, retrying`, with model, provider, attempt number, upstream status, the wait (`retry_in`), and the error. A request that recovers is therefore still visible. As with the handler's failure log, no prompt or completion content or upstream body is logged.
 - **Errors stay inspectable.** After more than one attempt, the error message reports the count (`after 3 attempts: …`) and wraps the last failure, so its `*llm.ProviderError`, status, and the handler's error mapping are preserved.

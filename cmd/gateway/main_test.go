@@ -380,7 +380,7 @@ func TestRequestPathRetries(t *testing.T) {
 		{"does not retry 400", []int{400, 200}, "", http.StatusBadRequest, "invalid_request", 1},
 		{"does not retry 500", []int{500, 200}, "", http.StatusBadGateway, "upstream_error", 1},
 		{"does not retry 401", []int{401, 200}, "", http.StatusBadGateway, "upstream_error", 1},
-		{"Retry-After beyond the budget returns at once", []int{429, 200}, "3600", http.StatusTooManyRequests, "provider_rate_limited", 1},
+		{"Retry-After beyond the max delay returns at once", []int{429, 200}, "3600", http.StatusTooManyRequests, "provider_rate_limited", 1},
 	}
 	for _, provider := range []struct {
 		model, path, body string
@@ -466,8 +466,8 @@ func TestRequestPathRetriesConnectionFailures(t *testing.T) {
 }
 
 func TestRequestPathClientCancellationStopsRetries(t *testing.T) {
-	// The upstream asks for a long wait, and the budget allows it, so the
-	// gateway is waiting to retry when the client goes away.
+	// The upstream asks for a long wait, and the budget and max delay allow
+	// it, so the gateway is waiting to retry when the client goes away.
 	first := make(chan struct{})
 	var once sync.Once
 	oa := newUpstream(t, "/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
@@ -478,6 +478,7 @@ func TestRequestPathClientCancellationStopsRetries(t *testing.T) {
 	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
 	cfg := gatewayConfig(oa, an)
 	cfg.UpstreamTimeout = 2 * time.Hour
+	cfg.Retry.MaxDelay = 2 * time.Hour
 	h, err := newHandler(cfg, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
@@ -597,6 +598,38 @@ func TestRequestPathFallsBackAfterPrimaryTimeout(t *testing.T) {
 	}
 	// The timed-out primary request was canceled, not left running.
 	waitFor(t, slow.canceled, "cancellation to reach the primary upstream")
+}
+
+func TestRequestPathLongRetryAfterFallsBackAtOnce(t *testing.T) {
+	// A rate-limited primary asks to wait 20s: longer than the retry max
+	// delay (8s), though within the primary's 60s time limit. Instead of
+	// waiting, the gateway uses the healthy fallback.
+	oa := newUpstream(t, "/v1/chat/completions", sequence("", "20", http.StatusTooManyRequests))
+	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+	gw := gatewayWith(t, oa, an, func(c *config) {
+		c.OpenAI.FallbackTo = "anthropic"
+		c.Retry = defaultRetryPolicy()
+	})
+
+	start := time.Now()
+	resp, data, err := postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+	if err != nil {
+		t.Fatalf("POST error = %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || replyModel(t, data) != "claude-opus-5-5" {
+		t.Errorf("status = %d, body %s; want 200 from the fallback", resp.StatusCode, data)
+	}
+	if got := len(oa.received()); got != 1 {
+		t.Errorf("primary received %d requests, want 1: a 20s Retry-After must not be retried", got)
+	}
+	// Honoring the Retry-After would take 20s.
+	if elapsed := time.Since(start); elapsed >= 5*time.Second {
+		t.Errorf("fallback answered after %v, want it without waiting", elapsed)
+	}
+}
+
+func defaultRetryPolicy() retry.Policy {
+	return retry.Policy{MaxAttempts: defaultRetryMaxAttempts, BaseDelay: defaultRetryBaseDelay, MaxDelay: defaultRetryMaxDelay}
 }
 
 func TestRequestPathBothProvidersFail(t *testing.T) {

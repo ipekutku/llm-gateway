@@ -30,8 +30,9 @@ type Policy struct {
 	// BaseDelay is the backoff ceiling before the second attempt. It
 	// doubles for each later attempt, up to MaxDelay.
 	BaseDelay time.Duration
-	// MaxDelay caps the backoff ceiling. A longer Retry-After from the
-	// upstream still takes precedence.
+	// MaxDelay caps the backoff ceiling and the longest wait the upstream
+	// may ask for in Retry-After. If it asks for longer, retrying stops,
+	// so the caller (a fallback, or the client) is not held waiting.
 	MaxDelay time.Duration
 }
 
@@ -73,8 +74,9 @@ func New(next llm.Provider, policy Policy, log *slog.Logger) (*Provider, error) 
 // an attempt succeeds, the attempts are used up, or ctx is done.
 //
 // Every attempt shares ctx, so its deadline is the time budget for all
-// attempts and waits. A wait that would end past the deadline is not
-// started; the last failure is returned instead. If ctx is canceled or
+// attempts and waits. A wait that would end past the deadline, or a
+// Retry-After longer than Policy.MaxDelay, is not started; the last failure
+// is returned instead. If ctx is canceled or
 // expires during a wait, the returned error wraps both the context error
 // and the last failure.
 //
@@ -90,6 +92,9 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespo
 			return llm.ChatResponse{}, attempts(attempt, err)
 		}
 
+		if pe, ok := errors.AsType[*llm.ProviderError](err); ok && pe.RetryAfter > p.policy.MaxDelay {
+			return llm.ChatResponse{}, attempts(attempt, err)
+		}
 		delay := p.delay(attempt, err)
 		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
 			return llm.ChatResponse{}, attempts(attempt, err)
@@ -153,7 +158,7 @@ func (p *Provider) logRetry(ctx context.Context, model string, attempt int, dela
 
 // delay returns how long to wait after the given failed attempt:
 // exponential backoff with full jitter, but at least the upstream's
-// Retry-After.
+// Retry-After, which Chat has already checked against MaxDelay.
 func (p *Provider) delay(attempt int, err error) time.Duration {
 	ceiling := p.policy.BaseDelay
 	for i := 1; i < attempt && ceiling < p.policy.MaxDelay; i++ {
