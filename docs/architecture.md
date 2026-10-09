@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the architecture as implemented in v0.2: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing, upstream timeouts, and bounded retries.
+This document describes the architecture as implemented in v0.2: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing, upstream timeouts, and bounded retries. Milestone 3 (v0.3) work in progress adds a circuit breaker, which is implemented but not yet wired into the gateway.
 
 ## Request flow
 
@@ -18,6 +18,7 @@ The incoming request's `context.Context` is passed through every step to the out
 | `internal/llm` | Vendor-neutral types (`ChatRequest`, `ChatResponse`, `Message`, `Usage`), the `Provider` interface, and shared errors. |
 | `internal/routing` | Exact-match static model router. |
 | `internal/retry` | Bounded retries of transient upstream failures, as an `llm.Provider` that wraps another. |
+| `internal/breaker` | Circuit breaker for one provider, as an `llm.Provider` that wraps another. |
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
 | `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
 | `internal/provider/anthropic` | Anthropic Messages client with private wire types. |
@@ -54,6 +55,7 @@ Implementations must honor context cancellation, support concurrent calls, and m
 | Error | Meaning |
 |---|---|
 | `llm.ErrUnknownModel` | No provider is configured for the requested model. |
+| `llm.ErrCircuitOpen` | A provider was not called because its circuit breaker is open. It is not a `*ProviderError`: no upstream call happened. |
 | `*llm.ProviderError` | An upstream call failed: non-2xx status, transport failure, or an unreadable or unusable response. It carries the provider name, the upstream status (0 if there was no response), the delay the upstream asked for in `Retry-After` (0 if none), and a wrapped cause. |
 
 `ProviderError` implements `Unwrap`, so `errors.Is(err, context.Canceled)` and `errors.Is(err, context.DeadlineExceeded)` still work through it. It never carries credentials or raw upstream bodies.
@@ -276,6 +278,42 @@ A chat completion is not idempotent. An attempt that reached the model may have 
 - **Cancellation stops retries.** If the context is already done after an attempt, no wait starts. A cancellation or deadline during a wait ends it at once; the error then wraps both the context error and the last upstream failure, so the handler's mapping (client gone, or 504) is unchanged.
 - **Retries are logged.** Each retry logs one warn line, `upstream attempt failed, retrying`, with model, provider, attempt number, upstream status, the wait (`retry_in`), and the error. A request that recovers is therefore still visible. As with the handler's failure log, no prompt or completion content or upstream body is logged.
 - **Errors stay inspectable.** After more than one attempt, the error message reports the count (`after 3 attempts: …`) and wraps the last failure, so its `*llm.ProviderError`, status, and the handler's error mapping are preserved.
+
+## Circuit breaker
+
+`breaker.Breaker` wraps one provider and implements `llm.Provider`. It is not yet wired into `cmd/gateway`. The planned placement is one breaker per provider, above that provider's `retry.Provider` and below fallback routing:
+
+```text
+router → fallback → breaker → retry → adapter
+```
+
+Above retry, one client request is one outcome for the breaker, however many attempts it took.
+
+### States
+
+| State | Calls | Transition |
+|---|---|---|
+| Closed | Pass through. | `Failures` consecutive failures → open. A success resets the count. |
+| Open | Rejected at once with an error wrapping `llm.ErrCircuitOpen` and naming the provider; the provider is not called. | After `Cooldown` → half-open, on the next call. |
+| Half-open | Exactly one call passes as a probe; others are rejected as if open. | Probe success → closed. Probe failure → open for another cooldown. A probe that tells nothing (client cancellation) lets the next call probe. |
+
+### Outcomes
+
+| Result | Effect | Reason |
+|---|---|---|
+| Success | Success | |
+| 429, 5xx (including 529) | Failure | The provider is unavailable to the gateway, including when it is rate limiting it. |
+| Transport failure, timeout (`DeadlineExceeded`) | Failure | |
+| Unusable 2xx response | Failure | The provider answered, but not usably. |
+| Other 4xx (400, 401, 404, …) | Success | The provider is up; the problem is the request or the gateway's configuration. |
+| Client cancellation (`Canceled`), errors not from the provider | Ignored | They say nothing about the provider's health. Ignored results neither count as a failure nor reset the count. |
+
+Decisions:
+
+- **Consecutive failures, not a failure rate.** A count is simple, needs no time window, and is easy to test. A rate over a window can come later if a provider fails intermittently enough to matter.
+- **Stale results are ignored.** Every state change starts a new generation, and a result from a call admitted under an earlier generation is dropped. Otherwise a slow call that started while closed could close the breaker while a half-open probe is still deciding.
+- **State is per process.** Several gateway instances each keep their own breaker; shared state is a Milestone 7 (Redis) concern.
+- **Transitions are logged**: `circuit opened` at warn (provider, previous state, consecutive failures, cooldown), and `circuit half-open, probing provider` and `circuit closed` at info.
 
 ## Server lifecycle
 

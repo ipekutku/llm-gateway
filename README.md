@@ -33,17 +33,27 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Current Milestone
 
-### v0.2 — Timeouts and Retry Policy
+### v0.3 — Provider Failover and Circuit Breaking
 
-The second milestone makes calls to unreliable upstream providers safer. It is feature-complete:
+The third milestone lets requests survive the degradation of one provider:
+
+* fallback pairs: a configured model can fall back to the other provider's configured model, tried once and never back again
+* fallback on provider failures (timeouts, unavailability, rate limiting, server errors), not on rejected requests or client cancellations
+* a per-provider time limit, so a primary that hangs leaves the fallback time to answer
+* a circuit breaker per provider: after repeated failures the provider is skipped for a cooldown, then probed with a single request
+* no retry/fallback loops: retries stay inside each provider, and fallback runs at most once per request
+
+Requests may be answered by a different model than requested; the response's `model` field always names the model that answered.
+
+### v0.2 — Timeouts and Retry Policy ✅
+
+The second milestone made calls to unreliable upstream providers safer:
 
 * explicit, configurable upstream timeouts: one time budget per request, plus connection-setup limits
 * bounded retries for transient failures: `429`, `502`, `503`, `504`, Anthropic's `529`, and failures to connect (`502` and `504` can come from a provider's proxy after the request reached the model, a small duplicate-generation risk)
 * exponential backoff with jitter, honoring the provider's `Retry-After` header
 * no retries of timeouts or failures after the request was sent, because a chat completion is not idempotent and a retry could produce a second, separately billed generation
 * cancellation stops retries immediately; all attempts share the request's time budget
-
-Provider fallback and circuit breakers are deferred to v0.3.
 
 ### v0.1 — Provider Abstraction and Routing ✅
 
@@ -173,7 +183,15 @@ The same checks run automatically through GitHub Actions for pull requests and c
 
 ## Project Status
 
-🚧 **Early development** — v0.2 is feature-complete.
+🚧 **Early development** — v0.2 is feature-complete; v0.3 is in progress.
+
+### v0.3
+
+| Component | Status |
+|---|---|
+| Circuit breaker per provider (`internal/breaker`) | ✅ Done |
+| Provider fallback and failure classification (`internal/routing`) | ⏳ Next |
+| Failover configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ⏳ Planned |
 
 ### v0.2
 

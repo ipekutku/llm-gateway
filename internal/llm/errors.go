@@ -9,6 +9,10 @@ import (
 // ErrUnknownModel reports that no provider is configured for a model.
 var ErrUnknownModel = errors.New("unknown model")
 
+// ErrCircuitOpen reports that a provider was not called because its recent
+// calls failed and its circuit breaker is open.
+var ErrCircuitOpen = errors.New("circuit breaker open")
+
 // ProviderError reports a failed upstream call: a non-2xx response, a
 // transport failure, or an unreadable or unusable response body.
 //
