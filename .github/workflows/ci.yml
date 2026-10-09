@@ -36,24 +36,20 @@ jobs:
       - name: Show Go version
         run: go version
 
+      # The commands live in the Makefile, shared with local development.
       - name: Check formatting
-        run: |
-          unformatted_files=$(gofmt -l .)
-          if [ -n "$unformatted_files" ]; then
-            printf 'Run gofmt on these files:\n%s\n' "$unformatted_files"
-            exit 1
-          fi
+        run: make fmt
 
       - name: Vet
-        run: go vet ./...
+        run: make vet
 
       - name: Test
-        run: go test -race -timeout 2m ./...
+        run: make test
 
       - name: Build
-        run: go build ./cmd/gateway
+        run: make build
 
       # Reports known vulnerabilities, including in the Go standard library,
       # that the code can reach. Pinned for reproducible results.
       - name: Vulnerability check
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+        run: make vuln
