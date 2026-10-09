@@ -31,6 +31,10 @@ const (
 	// headers.
 	readHeaderTimeout = 5 * time.Second
 
+	// serverIdleTimeout bounds how long a client's keep-alive connection
+	// may stay open between requests.
+	serverIdleTimeout = 2 * time.Minute
+
 	// shutdownTimeout bounds graceful shutdown. In-flight requests still
 	// running afterwards are cut off.
 	shutdownTimeout = 5 * time.Second
@@ -102,14 +106,21 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) e
 	attrs = append(attrs, slog.Int("clients", len(cfg.Clients)-disabled), slog.Int("disabled_clients", disabled))
 	logger.Info("gateway listening", attrs...)
 
-	srv := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: readHeaderTimeout,
-		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
-	}
-	err = serve(ctx, srv, ln, shutdownTimeout)
+	err = serve(ctx, newServer(handler, logger), ln, shutdownTimeout)
 	logger.Info("gateway stopped")
 	return err
+}
+
+// newServer returns the gateway's HTTP server. Request bodies are bounded
+// by the handler; there is deliberately no ReadTimeout or WriteTimeout,
+// because they would also cut off the long wait for the upstream.
+func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
 }
 
 // newHandler builds the provider clients, router, client authentication,

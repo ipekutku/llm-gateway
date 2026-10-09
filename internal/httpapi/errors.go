@@ -20,6 +20,7 @@ const (
 const (
 	codeInvalidRequest           = "invalid_request"
 	codeRequestTooLarge          = "request_too_large"
+	codeRequestTimeout           = "request_timeout"
 	codeMissingAPIKey            = "missing_api_key"
 	codeInvalidAPIKey            = "invalid_api_key"
 	codeRateLimitExceeded        = "rate_limit_exceeded"
@@ -48,6 +49,12 @@ var (
 		typ:     typeInvalidRequest,
 		code:    codeRequestTooLarge,
 		message: "The request body exceeds the 1 MiB limit.",
+	}
+	errRequestTimeout = apiError{
+		status:  http.StatusRequestTimeout,
+		typ:     typeInvalidRequest,
+		code:    codeRequestTimeout,
+		message: "The request body was not received in time.",
 	}
 	errMissingAPIKey = apiError{
 		status:  http.StatusUnauthorized,
