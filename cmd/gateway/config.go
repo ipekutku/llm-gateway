@@ -17,6 +17,7 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/retry"
+	"github.com/ipekutku/llm-gateway/internal/usage"
 )
 
 const (
@@ -50,6 +51,8 @@ const (
 
 	// clientsFileVar names the file of gateway clients.
 	clientsFileVar = "GATEWAY_CLIENTS_FILE"
+	databaseURLVar = "GATEWAY_DATABASE_URL"
+	pricingFileVar = "GATEWAY_PRICING_FILE"
 
 	// Rate limit defaults for a client whose entry omits them: one request
 	// per second sustained, bursts of up to 10, and 5 at a time.
@@ -60,7 +63,9 @@ const (
 
 // config is the gateway's startup configuration.
 type config struct {
-	Addr string
+	Addr        string
+	DatabaseURL string
+	Pricing     *usage.Pricing
 	// UpstreamTimeout bounds all upstream work for one request.
 	UpstreamTimeout time.Duration
 	// ConnectTimeout bounds establishing an upstream connection.
@@ -103,6 +108,12 @@ func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error
 
 	var errs []error
 	var err error
+	if cfg.DatabaseURL, err = loadDatabaseURL(getenv); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.Pricing, err = loadPricing(getenv, readFile); err != nil {
+		errs = append(errs, err)
+	}
 	if cfg.UpstreamTimeout, err = loadDuration(getenv, "GATEWAY_UPSTREAM_TIMEOUT", defaultUpstreamTimeout); err != nil {
 		errs = append(errs, err)
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/auth"
 	"github.com/ipekutku/llm-gateway/internal/llm"
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
+	"github.com/ipekutku/llm-gateway/internal/usage"
 )
 
 // ChatCompletionsPath is the path of the chat completions endpoint.
@@ -40,6 +41,20 @@ type handler struct {
 	limiter         *ratelimit.Limiter
 	upstreamTimeout time.Duration
 	log             *slog.Logger
+	accounting      Accounting
+}
+
+// UsageRecorder accepts records without waiting for persistent storage.
+type UsageRecorder interface {
+	Record(usage.Record) bool
+}
+
+// Accounting provides the recorder, prices, and each provider's configured
+// model name. Pricing uses configured names rather than response snapshots.
+type Accounting struct {
+	Recorder UsageRecorder
+	Pricing  *usage.Pricing
+	Models   map[string]string
 }
 
 // New returns the gateway's HTTP handler. It serves POST
@@ -66,7 +81,10 @@ type handler struct {
 //
 // Request bodies must arrive within bodyReadTimeout, or the response is
 // 408. The time to wait for the upstream is not limited by it.
-func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *ratelimit.Limiter, upstreamTimeout time.Duration, log *slog.Logger) (http.Handler, error) {
+//
+// accounting records every validated request once, including failures and
+// cancellations. Admission and validation rejections are not recorded.
+func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *ratelimit.Limiter, upstreamTimeout time.Duration, accounting Accounting, log *slog.Logger) (http.Handler, error) {
 	switch {
 	case provider == nil:
 		return nil, errors.New("httpapi: nil provider")
@@ -76,11 +94,18 @@ func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *rate
 		return nil, errors.New("httpapi: nil limiter")
 	case upstreamTimeout <= 0:
 		return nil, errors.New("httpapi: upstream timeout must be positive")
+	case accounting.Recorder == nil || accounting.Pricing == nil:
+		return nil, errors.New("httpapi: recorder and pricing are required")
 	}
 	if log == nil {
 		log = slog.Default()
 	}
-	h := &handler{provider: provider, auth: authenticator, limiter: limiter, upstreamTimeout: upstreamTimeout, log: log}
+	models := make(map[string]string, len(accounting.Models))
+	for provider, model := range accounting.Models {
+		models[provider] = model
+	}
+	accounting.Models = models
+	h := &handler{provider: provider, auth: authenticator, limiter: limiter, upstreamTimeout: upstreamTimeout, accounting: accounting, log: log}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+ChatCompletionsPath, h.chatCompletions)
@@ -94,9 +119,12 @@ func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *rate
 		// writer, such as a test recorder, gets no deadline.
 		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
 
+		received := time.Now()
 		id := rand.Text()
 		w.Header().Set(RequestIDHeader, id)
-		mux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
+		ctx := context.WithValue(r.Context(), requestIDKey{}, id)
+		ctx = context.WithValue(ctx, receivedAtKey{}, received)
+		mux.ServeHTTP(w, r.WithContext(ctx))
 	}), nil
 }
 
@@ -202,12 +230,26 @@ func retryAfterSeconds(d time.Duration) string {
 }
 
 func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatRequest) {
+	received, _ := r.Context().Value(receivedAtKey{}).(time.Time)
+	identity, _ := auth.FromContext(r.Context())
+	record := usage.Record{RequestID: requestID(r), Time: received, ClientID: identity.ClientID, RequestedModel: req.Model}
+	defer func() {
+		if r.Context().Err() != nil {
+			record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
+		}
+		record.Duration = time.Since(received)
+		h.accounting.Recorder.Record(record)
+	}()
 	ctx, cancel := context.WithTimeout(r.Context(), h.upstreamTimeout)
 	defer cancel()
 
 	resp, err := h.provider.Chat(ctx, req)
 	if err != nil {
+		if pe, ok := errors.AsType[*llm.ProviderError](err); ok {
+			record.Provider = pe.Provider
+		}
 		if r.Context().Err() != nil {
+			record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
 			// The client is gone; there is nobody to write a response to.
 			h.log.LogAttrs(r.Context(), slog.LevelInfo, "client canceled request",
 				requestIDAttr(r),
@@ -217,7 +259,11 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 			)
 			return
 		}
-		h.fail(w, r, classifyChatError(err), err, slog.String("model", req.Model))
+		failure := classifyChatError(err)
+		record.Status, record.ErrorCode = failure.status, failure.code
+		if writeErr := h.fail(w, r, failure, err, slog.String("model", req.Model)); writeErr != nil {
+			record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
+		}
 		return
 	}
 
@@ -225,7 +271,15 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 	if model == "" {
 		model = req.Model
 	}
-	writeJSON(w, http.StatusOK, chatResponse{
+	record.Status, record.Provider, record.Model = http.StatusOK, resp.Provider, model
+	record.Usage = &resp.Usage
+	cost, costErr := h.accounting.Pricing.Cost(usage.Model{Provider: resp.Provider, Model: h.accounting.Models[resp.Provider]}, resp.Usage)
+	if costErr == nil {
+		record.Cost = &cost
+	} else if !errors.Is(costErr, usage.ErrNoPrice) {
+		h.log.Warn("usage cost could not be estimated", requestIDAttr(r), slog.Any("error", costErr))
+	}
+	err = writeJSON(w, http.StatusOK, chatResponse{
 		ID:      "chatcmpl-" + requestID(r),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
@@ -244,12 +298,15 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 			TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
 		},
 	})
+	if err != nil || r.Context().Err() != nil {
+		record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
+	}
 }
 
 // fail logs a failed request once and writes the error envelope. Logs
 // contain no credentials, prompt or completion content, or raw upstream
 // bodies; err must follow the same rule, as llm.ProviderError does.
-func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err error, attrs ...slog.Attr) {
+func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err error, attrs ...slog.Attr) error {
 	attrs = append(attrs,
 		requestIDAttr(r),
 		clientAttr(r),
@@ -272,7 +329,7 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err e
 	}
 	h.log.LogAttrs(r.Context(), level, "chat completion failed", attrs...)
 
-	writeJSON(w, e.status, errorResponse{Error: errorBody{
+	return writeJSON(w, e.status, errorResponse{Error: errorBody{
 		Message: e.message,
 		Type:    e.typ,
 		Code:    e.code,
@@ -280,6 +337,7 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err e
 }
 
 type requestIDKey struct{}
+type receivedAtKey struct{}
 
 // requestID is the ID assigned to r when it arrived.
 func requestID(r *http.Request) string {
@@ -301,14 +359,15 @@ func clientAttr(r *http.Request) slog.Attr {
 	return slog.String("client_id", id.ClientID)
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func writeJSON(w http.ResponseWriter, status int, v any) error {
 	body, err := json.Marshal(v)
 	if err != nil {
 		// Unreachable: the response types contain only strings and integers.
 		w.WriteHeader(http.StatusInternalServerError)
-		return
+		return err
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	_, err = w.Write(body)
+	return err
 }

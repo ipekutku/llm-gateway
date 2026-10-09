@@ -34,15 +34,15 @@ func TestSmoke(t *testing.T) {
 		{"id": "smoke", "key_sha256": "` + hashHex(key) + `"},
 		{"id": "smoke-limited", "key_sha256": "` + hashHex(limitedKey) + `", "requests_per_minute": 1, "burst": 1}
 	]}`
-	vars := map[string]string{clientsFileVar: "clients.json"}
+	vars := map[string]string{clientsFileVar: "clients.json", databaseURLVar: testDatabaseURL, pricingFileVar: pricingPath}
 	for _, name := range smokeVars {
 		vars[name] = os.Getenv(name)
 	}
-	cfg, err := loadConfig(env(vars), files(map[string]string{"clients.json": clients}))
+	cfg, err := loadConfig(env(vars), files(map[string]string{"clients.json": clients, pricingPath: `{"prices":[]}`}))
 	if err != nil {
 		t.Fatalf("configuration: %v\nSet OPENAI_MODEL and OPENAI_API_KEY, ANTHROPIC_MODEL and ANTHROPIC_API_KEY, or both.", err)
 	}
-	h, err := newHandler(cfg, nil, slog.New(slog.NewTextHandler(t.Output(), nil)))
+	h, err := newHandler(cfg, nil, discardRecorder{}, slog.New(slog.NewTextHandler(t.Output(), nil)))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}

@@ -21,11 +21,16 @@ import (
 
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/retry"
+	"github.com/ipekutku/llm-gateway/internal/usage"
 )
 
 // guard bounds how long a test waits for something that should happen
 // promptly. It is a failure guard, not a synchronization mechanism.
 const guard = 5 * time.Second
+
+type discardRecorder struct{}
+
+func (discardRecorder) Record(usage.Record) bool { return true }
 
 const (
 	openaiReply = `{"model":"gpt-4o-2024-08-06","choices":[{"index":0,` +
@@ -106,7 +111,7 @@ func gatewayWith(t *testing.T, oa, an *upstream, edit func(*config)) *httptest.S
 	cfg.Retry = fastRetry
 	edit(&cfg)
 
-	h, err := newHandler(cfg, nil, slog.New(slog.DiscardHandler))
+	h, err := newHandler(cfg, nil, discardRecorder{}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -456,7 +461,7 @@ func TestRequestPathRetriesConnectionFailures(t *testing.T) {
 		newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply)))
 	cfg.OpenAI.BaseURL = refused
 	var logs syncBuffer
-	h, err := newHandler(cfg, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	h, err := newHandler(cfg, nil, discardRecorder{}, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -492,7 +497,7 @@ func TestRequestPathClientCancellationStopsRetries(t *testing.T) {
 	cfg := gatewayConfig(oa, an)
 	cfg.UpstreamTimeout = 2 * time.Hour
 	cfg.Retry.MaxDelay = 2 * time.Hour
-	h, err := newHandler(cfg, nil, slog.New(slog.DiscardHandler))
+	h, err := newHandler(cfg, nil, discardRecorder{}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -882,7 +887,7 @@ func TestServeShutsDownGracefully(t *testing.T) {
 	slow := newBlockingHandler(t, openaiReply)
 	oa := newUpstream(t, "/v1/chat/completions", slow.ServeHTTP)
 	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
-	h, err := newHandler(gatewayConfig(oa, an), nil, slog.New(slog.DiscardHandler))
+	h, err := newHandler(gatewayConfig(oa, an), nil, discardRecorder{}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -935,7 +940,7 @@ func TestServeCutsOffRequestsAfterShutdownTimeout(t *testing.T) {
 	slow := newBlockingHandler(t, openaiReply)
 	oa := newUpstream(t, "/v1/chat/completions", slow.ServeHTTP)
 	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
-	h, err := newHandler(gatewayConfig(oa, an), nil, slog.New(slog.DiscardHandler))
+	h, err := newHandler(gatewayConfig(oa, an), nil, discardRecorder{}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -959,6 +964,7 @@ func TestServeCutsOffRequestsAfterShutdownTimeout(t *testing.T) {
 
 func gatewayConfig(oa, an *upstream) config {
 	return config{
+		Pricing:         testPricing,
 		Addr:            "127.0.0.1:0",
 		UpstreamTimeout: defaultUpstreamTimeout,
 		ConnectTimeout:  defaultConnectTimeout,
@@ -1011,10 +1017,10 @@ func TestRunFailsWhenAddressIsUnavailable(t *testing.T) {
 	}
 	defer ln.Close()
 
-	err = run(context.Background(), env(map[string]string{
+	err = runWithFakeDatabase(context.Background(), map[string]string{
 		"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
 		"GATEWAY_ADDR": ln.Addr().String(), clientsFileVar: writeClientsFile(t),
-	}), slog.New(slog.DiscardHandler))
+	}, slog.New(slog.DiscardHandler))
 	if err == nil || !strings.Contains(err.Error(), "listen") {
 		t.Errorf("run() error = %v, want listen error", err)
 	}
@@ -1026,10 +1032,10 @@ func TestRunServesUntilCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- run(ctx, env(map[string]string{
+		result <- runWithFakeDatabase(ctx, map[string]string{
 			"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey,
 			"GATEWAY_ADDR": "127.0.0.1:0", clientsFileVar: clientsFile,
-		}), slog.New(slog.NewTextHandler(&logs, nil)))
+		}, slog.New(slog.NewTextHandler(&logs, nil)))
 	}()
 
 	deadline := time.After(guard)
@@ -1057,7 +1063,7 @@ func TestRunServesUntilCanceled(t *testing.T) {
 			t.Errorf("startup log does not contain %q:\n%s", want, logs.String())
 		}
 	}
-	for _, secret := range []string{anthropicKey, hashHex(clientKey)} {
+	for _, secret := range []string{anthropicKey, hashHex(clientKey), testDatabaseURL, "synthetic-password"} {
 		if strings.Contains(logs.String(), secret) {
 			t.Errorf("log exposes a key or key hash:\n%s", logs.String())
 		}

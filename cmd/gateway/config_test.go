@@ -15,6 +15,7 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/retry"
+	"github.com/ipekutku/llm-gateway/internal/usage"
 )
 
 // env returns a getenv func backed by vars.
@@ -38,8 +39,10 @@ const (
 	anthropicKey = "sk-ant-secret-value"
 
 	// clientKey is the gateway API key of the test client, team-a.
-	clientKey   = "gw-test-client-key"
-	clientsPath = "/etc/gateway/clients.json"
+	clientKey       = "gw-test-client-key"
+	clientsPath     = "/etc/gateway/clients.json"
+	pricingPath     = "/etc/gateway/prices.json"
+	testDatabaseURL = "postgres://gateway:synthetic-password@127.0.0.1/gateway"
 )
 
 // hashHex returns the hex SHA-256 hash of key, as written in a clients file.
@@ -52,6 +55,7 @@ func hashHex(key string) string {
 var testClientsFile = `{"clients": [{"id": "team-a", "key_sha256": "` + hashHex(clientKey) + `"}]}`
 
 var (
+	testPricing, _ = usage.NewPricing(nil)
 	testClients    = []auth.Client{{ID: "team-a", KeyHash: auth.HashKey(clientKey)}}
 	defaultLimits  = ratelimit.Limits{RequestsPerMinute: defaultRequestsPerMinute, Burst: defaultBurst, MaxConcurrent: defaultMaxConcurrent}
 	testRateLimits = map[string]ratelimit.Limits{"team-a": defaultLimits}
@@ -67,7 +71,13 @@ func load(vars map[string]string) (config, error) {
 		}
 		vars[clientsFileVar] = clientsPath
 	}
-	return loadConfig(env(vars), files(map[string]string{clientsPath: testClientsFile}))
+	if _, ok := vars[databaseURLVar]; !ok {
+		vars[databaseURLVar] = testDatabaseURL
+	}
+	if _, ok := vars[pricingFileVar]; !ok {
+		vars[pricingFileVar] = pricingPath
+	}
+	return loadConfig(env(vars), files(map[string]string{clientsPath: testClientsFile, pricingPath: `{"prices":[]}`}))
 }
 
 func TestLoadConfig(t *testing.T) {
@@ -77,6 +87,7 @@ func TestLoadConfig(t *testing.T) {
 	// withDefaults fills in the default timeouts, retry policy, and
 	// breaker settings.
 	withDefaults := func(c config) config {
+		c.DatabaseURL, c.Pricing = testDatabaseURL, testPricing
 		c.UpstreamTimeout, c.ConnectTimeout = defaultUpstreamTimeout, defaultConnectTimeout
 		c.ProviderTimeout = defaultUpstreamTimeout / 2
 		c.Retry = defaultRetry
@@ -130,6 +141,7 @@ func TestLoadConfig(t *testing.T) {
 				"GATEWAY_UPSTREAM_TIMEOUT": "45s", "GATEWAY_UPSTREAM_CONNECT_TIMEOUT": " 1500ms ",
 			},
 			want: config{
+				DatabaseURL: testDatabaseURL, Pricing: testPricing,
 				Addr: defaultAddr, OpenAI: openaiCfg,
 				UpstreamTimeout: 45 * time.Second, ConnectTimeout: 1500 * time.Millisecond,
 				ProviderTimeout: 22500 * time.Millisecond, // half the upstream timeout

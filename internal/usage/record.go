@@ -27,8 +27,8 @@ type Record struct {
 	ClientID string
 	// RequestedModel is the model the client asked for.
 	RequestedModel string
-	// Provider is the provider that answered, or the last one that failed;
-	// empty if no provider was called.
+	// Provider is the provider that answered or the final upstream error
+	// identifies; empty when that outcome identifies no upstream.
 	Provider string
 	// Model is the model the provider reported; empty on failure.
 	Model string

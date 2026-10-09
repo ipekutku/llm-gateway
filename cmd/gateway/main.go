@@ -19,11 +19,13 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/httpapi"
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"github.com/ipekutku/llm-gateway/internal/postgres"
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/retry"
 	"github.com/ipekutku/llm-gateway/internal/routing"
+	"github.com/ipekutku/llm-gateway/internal/usage"
 )
 
 const (
@@ -50,7 +52,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, os.Getenv, logger); err != nil {
+	if err := execute(ctx, os.Args[1:], os.Getenv, logger); err != nil {
 		logger.Error("gateway failed", slog.Any("error", err))
 		os.Exit(1)
 	}
@@ -59,14 +61,57 @@ func main() {
 // run loads the configuration, starts the server, and serves until ctx is
 // canceled.
 func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) error {
-	cfg, err := loadConfig(getenv, os.ReadFile)
+	return runWith(ctx, getenv, os.ReadFile, func(ctx context.Context, url string) (accountingStore, error) {
+		return postgres.Open(ctx, url)
+	}, logger)
+}
+
+type accountingStore interface {
+	usage.RecordStore
+	CheckSchema(context.Context) error
+	Close()
+}
+
+// runWith injects filesystem and database access for startup/lifecycle tests.
+func runWith(ctx context.Context, getenv func(string) string, readFile func(string) ([]byte, error), openStore func(context.Context, string) (accountingStore, error), logger *slog.Logger) (result error) {
+	cfg, err := loadConfig(getenv, readFile)
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}
-	handler, err := newHandler(cfg, nil, logger)
+	startupCtx, cancel := context.WithTimeout(ctx, databaseStartupTimeout)
+	store, err := openStore(startupCtx, cfg.DatabaseURL)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("database: %w", err)
+	}
+	defer store.Close()
+	err = store.CheckSchema(startupCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("database schema: %w", err)
+	}
+	recorder, err := usage.NewRecorder(store, logger, usage.DefaultRecorderOptions())
 	if err != nil {
 		return err
 	}
+	var active *activeHandlers
+	defer func() {
+		drainCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if active != nil {
+			result = errors.Join(result, active.stop(drainCtx))
+		}
+		closeErr := recorder.Close(drainCtx)
+		result = errors.Join(result, closeErr)
+		if closeErr == nil {
+			logger.Info("usage recorder stopped")
+		}
+	}()
+	handler, err := newHandler(cfg, nil, recorder, logger)
+	if err != nil {
+		return err
+	}
+	active = &activeHandlers{next: handler}
 
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
@@ -106,8 +151,8 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) e
 	attrs = append(attrs, slog.Int("clients", len(cfg.Clients)-disabled), slog.Int("disabled_clients", disabled))
 	logger.Info("gateway listening", attrs...)
 
-	err = serve(ctx, newServer(handler, logger), ln, shutdownTimeout)
-	logger.Info("gateway stopped")
+	err = serve(ctx, newServer(active, logger), ln, shutdownTimeout)
+	logger.Info("HTTP server stopped")
 	return err
 }
 
@@ -128,7 +173,7 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 // with retries and, above them, a circuit breaker; the router's fallback
 // sits above both. A nil httpClient uses a client built by
 // newUpstreamClient.
-func newHandler(cfg config, httpClient *http.Client, logger *slog.Logger) (http.Handler, error) {
+func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecorder, logger *slog.Logger) (http.Handler, error) {
 	if httpClient == nil {
 		httpClient = newUpstreamClient(cfg)
 	}
@@ -185,7 +230,11 @@ func newHandler(cfg config, httpClient *http.Client, logger *slog.Logger) (http.
 	if err != nil {
 		return nil, err
 	}
-	return httpapi.New(router, authenticator, limiter, cfg.UpstreamTimeout, logger)
+	models := make(map[string]string, len(providers))
+	for name, e := range providers {
+		models[name] = e.cfg.Model
+	}
+	return httpapi.New(router, authenticator, limiter, cfg.UpstreamTimeout, httpapi.Accounting{Recorder: recorder, Pricing: cfg.Pricing, Models: models}, logger)
 }
 
 // resilient wraps a provider client with the retry policy and, above it,
@@ -213,6 +262,8 @@ func newUpstreamClient(cfg config) *http.Client {
 // If in-flight requests have not finished within timeout, it closes the
 // server, which cancels their contexts, and returns an error.
 func serve(ctx context.Context, srv *http.Server, ln net.Listener, timeout time.Duration) error {
+	// A serve failure must also cancel active handlers before accounting drains.
+	defer func() { _ = srv.Close() }()
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
