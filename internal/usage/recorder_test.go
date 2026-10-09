@@ -31,10 +31,11 @@ func (s *captureStore) Insert(ctx context.Context, records []Record) error {
 
 func testRecorderOptions() RecorderOptions {
 	return RecorderOptions{
-		QueueCapacity: 4,
-		BatchSize:     2,
-		FlushInterval: time.Hour,
-		WriteTimeout:  time.Second,
+		QueueCapacity:      4,
+		BatchSize:          2,
+		FlushInterval:      time.Hour,
+		WriteTimeout:       time.Second,
+		DropReportInterval: time.Hour,
 	}
 }
 
@@ -88,6 +89,7 @@ func TestNewRecorderRejectsInvalidInputs(t *testing.T) {
 		"batch": func(o *RecorderOptions) { o.BatchSize = 0 },
 		"flush": func(o *RecorderOptions) { o.FlushInterval = 0 },
 		"write": func(o *RecorderOptions) { o.WriteTimeout = 0 },
+		"drops": func(o *RecorderOptions) { o.DropReportInterval = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			opts := DefaultRecorderOptions()
@@ -202,8 +204,87 @@ func TestRecorderDropsWhenQueueIsFull(t *testing.T) {
 	if first[0].RequestID != "first" || second[0].RequestID != "second" {
 		t.Errorf("stored IDs = %q, %q", first[0].RequestID, second[0].RequestID)
 	}
-	if !strings.Contains(logs.String(), "usage record dropped: queue full") || !strings.Contains(logs.String(), "request_id=dropped") {
-		t.Errorf("queue-full warning missing: %s", logs.String())
+	if !strings.Contains(logs.String(), "usage records dropped: queue full") || !strings.Contains(logs.String(), "count=1") {
+		t.Errorf("queue-full summary missing: %s", logs.String())
+	}
+}
+
+// fillQueue returns a recorder whose writer is blocked in its first insert
+// and whose one-record queue is full, so every further Record is dropped.
+// Closing release lets the writer continue.
+func fillQueue(t *testing.T, ctx context.Context, logger *slog.Logger, opts RecorderOptions) (r *Recorder, release chan struct{}) {
+	t.Helper()
+	store := &blockFirstStore{
+		started: make(chan struct{}), release: make(chan struct{}), batches: make(chan []Record, 2),
+	}
+	opts.QueueCapacity, opts.BatchSize = 1, 1
+	r = newTestRecorder(t, store, logger, opts)
+	if !r.Record(testRecord("blocked")) {
+		t.Fatal("first Record rejected")
+	}
+	select {
+	case <-store.started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if !r.Record(testRecord("queued")) {
+		t.Fatal("second Record rejected")
+	}
+	return r, store.release
+}
+
+func TestRecorderSummarizesDropsInOneWarning(t *testing.T) {
+	ctx := testRecorderContext(t)
+	var logs bytes.Buffer
+	r, release := fillQueue(t, ctx, slog.New(slog.NewTextHandler(&logs, nil)), testRecorderOptions())
+	for i := range 50 {
+		if r.Record(testRecord("dropped-" + strconv.Itoa(i))) {
+			t.Fatal("Record into a full queue succeeded")
+		}
+	}
+	close(release)
+	if err := r.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logs.String(), "usage records dropped"); got != 1 {
+		t.Errorf("got %d drop warnings, want 1: %s", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "count=50") || strings.Contains(logs.String(), "dropped-") {
+		t.Errorf("drop summary should count 50 records without naming them: %s", logs.String())
+	}
+}
+
+// lineWriter sends every log line to a channel, so a test can wait for a
+// line the writer goroutine logs.
+type lineWriter chan string
+
+func (w lineWriter) Write(p []byte) (int, error) {
+	w <- string(p)
+	return len(p), nil
+}
+
+func TestRecorderReportsDropsPeriodically(t *testing.T) {
+	ctx := testRecorderContext(t)
+	lines := make(lineWriter, 16)
+	opts := testRecorderOptions()
+	opts.DropReportInterval = 10 * time.Millisecond
+	r, release := fillQueue(t, ctx, slog.New(slog.NewTextHandler(lines, nil)), opts)
+	for range 3 {
+		if r.Record(testRecord("dropped")) {
+			t.Fatal("Record into a full queue succeeded")
+		}
+	}
+	// Once its insert is released, the writer stores the two accepted
+	// records and the ticker reports the drops while the recorder is still
+	// open; Close runs only in cleanup.
+	close(release)
+	select {
+	case line := <-lines:
+		if !strings.Contains(line, "usage records dropped") || !strings.Contains(line, "count=3") {
+			t.Errorf("log line = %q, want a drop summary with count=3", line)
+		}
+	case <-ctx.Done():
+		t.Fatal("no periodic drop report before shutdown")
 	}
 }
 

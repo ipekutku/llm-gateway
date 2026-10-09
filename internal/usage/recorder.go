@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,21 +22,27 @@ type RecorderOptions struct {
 	BatchSize     int
 	FlushInterval time.Duration
 	WriteTimeout  time.Duration
+	// DropReportInterval is how often records dropped because the queue was
+	// full are reported, as one warning with their count.
+	DropReportInterval time.Duration
 }
 
 // DefaultRecorderOptions returns the initial operating limits for a recorder.
 func DefaultRecorderOptions() RecorderOptions {
 	return RecorderOptions{
-		QueueCapacity: 1024,
-		BatchSize:     100,
-		FlushInterval: time.Second,
-		WriteTimeout:  5 * time.Second,
+		QueueCapacity:      1024,
+		BatchSize:          100,
+		FlushInterval:      time.Second,
+		WriteTimeout:       5 * time.Second,
+		DropReportInterval: 10 * time.Second,
 	}
 }
 
 // Recorder queues records without delaying requests and writes them in
 // batches. A failed write loses that batch; it is logged and later batches
-// are still attempted. Its worker has its own context, so a client
+// are still attempted. Records dropped because the queue is full are counted
+// and reported periodically rather than one warning each, so a database
+// outage under load does not flood the logs. Its worker has its own context, so a client
 // disconnecting does not cancel the write of an accepted record.
 type Recorder struct {
 	store   RecordStore
@@ -46,6 +53,8 @@ type Recorder struct {
 	done    chan struct{}
 	mu      sync.Mutex
 	closing bool
+	// dropped counts records rejected by a full queue since the last report.
+	dropped atomic.Int64
 }
 
 // NewRecorder starts a background writer. The caller must call Close during
@@ -54,7 +63,7 @@ func NewRecorder(store RecordStore, logger *slog.Logger, opts RecorderOptions) (
 	if store == nil {
 		return nil, errors.New("usage recorder needs a store")
 	}
-	if opts.QueueCapacity <= 0 || opts.BatchSize <= 0 || opts.FlushInterval <= 0 || opts.WriteTimeout <= 0 {
+	if opts.QueueCapacity <= 0 || opts.BatchSize <= 0 || opts.FlushInterval <= 0 || opts.WriteTimeout <= 0 || opts.DropReportInterval <= 0 {
 		return nil, errors.New("usage recorder limits must be positive")
 	}
 	if logger == nil {
@@ -75,7 +84,8 @@ func NewRecorder(store RecordStore, logger *slog.Logger, opts RecorderOptions) (
 
 // Record queues a validated snapshot without blocking on database I/O. It
 // returns false if the record is invalid, the queue is full, or shutdown has
-// begun. Every rejection is logged; callers need not fail the request.
+// begun. Every rejection is logged, a full queue's in a periodic summary;
+// callers need not fail the request.
 func (r *Recorder) Record(record Record) bool {
 	if err := record.Validate(); err != nil {
 		r.log.Error("invalid usage record dropped", slog.Any("error", err))
@@ -102,7 +112,7 @@ func (r *Recorder) Record(record Record) bool {
 		return true
 	default:
 		r.mu.Unlock()
-		r.log.Warn("usage record dropped: queue full", slog.String("request_id", record.RequestID))
+		r.dropped.Add(1)
 		return false
 	}
 }
@@ -130,6 +140,11 @@ func (r *Recorder) Close(ctx context.Context) error {
 func (r *Recorder) run(ctx context.Context) {
 	defer close(r.done)
 	defer r.cancel()
+	// Runs before done is closed, so drops are reported by the time Close
+	// returns.
+	defer r.reportDrops()
+	dropReport := time.NewTicker(r.opts.DropReportInterval)
+	defer dropReport.Stop()
 
 	batch := make([]Record, 0, r.opts.BatchSize)
 	var timer *time.Timer
@@ -177,8 +192,18 @@ func (r *Recorder) run(ctx context.Context) {
 			}
 		case <-flushAt:
 			flush()
+		case <-dropReport.C:
+			r.reportDrops()
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// reportDrops logs how many records a full queue rejected since the last
+// report, if any.
+func (r *Recorder) reportDrops() {
+	if n := r.dropped.Swap(0); n > 0 {
+		r.log.Warn("usage records dropped: queue full", slog.Int64("count", n))
 	}
 }

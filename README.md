@@ -42,7 +42,7 @@ Milestone 5 is feature-complete. It adds per-client usage records and estimated 
 * every request gets a gateway-assigned ID, returned in the `X-Request-ID` header and logged with failures
 * cost estimation from per-model prices for input, cached input read and written, and output tokens, with exact integer arithmetic; a model without a price has an unknown cost, never zero
 * a PostgreSQL connection pool and usage store, with embedded forward-only migrations protected by an advisory lock, exact cost storage, and integration tests against disposable databases
-* an asynchronous recorder with a bounded queue, batch writes, write timeouts, and shutdown draining; queue overflow and failed writes are logged, and accepted records survive request cancellation
+* an asynchronous recorder with a bounded queue, batch writes, write timeouts, and shutdown draining; queue overflow is logged as a periodic count and failed writes are logged, and accepted records survive request cancellation
 * required database and pricing-file configuration, an explicit migration command, startup schema checks, and one usage record for each validated request, including failures and cancellations
 * documented SQL reports for usage and estimated cost per client, answering model, and UTC day, with coverage counts for unknown usage and cost
 
