@@ -249,14 +249,21 @@ Startup also fails if either accounting setting is absent, the pricing file is i
 
 The model names above are examples. Any model the provider's API accepts can be configured. The automated tests run both adapters against fake servers built from the providers' documented API formats.
 
-Verified against the live APIs with `make smoke` on 2026-10-09:
+Verified against the live APIs with `make smoke` on 2026-10-09, last with the v0.5 adapters, which also read the cache fields of token usage:
 
 | Configured model | Model reported by the provider | Checked |
 |---|---|---|
 | `gpt-4o` | `gpt-4o-2024-08-06` | completion ending in `stop`, forced `length` stop, token usage |
 | `claude-opus-5-5` | `claude-opus-5-5` | completion ending in `stop`, forced `length` stop, token usage |
 
-The live run did not cover refusals (`content_filter`), prompt-cache token accounting, or real upstream failures (retries, fallback, circuit breaking); those are tested only against fakes.
+The smoke test does not store usage. A separate manual run on 2026-10-09 sent live requests through the gateway with PostgreSQL from `make db` and checked the stored records:
+
+| Checked | Result |
+|---|---|
+| One request to each model | Stored with status 200, token usage, the reported model (`gpt-4o-2024-08-06` for `gpt-4o`), and `cost_usd` matching the configured prices exactly |
+| The same ~2,000-token prompt sent to `gpt-4o` three times | First: no cache reads. Second and third: 1,792 of 1,965 input tokens read from OpenAI's prompt cache, charged at the cache-read price, with an estimated cost 45% lower |
+
+Live runs have not covered refusals (`content_filter`), Anthropic prompt-cache reads and writes (the gateway does not request caching), or real upstream failures (retries, fallback, circuit breaking); those are tested only against fakes.
 
 ### Supported API
 
