@@ -40,8 +40,9 @@ The fifth milestone measures how the gateway is used and what that costs: every 
 * token usage keeps the prompt-cache detail providers price differently: cached input read (OpenAI and Anthropic) and written (Anthropic), as part of the input count
 * the provider that answered is known for every response, including one served by a fallback
 * every request gets a gateway-assigned ID, returned in the `X-Request-ID` header and logged with failures
+* cost estimation from per-model prices for input, cached input read and written, and output tokens, with exact integer arithmetic; a model without a price has an unknown cost, never zero
 
-Cost estimation and persisting usage records are not implemented yet.
+Prices cannot be configured yet, and usage records are not stored yet.
 
 ### v0.4 — Authentication and Rate Limiting ✅
 
@@ -288,8 +289,8 @@ make smoke
 |---|---|
 | Provider and prompt-cache tokens in neutral usage (`internal/llm`, `internal/provider/*`) | ✅ Done |
 | Request IDs (`internal/httpapi`) | ✅ Done |
-| Pricing and cost estimation (`internal/usage`) | ⏳ Next |
-| PostgreSQL store and migrations | ⏳ Planned |
+| Pricing and cost estimation (`internal/usage`) | ✅ Done |
+| PostgreSQL store and migrations | ⏳ Next |
 | Asynchronous usage recorder | ⏳ Planned |
 | Usage accounting configuration, wiring, and end-to-end tests | ⏳ Planned |
 | Usage queries and documentation | ⏳ Planned |
