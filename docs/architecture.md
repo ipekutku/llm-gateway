@@ -21,6 +21,7 @@ The handler authenticates the client and applies its rate limits before reading 
 | `internal/breaker` | Circuit breaker for one provider, as an `llm.Provider` that wraps another. |
 | `internal/auth` | Gateway client API keys and the request's client identity. |
 | `internal/ratelimit` | Per-client request rate and concurrency limits. |
+| `internal/usage` | Model prices and cost estimation from token usage. |
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
 | `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
 | `internal/provider/anthropic` | Anthropic Messages client with private wire types. |
@@ -441,6 +442,17 @@ Decisions:
 - **Retry-After for the request rate.** A `rate_limit_exceeded` response sets `Retry-After` to `RetryAfter` in whole seconds, rounded up and at least 1, so a client that waits that long is admitted. A `concurrency_limit_exceeded` response has no `Retry-After`.
 - **Logged at the handler.** Each rejection is logged once with the client and the limit, like any other failed request; the limiter itself does not log.
 
+## Cost estimation
+
+`internal/usage` estimates what a request cost from the usage its provider reported. It is not wired into the request path yet; usage records will store its result.
+
+- **Exact arithmetic.** A `Rate` is a price in millionths of a dollar per million tokens, parsed from a decimal string such as `"2.50"` or `"0.075"` (up to six decimal places, no sign or exponent, at most $1,000,000 per million tokens). A rate times a token count is a whole number of picodollars (10⁻¹² dollars), so a `Cost` is an `int64` of picodollars with no floating-point rounding, and costs sum exactly. An `int64` holds about $9.2 million per request; usage that would overflow it is rejected rather than wrapped.
+- **Four rates per model.** Input, cache read, cache write, and output. Cache reads and writes are part of `Usage.InputTokens`, so only the remaining input tokens are charged at the input rate. OpenAI has no cache writes, so its cache-write rate is irrelevant and can be 0.
+- **Prices are keyed by provider and configured model name**, not the model the provider reports: OpenAI answers `gpt-4o` as `gpt-4o-2024-08-06`, and dated names change without the configuration changing.
+- **Unknown, never zero.** A model without a price returns `ErrNoPrice`; negative counts, more cached than input tokens, or overflow return an error. Either way the cost is unknown, and callers must not record it as 0.
+
+Costs are estimates. They use the configured prices, which can be out of date, and cover only the usage reported for a successful response. Attempts that were retried, a primary that failed before a fallback answered, and requests that timed out may also be billed by the provider, but report no usage to the gateway.
+
 ## Server lifecycle
 
 - `http.Server` sets `ReadHeaderTimeout` to 5 seconds and `IdleTimeout` to 2 minutes. Without `IdleTimeout`, net/http would fall back to `ReadTimeout`, and with both unset an idle keep-alive connection would never be closed.
@@ -459,6 +471,7 @@ All tests run without credentials or network access, using `httptest` servers.
 | Level | What it proves |
 |---|---|
 | `internal/auth` | Key lookup, invalid, empty, and disabled keys, client validation, and concurrent use. |
+| `internal/usage` | Price parsing (decimal places, bounds, malformed values), costs with and without cache reads and writes, exact picodollar results, inconsistent and overflowing usage, missing prices, and concurrent use. |
 | `internal/ratelimit` | Burst, refill, and sustained rates with exact `RetryAfter`, concurrency limits and release, independent clients, and concurrent use, against a manual clock. |
 | `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers; in `httpapi` also the `Authorization` header rules, 401 and 429 responses, identity in the provider's context, concurrency slots released on every outcome, `client_id` in logs, and a gateway-assigned request ID on every response and in logs. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
