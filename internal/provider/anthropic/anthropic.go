@@ -251,21 +251,36 @@ func decodeResponse(data []byte) (llm.ChatResponse, error) {
 		return llm.ChatResponse{}, err
 	}
 
-	if resp.Usage == nil || resp.Usage.InputTokens == nil || resp.Usage.OutputTokens == nil {
-		return llm.ChatResponse{}, errors.New("response has no token usage")
+	usage, err := translateUsage(resp.Usage)
+	if err != nil {
+		return llm.ChatResponse{}, err
 	}
-	u := resp.Usage
 
 	return llm.ChatResponse{
+		Provider:     ProviderName,
 		Model:        resp.Model,
 		Message:      llm.Message{Role: llm.RoleAssistant, Content: text.String()},
 		FinishReason: finish,
-		Usage: llm.Usage{
-			// input_tokens excludes cached tokens; the neutral count is the
-			// whole prompt, as with OpenAI's prompt_tokens.
-			InputTokens:  *u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens,
-			OutputTokens: *u.OutputTokens,
-		},
+		Usage:        usage,
+	}, nil
+}
+
+// translateUsage requires both token counts. input_tokens excludes cached
+// tokens, so the neutral input count adds the cache reads and writes to
+// cover the whole prompt, as OpenAI's prompt_tokens does. Missing cache
+// fields count as none.
+func translateUsage(u *usage) (llm.Usage, error) {
+	if u == nil || u.InputTokens == nil || u.OutputTokens == nil {
+		return llm.Usage{}, errors.New("response has no token usage")
+	}
+	if *u.InputTokens < 0 || *u.OutputTokens < 0 || u.CacheCreationInputTokens < 0 || u.CacheReadInputTokens < 0 {
+		return llm.Usage{}, errors.New("response has inconsistent token usage")
+	}
+	return llm.Usage{
+		InputTokens:           *u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens,
+		CacheReadInputTokens:  u.CacheReadInputTokens,
+		CacheWriteInputTokens: u.CacheCreationInputTokens,
+		OutputTokens:          *u.OutputTokens,
 	}, nil
 }
 

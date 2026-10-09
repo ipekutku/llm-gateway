@@ -255,6 +255,7 @@ func TestChatTranslatesResponse(t *testing.T) {
 		t.Fatalf("Chat() error = %v", err)
 	}
 	want := llm.ChatResponse{
+		Provider:     ProviderName,
 		Model:        "claude-opus-5-5",
 		Message:      llm.Message{Role: llm.RoleAssistant, Content: "TCP provides reliable, ordered delivery."},
 		FinishReason: llm.FinishReasonStop,
@@ -356,15 +357,29 @@ func TestChatRefusalKeepsPartialText(t *testing.T) {
 }
 
 func TestChatUsageIncludesCachedInput(t *testing.T) {
-	c := newServer(t, respond(http.StatusOK, responseWith(okContent, "end_turn",
-		`{"input_tokens":10,"output_tokens":4,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000}`)))
-
-	got, err := c.Chat(context.Background(), testRequest)
-	if err != nil {
-		t.Fatalf("Chat() error = %v", err)
+	tests := []struct {
+		name  string
+		usage string
+		want  llm.Usage
+	}{
+		{"reads and writes", `{"input_tokens":10,"output_tokens":4,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000}`,
+			llm.Usage{InputTokens: 1110, CacheReadInputTokens: 1000, CacheWriteInputTokens: 100, OutputTokens: 4}},
+		{"no cache fields", okUsage, llm.Usage{InputTokens: 3, OutputTokens: 4}},
+		{"null cache fields", `{"input_tokens":3,"output_tokens":4,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}`,
+			llm.Usage{InputTokens: 3, OutputTokens: 4}},
 	}
-	if want := (llm.Usage{InputTokens: 1110, OutputTokens: 4}); got.Usage != want {
-		t.Errorf("Usage = %+v, want %+v", got.Usage, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newServer(t, respond(http.StatusOK, responseWith(okContent, "end_turn", tt.usage)))
+
+			got, err := c.Chat(context.Background(), testRequest)
+			if err != nil {
+				t.Fatalf("Chat() error = %v", err)
+			}
+			if got.Usage != tt.want {
+				t.Errorf("Usage = %+v, want %+v", got.Usage, tt.want)
+			}
+		})
 	}
 }
 
@@ -466,6 +481,8 @@ func TestChatInvalidResponses(t *testing.T) {
 		{"null usage", responseWith(okContent, "end_turn", `null`)},
 		{"missing output tokens", responseWith(okContent, "end_turn", `{"input_tokens":3}`)},
 		{"missing input tokens", responseWith(okContent, "end_turn", `{"output_tokens":3}`)},
+		{"negative usage", responseWith(okContent, "end_turn", `{"input_tokens":-3,"output_tokens":4}`)},
+		{"negative cache reads", responseWith(okContent, "end_turn", `{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":-1}`)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
