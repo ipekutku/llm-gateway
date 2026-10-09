@@ -231,6 +231,8 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 * The gateway serves plain HTTP and listens on loopback by default. Gateway keys would cross the network unencrypted, so expose it beyond the host only behind a proxy that terminates TLS.
 * Rate limits and concurrency counts are kept per gateway process; several instances do not share them (planned for v0.7).
 * Clients are read from a file at startup; changing them requires a restart. Each client has one key, so rotating a key briefly means replacing it.
+* Every rejected key logs one warning, and there is no per-IP limit on unauthenticated requests; anyone who can reach the port can fill the logs. Another reason to keep the gateway behind a proxy.
+* A request body must arrive within 30 seconds (otherwise `408`), and idle keep-alive connections close after 2 minutes. Both are fixed.
 * Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
 

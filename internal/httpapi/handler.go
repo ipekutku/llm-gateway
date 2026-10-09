@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,12 @@ import (
 
 // ChatCompletionsPath is the path of the chat completions endpoint.
 const ChatCompletionsPath = "/v1/chat/completions"
+
+// bodyReadTimeout bounds how long a client may take to send a request body,
+// counted from when its headers have been read. It also bounds how long the
+// server spends discarding the unread body of a rejected request. Replaced
+// in tests.
+var bodyReadTimeout = 30 * time.Second
 
 type handler struct {
 	provider        llm.Provider
@@ -47,6 +54,9 @@ type handler struct {
 //
 // Requests to other paths receive 404, and other methods on the endpoint
 // receive 405 with an Allow header.
+//
+// Request bodies must arrive within bodyReadTimeout, or the response is
+// 408. The time to wait for the upstream is not limited by it.
 func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *ratelimit.Limiter, upstreamTimeout time.Duration, log *slog.Logger) (http.Handler, error) {
 	switch {
 	case provider == nil:
@@ -65,7 +75,17 @@ func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *rate
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+ChatCompletionsPath, h.chatCompletions)
-	return mux, nil
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set for every request, so it also bounds discarding the unread
+		// body of a request rejected before its body is read: 401, 429,
+		// 404, or 405. Once the body has been read, net/http clears the
+		// deadline itself when it starts watching for a client disconnect,
+		// so the wait for the upstream is not limited; see
+		// TestBodyReadDeadlineDoesNotLimitUpstreamWait. An unsupported
+		// writer, such as a test recorder, gets no deadline.
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
+		mux.ServeHTTP(w, r)
+	}), nil
 }
 
 func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -85,6 +105,10 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			h.fail(w, r, errRequestTooLarge, nil)
+			return
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			h.fail(w, r, errRequestTimeout, err)
 			return
 		}
 		h.fail(w, r, invalidRequest("The request body could not be read."), nil)

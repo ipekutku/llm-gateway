@@ -106,6 +106,7 @@ The endpoint implements a deliberately small subset of the OpenAI Chat Completio
 
 Other rules:
 
+- The body must arrive within 30 seconds of the headers (`bodyReadTimeout`), or the response is 408.
 - The body is limited to 1 MiB and must be exactly one JSON object, optionally surrounded by whitespace. Empty bodies, `null`, non-object values, malformed JSON, and trailing values are rejected.
 - Fields with the wrong JSON type are rejected.
 - Unknown fields such as `temperature`, `tools`, or `n` are accepted for forward compatibility but have no effect.
@@ -150,6 +151,7 @@ Errors use a gateway-owned envelope:
 | Client at its concurrent request limit | 429 | `concurrency_limit_exceeded` | `rate_limit_error` |
 | Invalid JSON, validation failure, streaming requested | 400 | `invalid_request` | `invalid_request_error` |
 | Body exceeds 1 MiB | 413 | `request_too_large` | `invalid_request_error` |
+| Body not received within 30 seconds | 408 | `request_timeout` | `invalid_request_error` |
 | Unknown model (`llm.ErrUnknownModel`) | 404 | `model_not_found` | `invalid_request_error` |
 | Upstream 400 | 400 | `invalid_request` | `invalid_request_error` |
 | Upstream 429 | 429 | `provider_rate_limited` | `rate_limit_error` |
@@ -432,7 +434,9 @@ Decisions:
 
 ## Server lifecycle
 
-- `http.Server` sets `ReadHeaderTimeout` to 5 seconds. Other server timeouts are left unset; handler time is bounded by the upstream timeout instead.
+- `http.Server` sets `ReadHeaderTimeout` to 5 seconds and `IdleTimeout` to 2 minutes. Without `IdleTimeout`, net/http would fall back to `ReadTimeout`, and with both unset an idle keep-alive connection would never be closed.
+- The handler sets a 30-second read deadline (`bodyReadTimeout`) on every request's connection when the request arrives. It bounds reading the body, and also the server's discarding of the unread body of a request rejected before its body was read (401, 429, 404, 405), so a stalled sender cannot hold a connection. Once the body has been read, net/http clears the deadline itself when it starts watching for a client disconnect, so the upstream wait is not limited by it; a test guards that behavior.
+- `ReadTimeout` and `WriteTimeout` stay unset on purpose: they apply to the whole request, including the upstream wait of up to `GATEWAY_UPSTREAM_TIMEOUT`, which bounds handler time instead.
 - `signal.NotifyContext` cancels on `SIGINT` or `SIGTERM`. Shutdown then runs with a fresh 5-second context; the signal context is already canceled.
 - During graceful shutdown the listener closes and in-flight requests finish normally. If they are still running after 5 seconds, the server is closed. That cancels their request contexts, and the cancellation propagates to the upstream calls. The process then exits non-zero.
 - `http.ErrServerClosed` counts as a normal stop. Configuration, listen, and serve errors are logged and exit with status 1.

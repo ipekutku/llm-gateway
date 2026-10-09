@@ -1081,3 +1081,20 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+func TestNewServerTimeouts(t *testing.T) {
+	srv := newServer(http.NotFoundHandler(), slog.New(slog.DiscardHandler))
+	if srv.ReadHeaderTimeout != readHeaderTimeout {
+		t.Errorf("ReadHeaderTimeout = %v, want %v", srv.ReadHeaderTimeout, readHeaderTimeout)
+	}
+	// Without an IdleTimeout, net/http falls back to ReadTimeout, and with
+	// both zero idle keep-alive connections are never closed.
+	if srv.IdleTimeout != serverIdleTimeout || srv.IdleTimeout <= 0 {
+		t.Errorf("IdleTimeout = %v, want %v", srv.IdleTimeout, serverIdleTimeout)
+	}
+	// These would also cut off the wait for the upstream; request bodies
+	// are bounded by the handler instead.
+	if srv.ReadTimeout != 0 || srv.WriteTimeout != 0 {
+		t.Errorf("ReadTimeout, WriteTimeout = %v, %v; want 0, 0", srv.ReadTimeout, srv.WriteTimeout)
+	}
+}
