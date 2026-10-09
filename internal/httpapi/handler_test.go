@@ -251,6 +251,9 @@ func TestChatCompletionsSuccess(t *testing.T) {
 	if !regexp.MustCompile(`^chatcmpl-[A-Z2-7]{26}$`).MatchString(resp.ID) {
 		t.Errorf("id = %q, want chatcmpl-<26 base32 characters>", resp.ID)
 	}
+	if got := rec.Header().Get(RequestIDHeader); "chatcmpl-"+got != resp.ID {
+		t.Errorf("%s = %q, want the id %q without its prefix", RequestIDHeader, got, resp.ID)
+	}
 	if resp.Created < before || resp.Created > after {
 		t.Errorf("created = %d, want within [%d, %d]", resp.Created, before, after)
 	}
@@ -319,6 +322,73 @@ func TestChatCompletionsGeneratesUniqueIDs(t *testing.T) {
 		}
 		ids[resp.ID] = true
 	}
+}
+
+var requestIDPattern = regexp.MustCompile(`^[A-Z2-7]{26}$`)
+
+func TestEveryResponseHasARequestID(t *testing.T) {
+	h, _ := newHandler(t, failingProvider(&llm.ProviderError{Provider: "openai", StatusCode: http.StatusServiceUnavailable}))
+
+	tests := []struct {
+		name       string
+		r          *http.Request
+		wantStatus int
+	}{
+		{"upstream failure", httptest.NewRequest(http.MethodPost, ChatCompletionsPath, strings.NewReader(validBody)), http.StatusBadGateway},
+		{"invalid request", httptest.NewRequest(http.MethodPost, ChatCompletionsPath, strings.NewReader(`{}`)), http.StatusBadRequest},
+		{"missing key", requestWithAuth(""), http.StatusUnauthorized},
+		{"unknown path", httptest.NewRequest(http.MethodPost, "/v1/other", nil), http.StatusNotFound},
+		{"wrong method", httptest.NewRequest(http.MethodGet, ChatCompletionsPath, nil), http.StatusMethodNotAllowed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := serve(t, h, tt.r)
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			if got := rec.Header().Get(RequestIDHeader); !requestIDPattern.MatchString(got) {
+				t.Errorf("%s = %q, want 26 base32 characters", RequestIDHeader, got)
+			}
+		})
+	}
+}
+
+func TestClientRequestIDIsIgnored(t *testing.T) {
+	h, _ := newHandler(t, okProvider)
+	r := httptest.NewRequest(http.MethodPost, ChatCompletionsPath, strings.NewReader(validBody))
+	r.Header.Set(RequestIDHeader, "client-chosen")
+
+	rec := serve(t, h, r)
+
+	if got := rec.Header().Get(RequestIDHeader); !requestIDPattern.MatchString(got) {
+		t.Errorf("%s = %q, want a gateway-assigned ID", RequestIDHeader, got)
+	}
+	if strings.Contains(rec.Body.String(), "client-chosen") {
+		t.Errorf("response uses the client's request ID: %s", rec.Body)
+	}
+}
+
+func TestLogsIncludeRequestID(t *testing.T) {
+	t.Run("failure", func(t *testing.T) {
+		h, logs := newHandler(t, failingProvider(&llm.ProviderError{Provider: "openai", StatusCode: http.StatusServiceUnavailable}))
+		rec := post(t, h, validBody)
+		if want := "request_id=" + rec.Header().Get(RequestIDHeader); !strings.Contains(logs.String(), want) {
+			t.Errorf("failure log does not contain %s:\n%s", want, logs)
+		}
+	})
+
+	t.Run("client cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		h, logs := newHandler(t, providerFunc(func(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+			cancel()
+			return llm.ChatResponse{}, &llm.ProviderError{Provider: "openai", Err: context.Canceled}
+		}))
+		rec := serve(t, h, httptest.NewRequestWithContext(ctx, http.MethodPost, ChatCompletionsPath, strings.NewReader(validBody)))
+		if want := "request_id=" + rec.Header().Get(RequestIDHeader); !strings.Contains(logs.String(), want) {
+			t.Errorf("cancellation log does not contain %s:\n%s", want, logs)
+		}
+	})
 }
 
 func TestChatCompletionsForwardsContentUnchangedAndIgnoresUnknownFields(t *testing.T) {
@@ -660,7 +730,10 @@ func TestChatCompletionsSkipsResponseWhenClientCanceled(t *testing.T) {
 			r := httptest.NewRequestWithContext(ctx, http.MethodPost, ChatCompletionsPath, strings.NewReader(validBody))
 			rec := serve(t, h, r)
 
-			if rec.Body.Len() != 0 || len(rec.Header()) != 0 {
+			// The request ID header is set when the request arrives.
+			header := rec.Header().Clone()
+			header.Del(RequestIDHeader)
+			if rec.Body.Len() != 0 || len(header) != 0 {
 				t.Errorf("wrote response %d %v %s, want nothing", rec.Code, rec.Header(), rec.Body)
 			}
 			if !strings.Contains(logs.String(), "client canceled request") {
