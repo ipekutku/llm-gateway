@@ -43,8 +43,9 @@ Milestone 5 is in progress. It adds per-client usage records and estimated costs
 * cost estimation from per-model prices for input, cached input read and written, and output tokens, with exact integer arithmetic; a model without a price has an unknown cost, never zero
 * a PostgreSQL connection pool and usage store, with embedded forward-only migrations protected by an advisory lock, exact cost storage, and integration tests against disposable databases
 * an asynchronous recorder with a bounded queue, batch writes, write timeouts, and shutdown draining; queue overflow and failed writes are logged, and accepted records survive request cancellation
+* required database and pricing-file configuration, an explicit migration command, startup schema checks, and one usage record for each validated request, including failures and cancellations
 
-Gateway startup and request handling do not yet use the pricing, PostgreSQL, or recorder components. Running the gateway therefore does not estimate costs or persist request usage yet. Database and pricing-file configuration, a migration command, request accounting, and documented usage queries remain to complete v0.5.
+Usage accounting is connected to the request path and verified with fake upstreams and PostgreSQL. Documented usage queries and the milestone close-out remain to complete v0.5. Costs are estimates, and asynchronous recording can lose records during overload, database failures, or shutdown deadlines.
 
 See [Project Status](#project-status) for component status, [Development](#development) for the database test workflow, and [docs/ROADMAP.md](docs/ROADMAP.md#milestone-5--usage-and-cost-accounting) for milestone scope and exit criteria.
 
@@ -111,7 +112,17 @@ This project prioritizes:
 
 ## Running Locally
 
-Requires Go 1.26.9 or later. PostgreSQL is currently needed only for the database integration tests; the gateway's startup wiring is still the v0.4 baseline. First create a gateway API key for your client and a clients file holding its hash:
+Requires Go 1.26.9 or later and PostgreSQL. For a disposable local database, use Docker:
+
+```bash
+make db
+export GATEWAY_DATABASE_URL='postgres://gateway:gateway@127.0.0.1:55432/gateway?sslmode=disable'
+go run ./cmd/gateway migrate
+```
+
+If the development container is already running, reuse its connection settings. `make db-stop` deletes its data, including recorded usage. Use your own persistent PostgreSQL instance to retain records. The `migrate` command requires only `GATEWAY_DATABASE_URL`; apply migrations before starting the gateway. Startup checks connectivity and that the schema is current, and fails without migrating automatically.
+
+Create a gateway API key for your client and a clients file holding its hash:
 
 ```bash
 GATEWAY_KEY=$(openssl rand -base64 32)   # give this key to the client
@@ -120,10 +131,24 @@ printf '{"clients": [{"id": "my-app", "key_sha256": "%s"}]}\n' \
   "$(printf %s "$GATEWAY_KEY" | shasum -a 256 | cut -d' ' -f1)" > clients.json
 ```
 
+Save a pricing file as `prices.json`. Prices are non-negative decimal strings in USD per million tokens, with up to six decimal places, no sign or exponent, and a maximum of $1,000,000 per million tokens. The values below are illustrative; replace them with verified prices for your configured models:
+
+```json
+{
+  "prices": [
+    {"provider": "openai", "model": "gpt-4o", "input": "2.50", "cache_read": "1.25", "cache_write": "0", "output": "10"},
+    {"provider": "anthropic", "model": "claude-opus-5-5", "input": "1", "cache_read": "0.10", "cache_write": "2", "output": "5"}
+  ]
+}
+```
+
+The file must contain a `prices` array; every entry requires the provider, configured model name, and all four prices. Unknown fields and duplicate provider/model entries are rejected. A model absent from the file has an unknown cost (`NULL`), while its token usage is still recorded. `{"prices": []}` is valid if all costs should be unknown. Prices are read once at startup; restart after changing them.
+
 Then configure at least one provider and start the gateway:
 
 ```bash
 export GATEWAY_CLIENTS_FILE=clients.json
+export GATEWAY_PRICING_FILE=prices.json
 
 export OPENAI_MODEL=gpt-4o
 export OPENAI_API_KEY=sk-...            # your OpenAI key
@@ -134,7 +159,7 @@ export ANTHROPIC_API_KEY=sk-ant-...     # your Anthropic key
 go run ./cmd/gateway
 ```
 
-The gateway listens on `127.0.0.1:8080` and logs the configured models and the number of clients. Stop it with `Ctrl+C` or `SIGTERM`; in-flight requests get up to 5 seconds to finish.
+The gateway listens on `127.0.0.1:8080` and logs the configured models and the number of clients. Stop it with `Ctrl+C` or `SIGTERM`; in-flight requests get up to 5 seconds to finish, then pending handlers and usage writes share an additional 5-second drain budget.
 
 Send a request to either model:
 
@@ -168,6 +193,8 @@ The `model` field must match a configured model exactly; the request is routed t
 | Variable | Description |
 |---|---|
 | `GATEWAY_CLIENTS_FILE` | Required. Path of the JSON file listing the gateway's clients (see below). |
+| `GATEWAY_DATABASE_URL` | Required. PostgreSQL URL or connection string. Startup requires a reachable database with the current schema; `go run ./cmd/gateway migrate` applies pending migrations. Never log or commit this setting if it contains credentials. |
+| `GATEWAY_PRICING_FILE` | Required. Path of the JSON pricing file, read once at startup. Missing model prices produce unknown costs. |
 | `OPENAI_MODEL`, `OPENAI_API_KEY` | Enable OpenAI for one model. Set both or neither. |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Enable Anthropic for one model. Set both or neither. |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
@@ -217,6 +244,8 @@ Generate keys with a secure random source, as above; the hash protects only rand
 
 Startup fails if the clients file is missing, malformed, has unknown fields, or enables no client, if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, if a timeout or delay is not a positive duration, if the attempt count is outside 1–10, if the maximum retry delay is less than the base delay, if the provider timeout is not less than the upstream timeout, or if a fallback names a provider that is not configured. Error messages name the variables and clients but never print keys, hashes, or other values.
 
+Startup also fails if either accounting setting is absent, the pricing file is invalid, the database cannot be reached, or its migration history is behind, newer, or inconsistent with this binary. Database connectivity and schema checks share a 10-second startup budget. Migrations have a 1-minute budget and run transactionally under an advisory lock.
+
 The model names above are examples. Any model the provider's API accepts can be configured. The automated tests run both adapters against fake servers built from the providers' documented API formats.
 
 Verified against the live APIs with `make smoke` on 2026-10-09:
@@ -259,6 +288,9 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 * A request body must arrive within 30 seconds (otherwise `408`), and idle keep-alive connections close after 2 minutes. Both are fixed.
 * Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
+* Usage records cover requests that pass body validation, including unknown models and upstream failures. Authentication, gateway rate-limit, malformed-body, and body-size rejections are excluded. A disconnected client is recorded as status `499` with `client_closed`; this status is never sent as a response.
+* Accounting is asynchronous: a full queue drops new records, failed batches are logged and discarded, and a shutdown deadline can lose pending records. Database failure after startup does not fail otherwise successful requests. Records contain metadata, tokens, and estimated costs, never prompt or completion content.
+* Estimated costs cover only provider-reported usage, including a successful generation whose client disconnected before receiving it. Failed retries and a failed primary before fallback may incur charges without reporting usage. Unknown usage and cost are stored as `NULL`, never as fabricated zeros.
 
 ## Development
 
@@ -300,9 +332,11 @@ make smoke
 
 **This makes real, billed API calls** (a few short completions per provider, typically well under one cent). Configure one or both providers. For each model it checks a normal completion and a `length` stop, both with token usage. It also checks that unknown and missing gateway keys get `401`, and that a client over its limit gets `429` with `Retry-After`. It uses fresh random gateway keys and ignores other `GATEWAY_*` settings in the environment. It prints the model each provider reported and fails on any mismatch. It never runs in CI.
 
+The smoke harness injects a fake recorder and an empty pricing table, so it needs no database or pricing file and does not persist usage.
+
 ## Project Status
 
-v0.4 is feature-complete. v0.5 is in progress: pricing, persistence, and asynchronous recording components are implemented; their configuration and integration into the gateway are next.
+v0.4 is feature-complete. v0.5 usage accounting is implemented and connected to the gateway. Usage-query documentation and milestone close-out are next.
 
 ### v0.5
 
@@ -313,10 +347,10 @@ v0.4 is feature-complete. v0.5 is in progress: pricing, persistence, and asynchr
 | Pricing and cost estimation (`internal/usage`) | ✅ Done |
 | PostgreSQL store and embedded migrations (`internal/postgres`) | ✅ Done |
 | Asynchronous usage recorder (`internal/usage`) | ✅ Done |
-| Usage accounting configuration, migration command, wiring, and end-to-end tests | ⏳ Next |
-| Usage queries and documentation | ⏳ Planned |
+| Usage accounting configuration, migration command, wiring, and end-to-end tests | ✅ Done |
+| Usage queries and documentation | ⏳ Next |
 
-The completed components are tested independently. HTTP requests are not yet recorded, and v0.5 is not yet complete.
+The complete request path is tested against fake providers and a fake recorder, with an additional integration test that migrates a disposable PostgreSQL database and persists request records through the background writer. v0.5 remains in progress until the remaining roadmap criteria are closed out.
 
 ### v0.4
 

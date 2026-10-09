@@ -1,15 +1,16 @@
 # Architecture
 
-This document describes the implemented v0.4 gateway and the v0.5 usage, pricing, and PostgreSQL components now under development. The request path has client authentication and per-client rate limits, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, and a circuit breaker per provider.
+This document describes the implemented gateway through v0.5 usage accounting. The request path has client authentication and per-client rate limits, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, a circuit breaker per provider, and asynchronous usage persistence with estimated costs.
 
 ## Request flow
 
 ```text
 HTTP request → httpapi (auth → rate limit) → routing (fallback) → breaker → retry → provider adapter → upstream HTTP request
                   └──────────────────────────── shared internal/llm types ────────────────────────────┘
+                  └─ validated request outcome → usage.Recorder → postgres → PostgreSQL
 ```
 
-The handler authenticates the client and applies its rate limits before reading the request body (see [Client authentication](#client-authentication) and [Rate limiting](#rate-limiting)). The incoming request's `context.Context`, carrying the client's identity, is passed through every step to the outbound upstream request. The handler derives it once, adding the upstream deadline (see [Upstream timeouts](#upstream-timeouts)); nothing below the handler replaces or detaches it.
+The handler authenticates the client and applies its rate limits before reading the request body (see [Client authentication](#client-authentication) and [Rate limiting](#rate-limiting)). The incoming request's `context.Context`, carrying the client's identity, request ID, and arrival time, is passed through every step to the outbound upstream request. The handler derives it once, adding the upstream deadline (see [Upstream timeouts](#upstream-timeouts)); upstream work never detaches from it. Usage persistence deliberately has a separate lifetime, described in [Asynchronous usage recording](#asynchronous-usage-recording).
 
 ## Packages and dependency boundaries
 
@@ -33,7 +34,7 @@ Rules:
 - `llm` imports no other project package. Every other package depends on it.
 - Provider-specific request and response types are unexported inside their provider package.
 - The HTTP layer never depends on a concrete provider. It depends only on `llm.Provider`.
-- `postgres` depends on `usage` and `llm`; nothing depends on `postgres` except, later, `cmd/gateway`. The database stays out of the request path's packages.
+- `postgres` depends on `usage`; only `cmd/gateway` constructs and owns the database store. The HTTP handler accepts a small recorder interface and a pricing table, without depending on PostgreSQL.
 - `llm` types carry no JSON tags. Public wire formats live in `httpapi`, and upstream wire formats live in each provider package.
 
 ## Provider contract
@@ -93,13 +94,13 @@ Provider adapters must return every failure, including transport errors and canc
 
 ## HTTP API
 
-`httpapi.New(provider, authenticator, limiter, upstreamTimeout, logger)` returns an `http.Handler` serving `POST /v1/chat/completions`. The provider is normally the router. Other methods on the endpoint receive 405 with `Allow: POST`, and other paths receive 404; both use the standard `ServeMux` responses.
+`httpapi.New(provider, authenticator, limiter, upstreamTimeout, accounting, logger)` returns an `http.Handler` serving `POST /v1/chat/completions`. `Accounting` supplies the required recorder and pricing table, plus each provider's configured model name. The provider is normally the router. Other methods on the endpoint receive 405 with `Allow: POST`, and other paths receive 404; both use the standard `ServeMux` responses.
 
 The endpoint implements a deliberately small subset of the OpenAI Chat Completions format. It does not claim full API or SDK compatibility. Public wire types are unexported in `httpapi` and are translated to and from the neutral `llm` types.
 
 ### Request IDs
 
-Every request, including one rejected with 401, 404, or 405, gets an ID of 26 random base32 characters from `crypto/rand` when it arrives. It is returned in the `X-Request-ID` response header, logged as `request_id` with the request's failure or cancellation, and carried in the request context. A successful completion's `id` is `chatcmpl-` followed by it. An `X-Request-ID` header sent by the client is ignored: the ID is gateway-owned, so a client cannot make two requests share one or inject arbitrary text into logs. Usage records will be keyed by it.
+Every request, including one rejected with 401, 404, or 405, gets an ID of 26 random base32 characters from `crypto/rand` when it arrives. It is returned in the `X-Request-ID` response header, logged as `request_id` with the request's failure or cancellation, and carried in the request context. A successful completion's `id` is `chatcmpl-` followed by it. An `X-Request-ID` header sent by the client is ignored: the ID is gateway-owned, so a client cannot make two requests share one or inject arbitrary text into logs. Usage records are keyed by it.
 
 ### Request
 
@@ -247,13 +248,15 @@ Response fixtures follow Anthropic's documented response shape. The smoke test v
 
 ## Configuration
 
-Configuration is read once at startup in `cmd/gateway`: settings from the environment, and the gateway clients from the JSON file named by `GATEWAY_CLIENTS_FILE`. There is no configuration framework. Changing clients requires a restart.
+Configuration is read once at startup in `cmd/gateway`: settings from the environment, gateway clients from `GATEWAY_CLIENTS_FILE`, and prices from `GATEWAY_PRICING_FILE`. There is no configuration framework. Changing clients or prices requires a restart.
 
 | Variable | Rule |
 |---|---|
 | `OPENAI_MODEL`, `OPENAI_API_KEY` | Both absent disables OpenAI. Both present routes that one model to OpenAI. Only one present fails startup. |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Same rule for Anthropic. |
 | `GATEWAY_CLIENTS_FILE` | Required. Path of the clients file (see below). |
+| `GATEWAY_DATABASE_URL` | Required. PostgreSQL connection setting; never logged. Connection and schema checks share a 10-second startup budget. |
+| `GATEWAY_PRICING_FILE` | Required. Path of the JSON pricing file, described below. |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. The gateway serves plain HTTP, so gateway keys would cross the network unencrypted; exposing it beyond the host needs TLS terminated in front of it. |
 | `GATEWAY_UPSTREAM_TIMEOUT` | Upstream time budget per request, as a Go duration (`90s`, `2m`). Default `120s`. |
 | `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Limit on the upstream TCP dial and, separately, the TLS handshake. Default `10s`. |
@@ -404,7 +407,7 @@ Gateway keys are unrelated to provider keys: clients never see provider credenti
 | Element | Rule |
 |---|---|
 | `auth.Client` | ID, SHA-256 hash of the key, and a `Disabled` flag. One key per client. |
-| Client ID | 1 to 64 ASCII letters, digits, `-`, `_`, or `.`. IDs appear in logs and, later, in rate limits and usage records. |
+| Client ID | 1 to 64 ASCII letters, digits, `-`, `_`, or `.`. IDs appear in logs, rate limits, and usage records. |
 | `auth.New` | Rejects an empty client list, invalid or duplicate IDs, missing hashes, and two clients sharing a key, including a disabled one. The client list is copied and never changes afterwards, so lookups need no locking. |
 | `Authenticate(key)` | Returns the client's `auth.Identity`, an error wrapping `auth.ErrDisabledKey` that names a disabled client, or `auth.ErrInvalidKey` for any other key, including an empty one. Errors never contain the key. |
 | `auth.NewContext`, `auth.FromContext` | Carry the `Identity` in the request context, so later layers can identify the client. |
@@ -446,25 +449,31 @@ Decisions:
 
 ## Cost estimation
 
-`internal/usage` estimates what a request cost from the usage its provider reported. It is not wired into the request path yet; usage records will store its result.
+`internal/usage` estimates what a request cost from the usage its provider reported. The handler records the result without changing the public response.
 
 - **Exact arithmetic.** A `Rate` is a price in millionths of a dollar per million tokens, parsed from a decimal string such as `"2.50"` or `"0.075"` (up to six decimal places, no sign or exponent, at most $1,000,000 per million tokens). A rate times a token count is a whole number of picodollars (10⁻¹² dollars), so a `Cost` is an `int64` of picodollars with no floating-point rounding, and costs sum exactly. An `int64` holds about $9.2 million per request; usage that would overflow it is rejected rather than wrapped.
 - **Four rates per model.** Input, cache read, cache write, and output. Cache reads and writes are part of `Usage.InputTokens`, so only the remaining input tokens are charged at the input rate. OpenAI has no cache writes, so its cache-write rate is irrelevant and can be 0.
 - **Prices are keyed by provider and configured model name**, not the model the provider reports: OpenAI answers `gpt-4o` as `gpt-4o-2024-08-06`, and dated names change without the configuration changing.
 - **Unknown, never zero.** A model without a price returns `ErrNoPrice`; negative counts, more cached than input tokens, or overflow return an error. Either way the cost is unknown, and callers must not record it as 0.
 
-Costs are estimates. They use the configured prices, which can be out of date, and cover only the usage reported for a successful response. Attempts that were retried, a primary that failed before a fallback answered, and requests that timed out may also be billed by the provider, but report no usage to the gateway.
+Costs are estimates. They use the configured prices, which can be out of date, and cover only the usage reported for a successful upstream response, including one whose client disconnected before receiving it. Attempts that were retried, a primary that failed before a fallback answered, and requests that timed out may also be billed by the provider, but report no usage to the gateway.
+
+### Pricing file
+
+The file is a single JSON object with a `prices` array. Each entry requires `provider`, `model`, and four quoted decimal prices: `input`, `cache_read`, `cache_write`, and `output`, in USD per million tokens. The loader rejects unknown fields, missing or invalid rates, trailing data, blank names, and duplicate provider/model entries. Errors identify the file setting, entry index, and rate field without echoing configuration values. See the [README example](../README.md#running-locally).
+
+An empty `prices` array is valid. A configured model with no entry has unknown cost, while reported tokens are still recorded. The application passes an immutable provider-to-configured-model mapping to the handler; the provider that answered selects the price after fallback, rather than the original requested model or a dated response model name.
 
 ## PostgreSQL
 
-`internal/postgres` stores usage records. It is not wired into the gateway yet; a later change records each request through it.
+`internal/postgres` stores usage records through the asynchronous recorder. The application opens the pool, checks the schema, and starts the writer before listening. An unreachable or incompatible database fails startup; loss of the database afterwards only affects recording.
 
 - **Driver.** [pgx](https://github.com/jackc/pgx) v5 with its `pgxpool` connection pool, the project's first third-party dependency: the standard library has no PostgreSQL driver, and pgx is the maintained, widely used one. `database/sql` is not used; its generic interface would add nothing here.
 - **Connecting.** `Open(ctx, url)` takes a PostgreSQL URL or key/value connection string and pings the server, so an unreachable database fails at once. Pool settings such as `pool_max_conns` go in the URL, so there is no separate pool configuration. Errors never include the URL: pgx redacts passwords from its parse errors only on a best-effort basis, so a malformed URL produces a fixed message instead.
 
 ### Schema
 
-`usage_records` has one row per request, keyed by the gateway's request ID:
+`usage_records` has one row per recorded, validated request, keyed by the gateway's request ID:
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -473,7 +482,7 @@ Costs are estimates. They use the configured prices, which can be out of date, a
 | `duration_ms` | `integer` | How long the gateway took to answer. |
 | `client_id` | `text` | The authenticated client. |
 | `requested_model` | `text` | The model the client asked for. |
-| `provider` | `text`, nullable | The provider that answered, or the last one that failed; NULL if none was called. |
+| `provider` | `text`, nullable | The provider that answered, or the provider identified by the final upstream error; NULL if that outcome identifies no upstream. |
 | `model` | `text`, nullable | The model the provider reported; NULL on failure. |
 | `status` | `smallint` | The HTTP status sent to the client; 499 (nginx's convention) if the client disconnected first. |
 | `error_code` | `text`, nullable | The public error code; NULL on success. |
@@ -494,6 +503,7 @@ Migrations are SQL files in `internal/postgres/migrations`, named `NNNN_descript
 - **One transaction.** `Migrate` runs all pending migrations and their `schema_migrations` entries in one transaction, after taking a transaction-scoped advisory lock. PostgreSQL DDL is transactional, so a failing migration leaves the schema unchanged, and gateways migrating at the same time apply each migration once. Statements that cannot run in a transaction, such as `CREATE INDEX CONCURRENTLY`, are therefore not allowed.
 - **Migration history is checked.** Applied migrations must be an exact prefix of the embedded files, including their names. Missing or renamed entries are refused. If the database has a migration the gateway does not know, a newer gateway migrated it; `Migrate` and `CheckSchema` fail rather than write to a schema this version was not built for.
 - **`CheckSchema`** reports an error unless the database has applied exactly the known migrations, for a gateway that should not migrate on its own.
+- **Command.** `go run ./cmd/gateway migrate` reads only `GATEWAY_DATABASE_URL`, opens the database, and applies pending migrations within a 1-minute budget. It needs no provider credentials, clients file, or pricing file. Normal startup checks the schema but never runs migrations.
 
 ### Inserting records
 
@@ -501,7 +511,11 @@ Migrations are SQL files in `internal/postgres/migrations`, named `NNNN_descript
 
 ## Asynchronous usage recording
 
-`usage.Recorder` is implemented but not yet wired into the request path. It accepts a `usage.Record`, validates and copies its usage and cost values, then offers it to a bounded channel without waiting for PostgreSQL. Its only store dependency is an `Insert(ctx, []usage.Record) error` interface, which the PostgreSQL store satisfies.
+The handler submits one record when a request that passed body validation finishes: success, unknown model, upstream failure, timeout, or client cancellation. Authentication, gateway rate-limit, body-read, body-size, JSON, and message-validation failures never reach recording. A request's arrival timestamp includes admission and body-read time; its duration ends after response writing. Records contain no prompt or completion content.
+
+On upstream success, the record contains the answering provider, reported response model, token usage, and estimated cost if known. On failure, usage and cost are unknown, and a typed provider error identifies the final failed provider. An outcome without a typed upstream identity, such as an unknown model or open circuit, records a NULL provider. The status and error code match the gateway response. An incoming cancellation or failed response write is recorded as `499 client_closed` without sending a 499 response; already reported usage and cost are retained.
+
+`usage.Recorder` validates and copies usage and cost values, then offers the record to a bounded channel without waiting for PostgreSQL. Its only store dependency is an `Insert(ctx, []usage.Record) error` interface, which the PostgreSQL store satisfies.
 
 - **Bounded work.** The default queue holds 1,024 records. One writer inserts batches of at most 100, flushing a partial batch after 1 second. Each write has a 5-second timeout. These limits are explicit `RecorderOptions`, so tests use small deterministic values.
 - **Overload and failure.** A full queue drops the new record and logs a warning with its request ID. An invalid record or one submitted after shutdown is also rejected and logged. If a batch insert fails, the writer logs the failure, drops that batch, and continues with later records. It does not retry silently or block an HTTP response on database availability. These losses mean persisted usage can be incomplete; the gateway must not present it as an exact bill.
@@ -515,13 +529,14 @@ Migrations are SQL files in `internal/postgres/migrations`, named `NNNN_descript
 - `ReadTimeout` and `WriteTimeout` stay unset on purpose: they apply to the whole request, including the upstream wait of up to `GATEWAY_UPSTREAM_TIMEOUT`, which bounds handler time instead.
 - `signal.NotifyContext` cancels on `SIGINT` or `SIGTERM`. Shutdown then runs with a fresh 5-second context; the signal context is already canceled.
 - During graceful shutdown the listener closes and in-flight requests finish normally. If they are still running after 5 seconds, the server is closed. That cancels their request contexts, and the cancellation propagates to the upstream calls. The process then exits non-zero.
+- After HTTP shutdown, canceled handlers and the recorder share another 5-second budget. An application-owned handler tracker stops admitting new work and waits for accepted handlers to enqueue their final records before closing the recorder. The queue is then drained or canceled, and the database pool closes afterwards. Accounting cleanup also runs on startup/listen errors after the writer was created.
 - `http.ErrServerClosed` counts as a normal stop. Configuration, listen, and serve errors are logged and exit with status 1.
 
 These limits govern the server's own lifecycle and are separate from the upstream timeouts. A shutdown can therefore cut off a request that is still within its upstream timeout.
 
 ## Testing
 
-All tests run without credentials or network access, using `httptest` servers. The PostgreSQL integration tests also need a disposable PostgreSQL, named by `GATEWAY_TEST_DATABASE_URL`; without it they are skipped, except in CI, where they fail.
+Automated tests use synthetic credentials, fake upstream HTTP servers, and fake recorders/stores, with no paid provider calls. PostgreSQL integration tests also need a disposable PostgreSQL, named by `GATEWAY_TEST_DATABASE_URL`; without it they are skipped, except in CI, where they fail.
 
 | Level | What it proves |
 |---|---|
@@ -531,7 +546,7 @@ All tests run without credentials or network access, using `httptest` servers. T
 | `internal/ratelimit` | Burst, refill, and sustained rates with exact `RetryAfter`, concurrency limits and release, independent clients, and concurrent use, against a manual clock. |
 | `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers; in `httpapi` also the `Authorization` header rules, 401 and 429 responses, identity in the provider's context, concurrency slots released on every outcome, `client_id` in logs, and a gateway-assigned request ID on every response and in logs. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
-| `cmd/gateway` | Configuration rules, including the clients file, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, retries (recovery for each retryable status, exhaustion, non-retryable statuses, `Retry-After` beyond the budget, refused connections, and client cancellation during a retry wait), fallback (on failures and on a primary timeout, not on a rejected request, both providers failing), circuit breaking (opening, failing fast without calling the upstream, routing straight to the fallback, and one breaker shared by a provider's own route and fallback use), client cancellation and upstream timeouts reaching the upstream, authentication (anonymous, malformed, unknown, provider, and disabled keys rejected before any upstream call; gateway and provider credentials never crossing), per-client rate limits with `Retry-After`, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |
+| `cmd/gateway` | Configuration rules, including clients, required database/pricing settings, and strict price parsing. Startup and lifecycle tests inject a fake store. Complete-path tests use the real handler, router, and both adapters with fake upstreams: routing, errors, retries, fallback, circuit breaking, authentication, rate limits, cancellation, deadlines, and graceful/forced shutdown. Accounting tests verify one record per validated outcome, cache-aware and fallback prices, NULL costs for unpriced models, and no writes for pre-validation rejections. A disposable PostgreSQL test verifies unmigrated startup failure, the independent migration command, and actual handler → recorder → database persistence. |
 
 Tests coordinate with channels. Timeouts are used only as failure guards. CI runs the Makefile's `fmt`, `vet`, `test`, `build`, and `vuln` targets (`make check` locally), with a PostgreSQL service container for the integration tests. Locally, `make db` starts the same PostgreSQL image in Docker.
 
