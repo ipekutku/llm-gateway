@@ -21,7 +21,7 @@ The handler authenticates the client and applies its rate limits before reading 
 | `internal/breaker` | Circuit breaker for one provider, as an `llm.Provider` that wraps another. |
 | `internal/auth` | Gateway client API keys and the request's client identity. |
 | `internal/ratelimit` | Per-client request rate and concurrency limits. |
-| `internal/usage` | Model prices, cost estimation from token usage, and the usage record type. |
+| `internal/usage` | Model prices, cost estimation, the usage record type, and asynchronous recording. |
 | `internal/postgres` | PostgreSQL connection pool, schema migrations, and storage of usage records. |
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
 | `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
@@ -499,6 +499,15 @@ Migrations are SQL files in `internal/postgres/migrations`, named `NNNN_descript
 
 `Insert(ctx, records)` writes a batch in one round trip. pgx sends the batch with a single sync, so PostgreSQL runs it as one implicit transaction: every record is stored or none. Each row is inserted with `ON CONFLICT (request_id) DO NOTHING`, so a batch retried after an uncertain failure, such as a lost commit acknowledgment, creates no duplicates and does not overwrite stored rows. Every record is checked with `usage.Record.Validate` first; if any is invalid, nothing is sent.
 
+## Asynchronous usage recording
+
+`usage.Recorder` is implemented but not yet wired into the request path. It accepts a `usage.Record`, validates and copies its usage and cost values, then offers it to a bounded channel without waiting for PostgreSQL. Its only store dependency is an `Insert(ctx, []usage.Record) error` interface, which the PostgreSQL store satisfies.
+
+- **Bounded work.** The default queue holds 1,024 records. One writer inserts batches of at most 100, flushing a partial batch after 1 second. Each write has a 5-second timeout. These limits are explicit `RecorderOptions`, so tests use small deterministic values.
+- **Overload and failure.** A full queue drops the new record and logs a warning with its request ID. An invalid record or one submitted after shutdown is also rejected and logged. If a batch insert fails, the writer logs the failure, drops that batch, and continues with later records. It does not retry silently or block an HTTP response on database availability. These losses mean persisted usage can be incomplete; the gateway must not present it as an exact bill.
+- **Context ownership.** The writer uses a context created when the recorder starts, separate from any request context. This intentionally departs from the usual request-cancellation rule: a client disconnecting after upstream work must not cancel a record already accepted by the queue. The separate context is limited for each write and canceled if shutdown's drain deadline expires.
+- **Shutdown.** `Close(ctx)` atomically stops new records, drains the queue, and waits for the writer. If its context expires, it cancels the current insert and returns the context error; queued records may be lost. The store must honor context cancellation for this bound to hold. Repeated and concurrent calls are safe.
+
 ## Server lifecycle
 
 - `http.Server` sets `ReadHeaderTimeout` to 5 seconds and `IdleTimeout` to 2 minutes. Without `IdleTimeout`, net/http would fall back to `ReadTimeout`, and with both unset an idle keep-alive connection would never be closed.
@@ -517,7 +526,7 @@ All tests run without credentials or network access, using `httptest` servers. T
 | Level | What it proves |
 |---|---|
 | `internal/auth` | Key lookup, invalid, empty, and disabled keys, client validation, and concurrent use. |
-| `internal/usage` | Record validation, price parsing (decimal places, bounds, malformed values), costs with and without cache reads and writes, exact picodollar results, inconsistent and overflowing usage, missing prices, and concurrent use. |
+| `internal/usage` | Record validation, price parsing (decimal places, bounds, malformed values), costs with and without cache reads and writes, exact picodollar results, inconsistent and overflowing usage, and concurrent use. Recorder tests use a fake store for batching, interval flush, queue overflow, failed and timed-out writes, shutdown drain and cancellation, record snapshots, and concurrent Record/Close. |
 | `internal/postgres` | Migration file naming; against a real PostgreSQL, each test in its own new database: migrating an empty database, idempotent and concurrent migration, a failing migration leaving no trace, applying only pending migrations, refusing a newer schema; inserting success and failure records with exact costs and NULLs for unknown values, skipping already stored request IDs, rejecting invalid records without writing, all-or-nothing batches, cancellation, and concurrent inserts. Errors never reveal the database password. |
 | `internal/ratelimit` | Burst, refill, and sustained rates with exact `RetryAfter`, concurrency limits and release, independent clients, and concurrent use, against a manual clock. |
 | `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers; in `httpapi` also the `Authorization` header rules, 401 and 429 responses, identity in the provider's context, concurrency slots released on every outcome, `client_id` in logs, and a gateway-assigned request ID on every response and in logs. |

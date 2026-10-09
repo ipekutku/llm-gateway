@@ -35,16 +35,18 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ### v0.5 — Usage and Cost Accounting
 
-The fifth milestone measures how the gateway is used and what that costs: every request's token usage and estimated cost, stored in PostgreSQL. It is in progress. So far:
+Milestone 5 is in progress. It adds per-client usage records and estimated costs, persisted in PostgreSQL. The following components are implemented and tested:
 
 * token usage keeps the prompt-cache detail providers price differently: cached input read (OpenAI and Anthropic) and written (Anthropic), as part of the input count
 * the provider that answered is known for every response, including one served by a fallback
 * every request gets a gateway-assigned ID, returned in the `X-Request-ID` header and logged with failures
 * cost estimation from per-model prices for input, cached input read and written, and output tokens, with exact integer arithmetic; a model without a price has an unknown cost, never zero
+* a PostgreSQL connection pool and usage store, with embedded forward-only migrations protected by an advisory lock, exact cost storage, and integration tests against disposable databases
+* an asynchronous recorder with a bounded queue, batch writes, write timeouts, and shutdown draining; queue overflow and failed writes are logged, and accepted records survive request cancellation
 
-Prices cannot be configured yet, and usage records are not stored yet.
+Gateway startup and request handling do not yet use the pricing, PostgreSQL, or recorder components. Running the gateway therefore does not estimate costs or persist request usage yet. Database and pricing-file configuration, a migration command, request accounting, and documented usage queries remain to complete v0.5.
 
-The PostgreSQL store and embedded migrations are implemented but are not yet wired into gateway startup or request handling. To run their integration tests locally, start the disposable development database with `make db`, set the `GATEWAY_TEST_DATABASE_URL` value it prints, then run `make test`. `make db-stop` stops that container and deletes its data. Without the variable, the database tests skip locally; CI requires and runs them.
+See [Project Status](#project-status) for component status, [Development](#development) for the database test workflow, and [docs/ROADMAP.md](docs/ROADMAP.md#milestone-5--usage-and-cost-accounting) for milestone scope and exit criteria.
 
 ### v0.4 — Authentication and Rate Limiting ✅
 
@@ -91,7 +93,7 @@ The first milestone focused only on the core gateway architecture:
 * automated tests
 * continuous integration
 
-Features such as retries, failover, authentication, databases, observability, Kubernetes, and cloud deployment are intentionally deferred to later milestones.
+Retries, failover, and authentication were added in subsequent milestones. Observability and deployment infrastructure remain later roadmap work.
 
 ## Engineering Principles
 
@@ -109,7 +111,7 @@ This project prioritizes:
 
 ## Running Locally
 
-Requires Go 1.26.9 or later. First create a gateway API key for your client and a clients file holding its hash:
+Requires Go 1.26.9 or later. PostgreSQL is currently needed only for the database integration tests; the gateway's startup wiring is still the v0.4 baseline. First create a gateway API key for your client and a clients file holding its hash:
 
 ```bash
 GATEWAY_KEY=$(openssl rand -base64 32)   # give this key to the client
@@ -260,13 +262,30 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 
 ## Development
 
-Run the verification suite locally with:
+The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke tests), `test` (`go test -race -timeout 2m ./...`), `build`, and `vuln` (govulncheck).
+
+### PostgreSQL integration tests
+
+To run the complete suite including the database integration tests, start the disposable PostgreSQL 18 container with Docker:
 
 ```bash
+make db
+export GATEWAY_TEST_DATABASE_URL='postgres://gateway:gateway@127.0.0.1:55432/gateway?sslmode=disable'
 make check
 ```
 
-It runs the same checks as GitHub Actions, one `make` target each: `fmt` (gofmt), `vet`, `test` (`go test -race`), `build`, and `vuln` (govulncheck). CI runs these targets for pull requests and changes to `main`. Tests use local fake provider servers and need no API keys or network access; only the vulnerability check downloads its tool and the vulnerability database.
+`make db` prints the connection setting above. Its port defaults to `55432`; use `make db DB_PORT=<port>` and the printed URL if that port is occupied. The credentials are for this disposable local database. `GATEWAY_TEST_DATABASE_URL` is a test setting, not a gateway startup setting. Each integration test creates and drops its own database, so an alternative test server must grant the test user `CREATEDB`.
+
+Run `make test` to run just the tests. Without `GATEWAY_TEST_DATABASE_URL`, database integration tests skip locally; the remaining tests still run. CI supplies a PostgreSQL service and the variable, and fails if it is missing or the database is unreachable.
+
+When finished with the development database:
+
+```bash
+make db-stop
+unset GATEWAY_TEST_DATABASE_URL
+```
+
+Stopping the container deletes its data. Tests use fake provider servers and the recorder tests use a fake store; they require no provider API keys or paid API calls. Initial setup may download Go dependencies and the Docker image, and `make vuln` needs access to the Go vulnerability database.
 
 ### Smoke test against the real APIs
 
@@ -283,7 +302,7 @@ make smoke
 
 ## Project Status
 
-🚧 **Early development** — v0.5 is in progress.
+v0.4 is feature-complete. v0.5 is in progress: pricing, persistence, and asynchronous recording components are implemented; their configuration and integration into the gateway are next.
 
 ### v0.5
 
@@ -292,10 +311,12 @@ make smoke
 | Provider and prompt-cache tokens in neutral usage (`internal/llm`, `internal/provider/*`) | ✅ Done |
 | Request IDs (`internal/httpapi`) | ✅ Done |
 | Pricing and cost estimation (`internal/usage`) | ✅ Done |
-| PostgreSQL store and migrations | ⏳ Next |
-| Asynchronous usage recorder | ⏳ Planned |
-| Usage accounting configuration, wiring, and end-to-end tests | ⏳ Planned |
+| PostgreSQL store and embedded migrations (`internal/postgres`) | ✅ Done |
+| Asynchronous usage recorder (`internal/usage`) | ✅ Done |
+| Usage accounting configuration, migration command, wiring, and end-to-end tests | ⏳ Next |
 | Usage queries and documentation | ⏳ Planned |
+
+The completed components are tested independently. HTTP requests are not yet recorded, and v0.5 is not yet complete.
 
 ### v0.4
 
