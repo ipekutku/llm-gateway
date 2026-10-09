@@ -189,17 +189,39 @@ func TestChatAppliesJitterToBackoff(t *testing.T) {
 }
 
 func TestChatHonorsRetryAfter(t *testing.T) {
-	limited := &llm.ProviderError{Provider: "anthropic", StatusCode: http.StatusTooManyRequests, RetryAfter: 3 * time.Second}
+	// testPolicy: backoff 100ms before the first retry, MaxDelay 1s.
+	for _, retryAfter := range []time.Duration{800 * time.Millisecond, testPolicy.MaxDelay} {
+		t.Run(retryAfter.String(), func(t *testing.T) {
+			limited := &llm.ProviderError{Provider: "anthropic", StatusCode: http.StatusTooManyRequests, RetryAfter: retryAfter}
+			next := &scripted{results: []error{limited, nil}}
+			p, delays := newTestProvider(t, next, testPolicy)
+			p.jitter = func(time.Duration) time.Duration { return 0 }
+
+			if _, err := p.Chat(context.Background(), testRequest); err != nil {
+				t.Fatalf("Chat() error = %v", err)
+			}
+			// Retry-After wins over the jittered backoff.
+			if fmt.Sprint(*delays) != fmt.Sprint([]time.Duration{retryAfter}) {
+				t.Errorf("waits = %v, want [%v]", *delays, retryAfter)
+			}
+		})
+	}
+}
+
+func TestChatStopsWhenRetryAfterExceedsMaxDelay(t *testing.T) {
+	// Waiting longer than MaxDelay would hold up a fallback or the client;
+	// the failure is returned at once instead, even with ample budget.
+	limited := &llm.ProviderError{Provider: "openai", StatusCode: http.StatusTooManyRequests, RetryAfter: testPolicy.MaxDelay + time.Second}
 	next := &scripted{results: []error{limited, nil}}
 	p, delays := newTestProvider(t, next, testPolicy)
-	p.jitter = func(time.Duration) time.Duration { return 0 }
 
-	if _, err := p.Chat(context.Background(), testRequest); err != nil {
-		t.Fatalf("Chat() error = %v", err)
+	_, err := p.Chat(context.Background(), testRequest)
+
+	if err != limited {
+		t.Errorf("error = %v, want the 429 unchanged", err)
 	}
-	// Retry-After wins over both the jittered backoff and MaxDelay.
-	if fmt.Sprint(*delays) != fmt.Sprint([]time.Duration{3 * time.Second}) {
-		t.Errorf("waits = %v, want [3s]", *delays)
+	if next.Calls() != 1 || len(*delays) != 0 {
+		t.Errorf("calls = %d, waits = %v; want 1 call and no waits", next.Calls(), *delays)
 	}
 }
 
@@ -281,9 +303,10 @@ func TestRetryable(t *testing.T) {
 }
 
 func TestChatStopsWhenWaitWouldExceedDeadline(t *testing.T) {
+	// The wait is within MaxDelay but longer than the remaining budget.
 	limited := &llm.ProviderError{Provider: "openai", StatusCode: http.StatusTooManyRequests, RetryAfter: time.Hour}
 	next := &scripted{results: []error{limited, nil}}
-	p, delays := newTestProvider(t, next, testPolicy)
+	p, delays := newTestProvider(t, next, Policy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Hour})
 	ctx, cancel := context.WithTimeout(context.Background(), guard)
 	defer cancel()
 
