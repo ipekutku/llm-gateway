@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the architecture as implemented in v0.3: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, and a circuit breaker per provider.
+This document describes the architecture as implemented in v0.3: an HTTP endpoint, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, and a circuit breaker per provider. Milestone 4 (v0.4) work in progress adds client authentication, which is implemented but not yet wired into the gateway.
 
 ## Request flow
 
@@ -19,6 +19,7 @@ The incoming request's `context.Context` is passed through every step to the out
 | `internal/routing` | Exact-match static model router. |
 | `internal/retry` | Bounded retries of transient upstream failures, as an `llm.Provider` that wraps another. |
 | `internal/breaker` | Circuit breaker for one provider, as an `llm.Provider` that wraps another. |
+| `internal/auth` | Gateway client API keys and the request's client identity. |
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
 | `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
 | `internal/provider/anthropic` | Anthropic Messages client with private wire types. |
@@ -345,6 +346,32 @@ Decisions:
 - **State is per process.** Several gateway instances each keep their own breaker; shared state is a Milestone 7 (Redis) concern.
 - **Transitions are logged**: `circuit opened` at warn (provider, previous state, consecutive failures, cooldown), and `circuit half-open, probing provider` and `circuit closed` at info.
 
+## Client authentication
+
+`auth.Authenticator` maps gateway API keys to clients. It is not yet wired into `cmd/gateway` or `internal/httpapi`; the planned flow is:
+
+```text
+Authorization: Bearer <gateway key> → httpapi → Authenticator → client identity in the request context → rate limit → router
+```
+
+Gateway keys are unrelated to provider keys: clients never see provider credentials, and a gateway key gives no access to a provider except through the gateway.
+
+| Element | Rule |
+|---|---|
+| `auth.Client` | ID, SHA-256 hash of the key, and a `Disabled` flag. One key per client. |
+| Client ID | 1 to 64 ASCII letters, digits, `-`, `_`, or `.`. IDs appear in logs and, later, in rate limits and usage records. |
+| `auth.New` | Rejects an empty client list, invalid or duplicate IDs, missing hashes, and two clients sharing a key, including a disabled one. The client list is copied and never changes afterwards, so lookups need no locking. |
+| `Authenticate(key)` | Returns the client's `auth.Identity`, an error wrapping `auth.ErrDisabledKey` that names a disabled client, or `auth.ErrInvalidKey` for any other key, including an empty one. Errors never contain the key. |
+| `auth.NewContext`, `auth.FromContext` | Carry the `Identity` in the request context, so later layers can identify the client. |
+
+Decisions:
+
+- **Only hashes are stored.** The gateway holds the SHA-256 hash of each key, never the key, so the key configuration cannot be used to authenticate.
+- **Unsalted SHA-256, because keys are random.** A slow password hash (bcrypt, Argon2) protects low-entropy secrets against guessing. Gateway keys must be high-entropy random values (for example `openssl rand -base64 32`), which a fast hash already protects, and a fast hash keeps per-request authentication cheap.
+- **Lookup by hash, not by comparing keys.** The presented key is hashed and looked up in a map. Lookup timing depends only on the hash, which an attacker cannot steer toward a valid key's hash, so no comparison over the secret runs at all. This replaces a constant-time comparison against every stored key.
+- **Disabled is distinct from invalid internally.** The two errors let the gateway log why a key was rejected; the public response is decided when the HTTP layer is wired.
+- **One key per client.** Key rotation with several keys per client is deferred; replacing a key means replacing its hash.
+
 ## Server lifecycle
 
 - `http.Server` sets `ReadHeaderTimeout` to 5 seconds. Other server timeouts are left unset; handler time is bounded by the upstream timeout instead.
@@ -360,6 +387,7 @@ All tests run without credentials or network access, using `httptest` servers.
 
 | Level | What it proves |
 |---|---|
+| `internal/auth` | Key lookup, invalid, empty, and disabled keys, client validation, and concurrent use. |
 | `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
 | `cmd/gateway` | Configuration rules, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, retries (recovery for each retryable status, exhaustion, non-retryable statuses, `Retry-After` beyond the budget, refused connections, and client cancellation during a retry wait), fallback (on failures and on a primary timeout, not on a rejected request, both providers failing), circuit breaking (opening, failing fast without calling the upstream, routing straight to the fallback, and one breaker shared by a provider's own route and fallback use), client cancellation and upstream timeouts reaching the upstream, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |

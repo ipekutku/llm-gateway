@@ -33,9 +33,18 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Current Milestone
 
-### v0.3 — Provider Failover and Circuit Breaking
+### v0.4 — Authentication and Rate Limiting
 
-The third milestone lets requests survive the degradation of one provider. It is feature-complete:
+The fourth milestone turns the gateway from an anonymous proxy into a multi-client service. It is in progress; nothing below is active in the gateway yet:
+
+* gateway-issued API keys, sent as `Authorization: Bearer <key>`, separate from the provider keys, which stay server-side
+* only SHA-256 hashes of keys are stored; keys can be disabled
+* a client identity attached to every request
+* per-client rate limits: requests per minute and concurrent requests
+
+### v0.3 — Provider Failover and Circuit Breaking ✅
+
+The third milestone let requests survive the degradation of one provider:
 
 * fallback pairs: a configured model can fall back to the other provider's configured model, tried once and never back again
 * fallback on provider failures (timeouts, unavailability, rate limiting, server errors), not on rejected requests or client cancellations
@@ -199,7 +208,15 @@ The same checks run automatically through GitHub Actions for pull requests and c
 
 ## Project Status
 
-🚧 **Early development** — v0.3 is feature-complete.
+🚧 **Early development** — v0.3 is feature-complete; v0.4 is in progress.
+
+### v0.4
+
+| Component | Status |
+|---|---|
+| Client API keys and identity (`internal/auth`) | ✅ Done |
+| Per-client rate limiting (`internal/ratelimit`) | ⏳ Next |
+| Clients file configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ⏳ Planned |
 
 ### v0.3
 
