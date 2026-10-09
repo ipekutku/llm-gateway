@@ -11,20 +11,25 @@ import (
 // Error types returned in the error envelope.
 const (
 	typeInvalidRequest = "invalid_request_error"
+	typeAuthentication = "authentication_error"
 	typeRateLimit      = "rate_limit_error"
 	typeServer         = "server_error"
 )
 
 // Error codes returned in the error envelope.
 const (
-	codeInvalidRequest      = "invalid_request"
-	codeRequestTooLarge     = "request_too_large"
-	codeModelNotFound       = "model_not_found"
-	codeProviderRateLimited = "provider_rate_limited"
-	codeUpstreamError       = "upstream_error"
-	codeUpstreamTimeout     = "upstream_timeout"
-	codeProviderUnavailable = "provider_unavailable"
-	codeInternalError       = "internal_error"
+	codeInvalidRequest           = "invalid_request"
+	codeRequestTooLarge          = "request_too_large"
+	codeMissingAPIKey            = "missing_api_key"
+	codeInvalidAPIKey            = "invalid_api_key"
+	codeRateLimitExceeded        = "rate_limit_exceeded"
+	codeConcurrencyLimitExceeded = "concurrency_limit_exceeded"
+	codeModelNotFound            = "model_not_found"
+	codeProviderRateLimited      = "provider_rate_limited"
+	codeUpstreamError            = "upstream_error"
+	codeUpstreamTimeout          = "upstream_timeout"
+	codeProviderUnavailable      = "provider_unavailable"
+	codeInternalError            = "internal_error"
 )
 
 // apiError is a gateway-owned error response. Its message is fixed per
@@ -43,6 +48,30 @@ var (
 		typ:     typeInvalidRequest,
 		code:    codeRequestTooLarge,
 		message: "The request body exceeds the 1 MiB limit.",
+	}
+	errMissingAPIKey = apiError{
+		status:  http.StatusUnauthorized,
+		typ:     typeAuthentication,
+		code:    codeMissingAPIKey,
+		message: "Send a gateway API key in the Authorization header using the Bearer scheme.",
+	}
+	errInvalidAPIKey = apiError{
+		status:  http.StatusUnauthorized,
+		typ:     typeAuthentication,
+		code:    codeInvalidAPIKey,
+		message: "The API key is invalid or disabled.",
+	}
+	errRateLimitExceeded = apiError{
+		status:  http.StatusTooManyRequests,
+		typ:     typeRateLimit,
+		code:    codeRateLimitExceeded,
+		message: "Too many requests for this API key. Retry after the time in the Retry-After header.",
+	}
+	errConcurrencyLimitExceeded = apiError{
+		status:  http.StatusTooManyRequests,
+		typ:     typeRateLimit,
+		code:    codeConcurrencyLimitExceeded,
+		message: "Too many concurrent requests for this API key. Retry when a request has finished.",
 	}
 	errModelNotFound = apiError{
 		status:  http.StatusNotFound,

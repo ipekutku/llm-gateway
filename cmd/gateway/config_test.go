@@ -1,14 +1,19 @@
 package main
 
 import (
+	"encoding/hex"
+	"io/fs"
+	"maps"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ipekutku/llm-gateway/internal/auth"
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
+	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/retry"
 )
 
@@ -17,10 +22,53 @@ func env(vars map[string]string) func(string) string {
 	return func(name string) string { return vars[name] }
 }
 
+// files returns a readFile func backed by contents, keyed by path.
+func files(contents map[string]string) func(string) ([]byte, error) {
+	return func(path string) ([]byte, error) {
+		data, ok := contents[path]
+		if !ok {
+			return nil, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
+		}
+		return []byte(data), nil
+	}
+}
+
 const (
 	openaiKey    = "sk-openai-secret-value"
 	anthropicKey = "sk-ant-secret-value"
+
+	// clientKey is the gateway API key of the test client, team-a.
+	clientKey   = "gw-test-client-key"
+	clientsPath = "/etc/gateway/clients.json"
 )
+
+// hashHex returns the hex SHA-256 hash of key, as written in a clients file.
+func hashHex(key string) string {
+	h := auth.HashKey(key)
+	return hex.EncodeToString(h[:])
+}
+
+// testClientsFile enables team-a with clientKey and the default limits.
+var testClientsFile = `{"clients": [{"id": "team-a", "key_sha256": "` + hashHex(clientKey) + `"}]}`
+
+var (
+	testClients    = []auth.Client{{ID: "team-a", KeyHash: auth.HashKey(clientKey)}}
+	defaultLimits  = ratelimit.Limits{RequestsPerMinute: defaultRequestsPerMinute, Burst: defaultBurst, MaxConcurrent: defaultMaxConcurrent}
+	testRateLimits = map[string]ratelimit.Limits{"team-a": defaultLimits}
+)
+
+// load is loadConfig with GATEWAY_CLIENTS_FILE pointing at
+// testClientsFile, unless vars sets it.
+func load(vars map[string]string) (config, error) {
+	vars = maps.Clone(vars)
+	if _, ok := vars[clientsFileVar]; !ok {
+		if vars == nil {
+			vars = map[string]string{}
+		}
+		vars[clientsFileVar] = clientsPath
+	}
+	return loadConfig(env(vars), files(map[string]string{clientsPath: testClientsFile}))
+}
 
 func TestLoadConfig(t *testing.T) {
 	openaiCfg := &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: openai.DefaultBaseURL}
@@ -33,6 +81,7 @@ func TestLoadConfig(t *testing.T) {
 		c.ProviderTimeout = defaultUpstreamTimeout / 2
 		c.Retry = defaultRetry
 		c.Breaker = breaker.Settings{Failures: defaultBreakerFailures, Cooldown: defaultBreakerCooldown}
+		c.Clients, c.RateLimits = testClients, testRateLimits
 		return c
 	}
 
@@ -86,6 +135,8 @@ func TestLoadConfig(t *testing.T) {
 				ProviderTimeout: 22500 * time.Millisecond, // half the upstream timeout
 				Retry:           defaultRetry,
 				Breaker:         breaker.Settings{Failures: defaultBreakerFailures, Cooldown: defaultBreakerCooldown},
+				Clients:         testClients,
+				RateLimits:      testRateLimits,
 			},
 		},
 		{
@@ -134,7 +185,7 @@ func TestLoadConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := loadConfig(env(tt.vars))
+			got, err := load(tt.vars)
 			if err != nil {
 				t.Fatalf("loadConfig() error = %v", err)
 			}
@@ -314,7 +365,7 @@ func TestLoadConfigErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := loadConfig(env(tt.vars))
+			_, err := load(tt.vars)
 			if err == nil {
 				t.Fatal("loadConfig() error = nil, want error")
 			}
@@ -329,5 +380,117 @@ func TestLoadConfigErrors(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLoadClients(t *testing.T) {
+	file := `{
+		"clients": [
+			{"id": "team-a", "key_sha256": "` + hashHex("key-a") + `"},
+			{"id": "team-b", "key_sha256": "` + strings.ToUpper(hashHex("key-b")) + `",
+			 "requests_per_minute": 10, "burst": 2, "max_concurrent": 10},
+			{"id": "team-old", "key_sha256": "` + hashHex("key-old") + `", "disabled": true}
+		]
+	}`
+	clients, limits, err := loadClients(env(map[string]string{clientsFileVar: " " + clientsPath + " "}), files(map[string]string{clientsPath: file}))
+	if err != nil {
+		t.Fatalf("loadClients() error = %v", err)
+	}
+	wantClients := []auth.Client{
+		{ID: "team-a", KeyHash: auth.HashKey("key-a")},
+		{ID: "team-b", KeyHash: auth.HashKey("key-b")},
+		{ID: "team-old", KeyHash: auth.HashKey("key-old"), Disabled: true},
+	}
+	if !reflect.DeepEqual(clients, wantClients) {
+		t.Errorf("clients = %+v, want %+v", clients, wantClients)
+	}
+	wantLimits := map[string]ratelimit.Limits{
+		"team-a":   defaultLimits,
+		"team-b":   {RequestsPerMinute: 10, Burst: 2, MaxConcurrent: 10},
+		"team-old": defaultLimits,
+	}
+	if !reflect.DeepEqual(limits, wantLimits) {
+		t.Errorf("limits = %+v, want %+v", limits, wantLimits)
+	}
+}
+
+func TestLoadClientsErrors(t *testing.T) {
+	hashA, hashB := hashHex("key-a"), hashHex("key-b")
+	tests := []struct {
+		name string
+		file string // absent from the file system if empty
+		want []string
+	}{
+		{name: "missing file", want: []string{"GATEWAY_CLIENTS_FILE", "file does not exist"}},
+		{name: "malformed JSON", file: `{"clients": [`, want: []string{"GATEWAY_CLIENTS_FILE: invalid JSON"}},
+		{name: "trailing data", file: `{"clients": []} {}`, want: []string{"data after the top-level object"}},
+		{name: "unknown field", file: `{"clients": [{"id": "team-a", "key": "plain-secret-key"}]}`, want: []string{`unknown field "key"`}},
+		{name: "wrong type", file: `{"clients": [{"id": "team-a", "key_sha256": "` + hashA + `", "burst": "10"}]}`, want: []string{"invalid JSON"}},
+		{name: "no clients", file: `{"clients": []}`, want: []string{"no enabled client"}},
+		{name: "only disabled clients", file: `{"clients": [{"id": "team-a", "key_sha256": "` + hashA + `", "disabled": true}]}`, want: []string{"no enabled client"}},
+		{name: "missing hash", file: `{"clients": [{"id": "team-a"}]}`, want: []string{`clients[0] ("team-a"): key_sha256 must be 64 hexadecimal characters`}},
+		{name: "short hash", file: `{"clients": [{"id": "team-a", "key_sha256": "` + hashA[:62] + `"}]}`, want: []string{"key_sha256 must be 64 hexadecimal characters"}},
+		{name: "non-hex hash", file: `{"clients": [{"id": "team-a", "key_sha256": "` + strings.Repeat("z", 64) + `"}]}`, want: []string{"key_sha256 must be 64 hexadecimal characters"}},
+		{
+			name: "limits out of range reported together",
+			file: `{"clients": [{"id": "team-a", "key_sha256": "` + hashA + `", "requests_per_minute": 0, "burst": -1, "max_concurrent": 1000001}]}`,
+			want: []string{
+				"requests_per_minute must be an integer from 1 to 1000000",
+				"burst must be an integer from 1 to 1000000",
+				"max_concurrent must be an integer from 1 to 1000000",
+			},
+		},
+		{name: "invalid ID", file: `{"clients": [{"id": "team a", "key_sha256": "` + hashA + `"}]}`, want: []string{"GATEWAY_CLIENTS_FILE: auth: client ID"}},
+		{
+			name: "duplicate ID",
+			file: `{"clients": [{"id": "team-a", "key_sha256": "` + hashA + `"}, {"id": "team-a", "key_sha256": "` + hashB + `"}]}`,
+			want: []string{"duplicate client ID"},
+		},
+		{
+			name: "shared key",
+			file: `{"clients": [{"id": "team-a", "key_sha256": "` + hashA + `"}, {"id": "team-b", "key_sha256": "` + hashA + `"}]}`,
+			want: []string{"same key"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			contents := map[string]string{}
+			if tt.file != "" {
+				contents[clientsPath] = tt.file
+			}
+			_, _, err := loadClients(env(map[string]string{clientsFileVar: clientsPath}), files(contents))
+			if err == nil {
+				t.Fatal("loadClients() error = nil, want error")
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+			for _, secret := range []string{hashA, hashB, "plain-secret-key"} {
+				if strings.Contains(strings.ToLower(err.Error()), secret) {
+					t.Errorf("error exposes file contents: %q", err)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadConfigRequiresClientsFile(t *testing.T) {
+	_, err := loadConfig(env(map[string]string{"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey, clientsFileVar: " "}), files(nil))
+	if err == nil || !strings.Contains(err.Error(), "GATEWAY_CLIENTS_FILE is required") {
+		t.Errorf("loadConfig() error = %v, want GATEWAY_CLIENTS_FILE is required", err)
+	}
+}
+
+func TestLoadConfigReportsClientErrorsWithOthers(t *testing.T) {
+	_, err := loadConfig(env(map[string]string{"OPENAI_MODEL": "gpt-4o", clientsFileVar: clientsPath}), files(map[string]string{clientsPath: `{"clients": []}`}))
+	if err == nil {
+		t.Fatal("loadConfig() error = nil, want error")
+	}
+	for _, want := range []string{"OPENAI_API_KEY is missing", "no enabled client"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
 	}
 }

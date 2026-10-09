@@ -1,15 +1,21 @@
 package main
 
 import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ipekutku/llm-gateway/internal/auth"
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
+	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/retry"
 )
 
@@ -41,6 +47,15 @@ const (
 
 	// maxBreakerFailures bounds GATEWAY_BREAKER_FAILURES.
 	maxBreakerFailures = 100
+
+	// clientsFileVar names the file of gateway clients.
+	clientsFileVar = "GATEWAY_CLIENTS_FILE"
+
+	// Rate limit defaults for a client whose entry omits them: one request
+	// per second sustained, bursts of up to 10, and 5 at a time.
+	defaultRequestsPerMinute = 60
+	defaultBurst             = 10
+	defaultMaxConcurrent     = 5
 )
 
 // config is the gateway's startup configuration.
@@ -60,6 +75,10 @@ type config struct {
 	// OpenAI and Anthropic are nil when the provider is disabled.
 	OpenAI    *providerConfig
 	Anthropic *providerConfig
+	// Clients are the gateway clients, valid for auth.New.
+	Clients []auth.Client
+	// RateLimits holds the limits of every client in Clients, by ID.
+	RateLimits map[string]ratelimit.Limits
 }
 
 // providerConfig enables one provider for exactly one model.
@@ -72,10 +91,11 @@ type providerConfig struct {
 	FallbackTo string
 }
 
-// loadConfig reads the configuration from getenv, normally os.Getenv. A
-// variable that is unset or blank counts as absent. Errors name the
-// offending variables but never include their values.
-func loadConfig(getenv func(string) string) (config, error) {
+// loadConfig reads the configuration from getenv, normally os.Getenv, and
+// the clients file through readFile, normally os.ReadFile. A variable that
+// is unset or blank counts as absent. Errors name the offending variables
+// but never include their values.
+func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error)) (config, error) {
 	cfg := config{Addr: defaultAddr}
 	if addr := getenv("GATEWAY_ADDR"); strings.TrimSpace(addr) != "" {
 		cfg.Addr = addr
@@ -108,6 +128,9 @@ func loadConfig(getenv func(string) string) (config, error) {
 		errs = append(errs, err)
 	}
 	if cfg.Anthropic, err = loadProvider(getenv, "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY", anthropic.DefaultBaseURL); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.Clients, cfg.RateLimits, err = loadClients(getenv, readFile); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -169,6 +192,107 @@ func loadFallback(getenv func(string) string, p *providerConfig, prefix string, 
 	}
 	p.FallbackTo = otherName
 	return nil
+}
+
+// clientsFile is the format of the GATEWAY_CLIENTS_FILE file.
+type clientsFile struct {
+	Clients []clientEntry `json:"clients"`
+}
+
+type clientEntry struct {
+	ID string `json:"id"`
+	// KeySHA256 is the hex SHA-256 hash of the client's API key.
+	KeySHA256 string `json:"key_sha256"`
+	Disabled  bool   `json:"disabled"`
+	// Limits are optional; nil means the default.
+	RequestsPerMinute *int `json:"requests_per_minute"`
+	Burst             *int `json:"burst"`
+	MaxConcurrent     *int `json:"max_concurrent"`
+}
+
+// loadClients reads the clients file named by GATEWAY_CLIENTS_FILE. The
+// file is required, must be a single JSON object without unknown fields,
+// and must enable at least one client. Errors name the file variable and
+// the client, never a key hash.
+func loadClients(getenv func(string) string, readFile func(string) ([]byte, error)) ([]auth.Client, map[string]ratelimit.Limits, error) {
+	path := strings.TrimSpace(getenv(clientsFileVar))
+	if path == "" {
+		return nil, nil, fmt.Errorf("%s is required: gateway clients authenticate with API keys listed there", clientsFileVar)
+	}
+	data, err := readFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", clientsFileVar, err)
+	}
+
+	var file clientsFile
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&file); err != nil {
+		return nil, nil, fmt.Errorf("%s: invalid JSON: %w", clientsFileVar, err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, nil, fmt.Errorf("%s: invalid JSON: data after the top-level object", clientsFileVar)
+	}
+
+	clients := make([]auth.Client, 0, len(file.Clients))
+	limits := make(map[string]ratelimit.Limits, len(file.Clients))
+	var errs []error
+	enabled := 0
+	for i, e := range file.Clients {
+		name := fmt.Sprintf("%s: clients[%d] (%q)", clientsFileVar, i, e.ID)
+		hash, err := hex.DecodeString(e.KeySHA256)
+		if err != nil || len(hash) != len(auth.Client{}.KeyHash) {
+			errs = append(errs, fmt.Errorf("%s: key_sha256 must be 64 hexadecimal characters", name))
+			continue
+		}
+		var lim ratelimit.Limits
+		var limErrs []error
+		for _, f := range []struct {
+			field string
+			value *int
+			def   int
+			dst   *int
+		}{
+			{"requests_per_minute", e.RequestsPerMinute, defaultRequestsPerMinute, &lim.RequestsPerMinute},
+			{"burst", e.Burst, defaultBurst, &lim.Burst},
+			{"max_concurrent", e.MaxConcurrent, defaultMaxConcurrent, &lim.MaxConcurrent},
+		} {
+			switch {
+			case f.value == nil:
+				*f.dst = f.def
+			case *f.value < 1 || *f.value > ratelimit.MaxLimit:
+				limErrs = append(limErrs, fmt.Errorf("%s: %s must be an integer from 1 to %d", name, f.field, ratelimit.MaxLimit))
+			default:
+				*f.dst = *f.value
+			}
+		}
+		if len(limErrs) > 0 {
+			errs = append(errs, limErrs...)
+			continue
+		}
+		c := auth.Client{ID: e.ID, Disabled: e.Disabled}
+		copy(c.KeyHash[:], hash)
+		clients = append(clients, c)
+		limits[e.ID] = lim
+		if !e.Disabled {
+			enabled++
+		}
+	}
+	if len(errs) > 0 {
+		return nil, nil, errors.Join(errs...)
+	}
+	if enabled == 0 {
+		return nil, nil, fmt.Errorf("%s: no enabled client", clientsFileVar)
+	}
+	// Client IDs, duplicates, and shared keys are checked by the packages
+	// that use them.
+	if _, err := auth.New(clients); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", clientsFileVar, err)
+	}
+	if _, err := ratelimit.New(limits); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", clientsFileVar, err)
+	}
+	return clients, limits, nil
 }
 
 // loadDuration parses a positive Go duration such as "90s", returning def

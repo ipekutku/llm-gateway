@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -92,10 +94,10 @@ var fastRetry = retry.Policy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDel
 // use fastRetry unless edit changes them.
 func gatewayWith(t *testing.T, oa, an *upstream, edit func(*config)) *httptest.Server {
 	t.Helper()
-	cfg, err := loadConfig(env(map[string]string{
+	cfg, err := load(map[string]string{
 		"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
 		"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey,
-	}))
+	})
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
 	}
@@ -113,13 +115,24 @@ func gatewayWith(t *testing.T, oa, an *upstream, edit func(*config)) *httptest.S
 	return gw
 }
 
+// postChat sends a chat request authenticated as the test client.
 func postChat(t *testing.T, ctx context.Context, url, body string) (*http.Response, []byte, error) {
+	t.Helper()
+	return postChatAs(t, ctx, url, "Bearer "+clientKey, body)
+}
+
+// postChatAs sends a chat request with the given Authorization header, or
+// none if it is empty.
+func postChatAs(t *testing.T, ctx context.Context, url, authorization, body string) (*http.Response, []byte, error) {
 	t.Helper()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/v1/chat/completions", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, nil, err
@@ -954,7 +967,20 @@ func gatewayConfig(oa, an *upstream) config {
 		Breaker:         breaker.Settings{Failures: defaultBreakerFailures, Cooldown: defaultBreakerCooldown},
 		OpenAI:          &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: oa.srv.URL},
 		Anthropic:       &providerConfig{Model: "claude-opus-5-5", APIKey: anthropicKey, BaseURL: an.srv.URL},
+		Clients:         testClients,
+		RateLimits:      testRateLimits,
 	}
+}
+
+// writeClientsFile writes testClientsFile to a temporary file and returns
+// its path.
+func writeClientsFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "clients.json")
+	if err := os.WriteFile(path, []byte(testClientsFile), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	return path
 }
 
 func TestServeReportsServeErrors(t *testing.T) {
@@ -987,7 +1013,7 @@ func TestRunFailsWhenAddressIsUnavailable(t *testing.T) {
 
 	err = run(context.Background(), env(map[string]string{
 		"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
-		"GATEWAY_ADDR": ln.Addr().String(),
+		"GATEWAY_ADDR": ln.Addr().String(), clientsFileVar: writeClientsFile(t),
 	}), slog.New(slog.DiscardHandler))
 	if err == nil || !strings.Contains(err.Error(), "listen") {
 		t.Errorf("run() error = %v, want listen error", err)
@@ -996,12 +1022,13 @@ func TestRunFailsWhenAddressIsUnavailable(t *testing.T) {
 
 func TestRunServesUntilCanceled(t *testing.T) {
 	var logs syncBuffer
+	clientsFile := writeClientsFile(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
 		result <- run(ctx, env(map[string]string{
 			"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey,
-			"GATEWAY_ADDR": "127.0.0.1:0",
+			"GATEWAY_ADDR": "127.0.0.1:0", clientsFileVar: clientsFile,
 		}), slog.New(slog.NewTextHandler(&logs, nil)))
 	}()
 
@@ -1025,11 +1052,15 @@ func TestRunServesUntilCanceled(t *testing.T) {
 	case <-time.After(guard):
 		t.Fatal("timed out waiting for run to return")
 	}
-	if !strings.Contains(logs.String(), "anthropic_model=claude-opus-5-5") {
-		t.Errorf("startup log does not name the configured model:\n%s", logs.String())
+	for _, want := range []string{"anthropic_model=claude-opus-5-5", "clients=1", "disabled_clients=0"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("startup log does not contain %q:\n%s", want, logs.String())
+		}
 	}
-	if strings.Contains(logs.String(), anthropicKey) {
-		t.Errorf("log exposes the API key:\n%s", logs.String())
+	for _, secret := range []string{anthropicKey, hashHex(clientKey)} {
+		if strings.Contains(logs.String(), secret) {
+			t.Errorf("log exposes a key or key hash:\n%s", logs.String())
+		}
 	}
 }
 

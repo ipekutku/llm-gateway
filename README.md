@@ -35,12 +35,13 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ### v0.4 — Authentication and Rate Limiting
 
-The fourth milestone turns the gateway from an anonymous proxy into a multi-client service. It is in progress; nothing below is active in the gateway yet:
+The fourth milestone turns the gateway from an anonymous proxy into a multi-client service. It is feature-complete:
 
-* gateway-issued API keys, sent as `Authorization: Bearer <key>`, separate from the provider keys, which stay server-side
-* only SHA-256 hashes of keys are stored; keys can be disabled
-* a client identity attached to every request
-* per-client rate limits: requests per minute and concurrent requests
+* every request needs a gateway-issued API key, sent as `Authorization: Bearer <key>`; anonymous requests get `401`
+* gateway keys are separate from the provider keys, which stay server-side and never reach clients
+* only SHA-256 hashes of keys are stored, in a clients file; keys can be disabled
+* a client identity attached to every request and to its failure logs
+* per-client rate limits: requests per minute with bursts, and concurrent requests, answered with `429` and `Retry-After`
 
 ### v0.3 — Provider Failover and Circuit Breaking ✅
 
@@ -95,9 +96,20 @@ This project prioritizes:
 
 ## Running Locally
 
-Requires Go 1.26.9 or later. Configure at least one provider and start the gateway:
+Requires Go 1.26.9 or later. First create a gateway API key for your client and a clients file holding its hash:
 
 ```bash
+GATEWAY_KEY=$(openssl rand -base64 32)   # give this key to the client
+echo "$GATEWAY_KEY"
+printf '{"clients": [{"id": "my-app", "key_sha256": "%s"}]}\n' \
+  "$(printf %s "$GATEWAY_KEY" | shasum -a 256 | cut -d' ' -f1)" > clients.json
+```
+
+Then configure at least one provider and start the gateway:
+
+```bash
+export GATEWAY_CLIENTS_FILE=clients.json
+
 export OPENAI_MODEL=gpt-4o
 export OPENAI_API_KEY=sk-...            # your OpenAI key
 
@@ -107,12 +119,13 @@ export ANTHROPIC_API_KEY=sk-ant-...     # your Anthropic key
 go run ./cmd/gateway
 ```
 
-The gateway listens on `127.0.0.1:8080` and logs the configured models. Stop it with `Ctrl+C` or `SIGTERM`; in-flight requests get up to 5 seconds to finish.
+The gateway listens on `127.0.0.1:8080` and logs the configured models and the number of clients. Stop it with `Ctrl+C` or `SIGTERM`; in-flight requests get up to 5 seconds to finish.
 
 Send a request to either model:
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "gpt-4o",
@@ -124,6 +137,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   }'
 
 curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "claude-opus-5-5",
@@ -138,6 +152,7 @@ The `model` field must match a configured model exactly; the request is routed t
 
 | Variable | Description |
 |---|---|
+| `GATEWAY_CLIENTS_FILE` | Required. Path of the JSON file listing the gateway's clients (see below). |
 | `OPENAI_MODEL`, `OPENAI_API_KEY` | Enable OpenAI for one model. Set both or neither. |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Enable Anthropic for one model. Set both or neither. |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
@@ -160,13 +175,38 @@ export OPENAI_FALLBACK=anthropic
 
 A request for `gpt-4o` that OpenAI cannot serve is then answered by `claude-opus-5-5`; the response's `model` field shows which model answered. While a provider is skipped and no fallback can answer, requests fail with `503 provider_unavailable`.
 
-Startup fails if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, if a timeout or delay is not a positive duration, if the attempt count is outside 1–10, if the maximum retry delay is less than the base delay, if the provider timeout is not less than the upstream timeout, or if a fallback names a provider that is not configured. Error messages name the variables but never print their values.
+### Clients
+
+The clients file lists every client allowed to use the gateway, with the SHA-256 hash of its key and optional limits:
+
+```json
+{
+  "clients": [
+    {"id": "my-app", "key_sha256": "<hash>"},
+    {"id": "batch-jobs", "key_sha256": "<hash>", "requests_per_minute": 120, "burst": 20, "max_concurrent": 10},
+    {"id": "old-app", "key_sha256": "<hash>", "disabled": true}
+  ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `id` | Client name used in logs: letters, digits, `-`, `_`, or `.`, up to 64 characters. |
+| `key_sha256` | Hex SHA-256 hash of the client's key. The gateway never stores the key itself. |
+| `disabled` | `true` rejects the key. Default `false`. |
+| `requests_per_minute` | Sustained request rate. Default `60`. |
+| `burst` | Requests allowed at once after a quiet period. Default `10`. |
+| `max_concurrent` | Requests in progress at the same time. Default `5`. |
+
+Generate keys with a secure random source, as above; the hash protects only random keys, not memorable passwords. A request over its client's rate gets `429 rate_limit_exceeded` with `Retry-After`; over its concurrency limit, `429 concurrency_limit_exceeded`. The file is read once at startup; restart the gateway to add, change, or disable clients.
+
+Startup fails if the clients file is missing, malformed, has unknown fields, or enables no client, if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, if a timeout or delay is not a positive duration, if the attempt count is outside 1–10, if the maximum retry delay is less than the base delay, if the provider timeout is not less than the upstream timeout, or if a fallback names a provider that is not configured. Error messages name the variables and clients but never print keys, hashes, or other values.
 
 The model names above are examples. Any model the provider's API accepts can be configured. Both adapters are tested against fake servers built from the providers' documented API formats; they have not yet been verified against the live APIs.
 
 ### Supported API
 
-`POST /v1/chat/completions` implements a small subset of the OpenAI Chat Completions format. It is not a full OpenAI-compatible API.
+`POST /v1/chat/completions` implements a small subset of the OpenAI Chat Completions format. It is not a full OpenAI-compatible API. Every request needs `Authorization: Bearer <gateway key>`; a missing, unknown, or disabled key gets `401`.
 
 | Request field | Support |
 |---|---|
@@ -188,7 +228,9 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 * Fallback works only between the two configured models; there are no logical model names yet.
 * Circuit breaker state is kept per gateway process; several instances do not share it (planned for v0.7).
 * A request whose upstream timeout expires may still be billed by the provider for the work done before it was canceled.
-* No gateway authentication; run it only on a trusted network (planned for v0.4).
+* The gateway serves plain HTTP and listens on loopback by default. Gateway keys would cross the network unencrypted, so expose it beyond the host only behind a proxy that terminates TLS.
+* Rate limits and concurrency counts are kept per gateway process; several instances do not share them (planned for v0.7).
+* Clients are read from a file at startup; changing them requires a restart. Each client has one key, so rotating a key briefly means replacing it.
 * Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
 
@@ -208,7 +250,7 @@ The same checks run automatically through GitHub Actions for pull requests and c
 
 ## Project Status
 
-🚧 **Early development** — v0.3 is feature-complete; v0.4 is in progress.
+🚧 **Early development** — v0.4 is feature-complete.
 
 ### v0.4
 
@@ -216,7 +258,7 @@ The same checks run automatically through GitHub Actions for pull requests and c
 |---|---|
 | Client API keys and identity (`internal/auth`) | ✅ Done |
 | Per-client rate limiting (`internal/ratelimit`) | ✅ Done |
-| Clients file configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ⏳ Next |
+| Clients file configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ✅ Done |
 
 ### v0.3
 
