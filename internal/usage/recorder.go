@@ -10,7 +10,8 @@ import (
 )
 
 // RecordStore persists a batch of usage records. Implementations must honor
-// ctx. Each Recorder calls Insert on only one batch at a time.
+// ctx and skip records whose request ID they already hold, because a failed
+// batch is retried. Each Recorder calls Insert on only one batch at a time.
 type RecordStore interface {
 	Insert(ctx context.Context, records []Record) error
 }
@@ -39,8 +40,8 @@ func DefaultRecorderOptions() RecorderOptions {
 }
 
 // Recorder queues records without delaying requests and writes them in
-// batches. A failed write loses that batch; it is logged and later batches
-// are still attempted. Records dropped because the queue is full are counted
+// batches. A failed write is retried once; if that also fails, the batch is
+// lost, the failure is logged, and later batches are still attempted. Records dropped because the queue is full are counted
 // and reported periodically rather than one warning each, so a database
 // outage under load does not flood the logs. Its worker has its own context, so a client
 // disconnecting does not cancel the write of an accepted record.
@@ -163,8 +164,16 @@ func (r *Recorder) run(ctx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
+		// A failed batch is retried once within the same write timeout, so a
+		// dropped connection or a failover does not lose it. Stores must
+		// skip records they already hold, as postgres.Store does, so a write
+		// that committed but reported failure is not stored twice. A write
+		// that used up the timeout is not retried.
 		writeCtx, cancel := context.WithTimeout(ctx, r.opts.WriteTimeout)
 		err := r.store.Insert(writeCtx, batch)
+		if err != nil && writeCtx.Err() == nil {
+			err = r.store.Insert(writeCtx, batch)
+		}
 		cancel()
 		if err != nil {
 			r.log.Warn("usage records not persisted", slog.Int("count", len(batch)), slog.Any("error", err))

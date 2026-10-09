@@ -295,14 +295,17 @@ func TestRecorderLogsWriteFailureAndContinues(t *testing.T) {
 	opts := testRecorderOptions()
 	opts.BatchSize = 1
 	r := newTestRecorder(t, store, slog.New(slog.NewTextHandler(&logs, nil)), opts)
-	if !r.Record(testRecord("first")) {
-		t.Fatal("first Record rejected")
+	for _, id := range []string{"first", "second"} {
+		if !r.Record(testRecord(id)) {
+			t.Fatalf("Record(%q) rejected after an earlier write failure", id)
+		}
+		// Each failed batch is tried twice.
+		for range 2 {
+			if got := receiveBatch(t, ctx, store.batches); got[0].RequestID != id {
+				t.Errorf("attempt stored %q, want %q", got[0].RequestID, id)
+			}
+		}
 	}
-	receiveBatch(t, ctx, store.batches)
-	if !r.Record(testRecord("second")) {
-		t.Fatal("second Record rejected after write failure")
-	}
-	receiveBatch(t, ctx, store.batches)
 	if err := r.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -311,6 +314,48 @@ func TestRecorderLogsWriteFailureAndContinues(t *testing.T) {
 	}
 }
 
+// failOnceStore fails its first Insert, as a dropped connection would, and
+// stores later ones.
+type failOnceStore struct {
+	calls   atomic.Int32
+	batches chan []Record
+}
+
+func (s *failOnceStore) Insert(ctx context.Context, records []Record) error {
+	if s.calls.Add(1) == 1 {
+		return errors.New("connection reset")
+	}
+	s.batches <- append([]Record(nil), records...)
+	return nil
+}
+
+func TestRecorderRetriesFailedBatchOnce(t *testing.T) {
+	ctx := testRecorderContext(t)
+	store := &failOnceStore{batches: make(chan []Record, 1)}
+	var logs bytes.Buffer
+	opts := testRecorderOptions()
+	opts.BatchSize = 1
+	r := newTestRecorder(t, store, slog.New(slog.NewTextHandler(&logs, nil)), opts)
+	if !r.Record(testRecord("retried")) {
+		t.Fatal("Record rejected")
+	}
+	if got := receiveBatch(t, ctx, store.batches); got[0].RequestID != "retried" {
+		t.Errorf("stored %q, want retried", got[0].RequestID)
+	}
+	if err := r.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.calls.Load(); got != 2 {
+		t.Errorf("Insert called %d times, want 2", got)
+	}
+	if strings.Contains(logs.String(), "not persisted") {
+		t.Errorf("logged a failure for a batch the retry stored: %s", logs.String())
+	}
+}
+
+// TestRecorderWriteTimeoutDoesNotBlockLaterBatches also shows that a write
+// that used up its timeout is not retried: a retry would store the
+// timed-out batch before the next one.
 func TestRecorderWriteTimeoutDoesNotBlockLaterBatches(t *testing.T) {
 	ctx := testRecorderContext(t)
 	store := &blockFirstStore{

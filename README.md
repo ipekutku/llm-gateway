@@ -290,7 +290,7 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 * Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
 * Usage records cover requests that pass body validation, including unknown models and upstream failures. Authentication, gateway rate-limit, malformed-body, and body-size rejections are excluded. A disconnected client is recorded as status `499` with `client_closed`; this status is never sent as a response.
-* Accounting is asynchronous: a full queue drops new records, failed batches are logged and discarded, and a shutdown deadline can lose pending records. Database failure after startup does not fail otherwise successful requests. Records contain metadata, tokens, and estimated costs, never prompt or completion content.
+* Accounting is asynchronous: a full queue drops new records, a failed batch is retried once and then logged and discarded, and a shutdown deadline can lose pending records. Database failure after startup does not fail otherwise successful requests. Records contain metadata, tokens, and estimated costs, never prompt or completion content.
 * Estimated costs cover only provider-reported usage, including a successful generation whose client disconnected before receiving it. Failed retries and a failed primary before fallback may incur charges without reporting usage. Unknown usage and cost are stored as `NULL`, never as fabricated zeros.
 
 ### Querying usage
