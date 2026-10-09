@@ -202,7 +202,16 @@ Generate keys with a secure random source, as above; the hash protects only rand
 
 Startup fails if the clients file is missing, malformed, has unknown fields, or enables no client, if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, if a timeout or delay is not a positive duration, if the attempt count is outside 1–10, if the maximum retry delay is less than the base delay, if the provider timeout is not less than the upstream timeout, or if a fallback names a provider that is not configured. Error messages name the variables and clients but never print keys, hashes, or other values.
 
-The model names above are examples. Any model the provider's API accepts can be configured. Both adapters are tested against fake servers built from the providers' documented API formats; they have not yet been verified against the live APIs.
+The model names above are examples. Any model the provider's API accepts can be configured. The automated tests run both adapters against fake servers built from the providers' documented API formats.
+
+Verified against the live APIs with `make smoke` on 2026-10-09:
+
+| Configured model | Model reported by the provider | Checked |
+|---|---|---|
+| `gpt-4o` | `gpt-4o-2024-08-06` | completion ending in `stop`, forced `length` stop, token usage |
+| `claude-opus-5-5` | `claude-opus-5-5` | completion ending in `stop`, forced `length` stop, token usage |
+
+The live run did not cover refusals (`content_filter`), prompt-cache token accounting, or real upstream failures (retries, fallback, circuit breaking); those are tested only against fakes.
 
 ### Supported API
 
