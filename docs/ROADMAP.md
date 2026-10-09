@@ -492,6 +492,8 @@ Test:
 
 **Target version:** `v0.5.0`
 
+**Status:** Feature-complete. Usage accounting is wired into the gateway, with SQL reporting documented in [usage.md](usage.md). Milestone 6 is next; its metrics, tracing, and dashboards are not implemented yet.
+
 ## Objective
 
 Measure how the gateway is being used and what that usage costs.
@@ -504,15 +506,21 @@ Track:
 
 ```text
 input tokens
+cache read input tokens
+cache write input tokens
 output tokens
-total tokens
+total tokens (input + output)
 ```
+
+Input is the whole prompt; cache reads and writes are subsets of it, not additional tokens. Unknown usage remains unknown rather than being fabricated.
 
 ### Cost Calculation
 
 Maintain provider/model pricing metadata.
 
 Calculate estimated request cost.
+
+Prices are loaded from the required JSON pricing file, with separate input, cache-read, cache-write, and output rates. Estimation uses exact integer picodollar arithmetic and the answering provider's configured model price. A missing price produces unknown cost, never zero; historical costs are not recalculated when prices change.
 
 Conceptually:
 
@@ -542,19 +550,13 @@ success/failure
 timestamp
 ```
 
+The handler submits one record for every request that passes body validation, including success, unknown model, upstream failure, timeout, and client cancellation. Authentication, gateway rate-limit, and body/validation rejections are excluded. A bounded asynchronous writer persists metadata only; overload, failed writes, and shutdown deadlines can lose records. Persisted usage is not an exact bill or a complete traffic audit.
+
 ### PostgreSQL
 
-Introduce PostgreSQL for persistent platform data.
+PostgreSQL stores usage records and schema migration history. The database is required, and startup checks reachability and schema compatibility before listening. An explicit `migrate` command applies embedded, forward-only migrations under an advisory lock. Database outages after startup affect accounting, not the upstream response.
 
-Possible data:
-
-```text
-API clients
-API keys
-usage records
-pricing metadata
-request metadata
-```
+API clients and hashed keys remain in the clients file; pricing metadata remains in the pricing file. Usage records store `client_id` as plain text with no client foreign key. Moving clients or keys to PostgreSQL, down migrations, retention automation, and an admin HTTP API are out of scope. Admin APIs remain in the [future list](#possible-future-milestones).
 
 ## Database Engineering
 
@@ -568,11 +570,13 @@ Add:
 
 ## Exit Criteria
 
-* request usage is persisted
-* costs are calculated
-* usage can be queried
-* database migrations are reproducible
-* tests can run against a disposable database
+* [x] request usage is persisted — the real PostgreSQL accounting test verifies handler → background writer → database, with the documented best-effort limits
+* [x] costs are calculated — cache-aware, exact estimation is wired into the handler; missing prices remain NULL
+* [x] usage can be queried — [SQL reports](usage.md) cover clients, answering models, UTC days, and request IDs, including unknown-value coverage
+* [x] database migrations are reproducible — embedded migrations and the independent `migrate` command are tested for fresh, repeated, concurrent, and incompatible migration histories
+* [x] tests can run against a disposable database — `make db` supports local tests; CI provides PostgreSQL and requires the database setting; each integration test creates and drops its own database
+
+Implemented decisions and test boundaries are described in [architecture.md](architecture.md#cost-estimation). Local configuration and verification commands are in the [README](../README.md#running-locally).
 
 ---
 

@@ -45,7 +45,7 @@ type Provider interface {
 }
 ```
 
-Implementations must honor context cancellation, support concurrent calls, and must not mutate the request or its `Messages` slice. The router shares provider instances across requests, so each provider must keep per-call state local or synchronize access to shared mutable state. The contract is deliberately text-only. Content is a `string`, and there is no streaming, tool calling, or multimodal input in Milestone 1.
+Implementations must honor context cancellation, support concurrent calls, and must not mutate the request or its `Messages` slice. The router shares provider instances across requests, so each provider must keep per-call state local or synchronize access to shared mutable state. The contract is deliberately text-only. Content is a `string`, and there is no streaming, tool calling, or multimodal input through v0.5.
 
 ## Routing
 
@@ -420,7 +420,7 @@ Decisions:
 - **Disabled looks invalid to the client.** Both get the same 401 `invalid_api_key` response, so a response never reveals whether a key once existed. The log records the reason and, for a disabled key, the client.
 - **Authenticate before anything else.** Authentication and rate limiting run before the body is read, so an unauthenticated or limited request costs the gateway almost nothing and never reaches a provider. Requests to unknown paths or with other methods still get 404 or 405 from the `ServeMux` without authentication; those reveal only which endpoint exists.
 - **Header rules.** Exactly one `Authorization` header with the scheme `Bearer` (any case), one or more spaces, and a key without whitespace. Anything else is `missing_api_key`. Every 401 carries `WWW-Authenticate: Bearer`, with `error="invalid_token"` for a rejected key, as RFC 6750 describes.
-- **Identity in the context.** The handler stores the client's `auth.Identity` in the request context passed to the router, so every layer below can identify the client. For now only the handler's logs use it.
+- **Identity in the context.** The handler stores the client's `auth.Identity` in the request context passed to the router, so every layer below can identify the client. The handler uses it in failure logs and usage records.
 - **One key per client.** Key rotation with several keys per client is deferred; replacing a key means replacing its hash.
 
 ## Rate limiting
@@ -508,6 +508,14 @@ Migrations are SQL files in `internal/postgres/migrations`, named `NNNN_descript
 ### Inserting records
 
 `Insert(ctx, records)` writes a batch in one round trip. pgx sends the batch with a single sync, so PostgreSQL runs it as one implicit transaction: every record is stored or none. Each row is inserted with `ON CONFLICT (request_id) DO NOTHING`, so a batch retried after an uncertain failure, such as a lost commit acknowledgment, creates no duplicates and does not overwrite stored rows. Every record is checked with `usage.Record.Validate` first; if any is invalid, nothing is sent.
+
+### Querying usage
+
+v0.5's query interface is direct SQL against `usage_records`; there is no admin HTTP API. [usage.md](usage.md) documents reports by client, answering provider/model, and UTC day, plus request-ID lookups. Time filters use a half-open interval on `received_at`, matching the time-range indexes. UTC day attribution uses request arrival rather than completion or insertion time.
+
+Reports sum the stored exact `numeric` costs and retain NULL when a group has no known costs. Coverage counts distinguish a known subtotal from missing usage or pricing; cache subsets are not added to input tokens a second time. Groups by `model` describe the reported answering model, while `requested_model` describes client demand, including failures and fallback. Database reporting access is separate from gateway authentication and should use a SELECT-only role.
+
+Pricing is applied at record creation, not query time, so changing the file does not reprice historical records. Accounting can lose records, and unsuccessful upstream attempts can incur unreported charges. Query results are therefore estimates over persisted records, not an exact bill or an exhaustive audit. Retention, admin endpoints, and a database-backed clients/keys model are not implemented in v0.5.
 
 ## Asynchronous usage recording
 

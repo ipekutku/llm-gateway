@@ -33,9 +33,9 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Current Milestone
 
-### v0.5 — Usage and Cost Accounting
+### v0.5 — Usage and Cost Accounting ✅
 
-Milestone 5 is in progress. It adds per-client usage records and estimated costs, persisted in PostgreSQL. The following components are implemented and tested:
+Milestone 5 is feature-complete. It adds per-client usage records and estimated costs, persisted in PostgreSQL. The following components are implemented and tested:
 
 * token usage keeps the prompt-cache detail providers price differently: cached input read (OpenAI and Anthropic) and written (Anthropic), as part of the input count
 * the provider that answered is known for every response, including one served by a fallback
@@ -44,8 +44,9 @@ Milestone 5 is in progress. It adds per-client usage records and estimated costs
 * a PostgreSQL connection pool and usage store, with embedded forward-only migrations protected by an advisory lock, exact cost storage, and integration tests against disposable databases
 * an asynchronous recorder with a bounded queue, batch writes, write timeouts, and shutdown draining; queue overflow and failed writes are logged, and accepted records survive request cancellation
 * required database and pricing-file configuration, an explicit migration command, startup schema checks, and one usage record for each validated request, including failures and cancellations
+* documented SQL reports for usage and estimated cost per client, answering model, and UTC day, with coverage counts for unknown usage and cost
 
-Usage accounting is connected to the request path and verified with fake upstreams and PostgreSQL. Documented usage queries and the milestone close-out remain to complete v0.5. Costs are estimates, and asynchronous recording can lose records during overload, database failures, or shutdown deadlines.
+Usage accounting is connected to the request path and verified with fake upstreams and PostgreSQL. See [Querying usage and estimated cost](docs/usage.md) for reports and request lookups. Costs are estimates, and asynchronous recording can lose records during overload, database failures, or shutdown deadlines. v0.6 observability is next; metrics, tracing, and dashboards are not implemented yet.
 
 See [Project Status](#project-status) for component status, [Development](#development) for the database test workflow, and [docs/ROADMAP.md](docs/ROADMAP.md#milestone-5--usage-and-cost-accounting) for milestone scope and exit criteria.
 
@@ -292,6 +293,10 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 * Accounting is asynchronous: a full queue drops new records, failed batches are logged and discarded, and a shutdown deadline can lose pending records. Database failure after startup does not fail otherwise successful requests. Records contain metadata, tokens, and estimated costs, never prompt or completion content.
 * Estimated costs cover only provider-reported usage, including a successful generation whose client disconnected before receiving it. Failed retries and a failed primary before fallback may incur charges without reporting usage. Unknown usage and cost are stored as `NULL`, never as fabricated zeros.
 
+### Querying usage
+
+Usage is queried directly in PostgreSQL. [docs/usage.md](docs/usage.md) provides SQL reports per client, answering model, and UTC day, plus lookups using `X-Request-ID`. Reports show known token/cost subtotals alongside counts of unknown values; cache reads and writes are already included in input tokens. An admin HTTP API remains future roadmap work.
+
 ## Development
 
 The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke tests), `test` (`go test -race -timeout 2m ./...`), `build`, and `vuln` (govulncheck).
@@ -336,7 +341,7 @@ The smoke harness injects a fake recorder and an empty pricing table, so it need
 
 ## Project Status
 
-v0.4 is feature-complete. v0.5 usage accounting is implemented and connected to the gateway. Usage-query documentation and milestone close-out are next.
+v0.5 is feature-complete, including usage persistence, cost estimation, migrations, and documented SQL queries. The next roadmap milestone is v0.6 observability; no v0.6 implementation is included yet.
 
 ### v0.5
 
@@ -348,9 +353,9 @@ v0.4 is feature-complete. v0.5 usage accounting is implemented and connected to 
 | PostgreSQL store and embedded migrations (`internal/postgres`) | ✅ Done |
 | Asynchronous usage recorder (`internal/usage`) | ✅ Done |
 | Usage accounting configuration, migration command, wiring, and end-to-end tests | ✅ Done |
-| Usage queries and documentation | ⏳ Next |
+| Usage queries and documentation | ✅ Done |
 
-The complete request path is tested against fake providers and a fake recorder, with an additional integration test that migrates a disposable PostgreSQL database and persists request records through the background writer. v0.5 remains in progress until the remaining roadmap criteria are closed out.
+The complete request path is tested against fake providers and a fake recorder, with an additional integration test that migrates a disposable PostgreSQL database and persists request records through the background writer. [Documented SQL queries](docs/usage.md) cover reporting without adding an admin API. See the [v0.5 exit criteria](docs/ROADMAP.md#milestone-5--usage-and-cost-accounting) for the milestone close-out.
 
 ### v0.4
 
