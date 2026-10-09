@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the architecture as implemented in v0.4: an HTTP endpoint with client authentication and per-client rate limits, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, and a circuit breaker per provider.
+This document describes the implemented v0.4 gateway and the v0.5 usage, pricing, and PostgreSQL components now under development. The request path has client authentication and per-client rate limits, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, and a circuit breaker per provider.
 
 ## Request flow
 
@@ -21,7 +21,8 @@ The handler authenticates the client and applies its rate limits before reading 
 | `internal/breaker` | Circuit breaker for one provider, as an `llm.Provider` that wraps another. |
 | `internal/auth` | Gateway client API keys and the request's client identity. |
 | `internal/ratelimit` | Per-client request rate and concurrency limits. |
-| `internal/usage` | Model prices and cost estimation from token usage. |
+| `internal/usage` | Model prices, cost estimation from token usage, and the usage record type. |
+| `internal/postgres` | PostgreSQL connection pool, schema migrations, and storage of usage records. |
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
 | `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
 | `internal/provider/anthropic` | Anthropic Messages client with private wire types. |
@@ -32,6 +33,7 @@ Rules:
 - `llm` imports no other project package. Every other package depends on it.
 - Provider-specific request and response types are unexported inside their provider package.
 - The HTTP layer never depends on a concrete provider. It depends only on `llm.Provider`.
+- `postgres` depends on `usage` and `llm`; nothing depends on `postgres` except, later, `cmd/gateway`. The database stays out of the request path's packages.
 - `llm` types carry no JSON tags. Public wire formats live in `httpapi`, and upstream wire formats live in each provider package.
 
 ## Provider contract
@@ -453,6 +455,50 @@ Decisions:
 
 Costs are estimates. They use the configured prices, which can be out of date, and cover only the usage reported for a successful response. Attempts that were retried, a primary that failed before a fallback answered, and requests that timed out may also be billed by the provider, but report no usage to the gateway.
 
+## PostgreSQL
+
+`internal/postgres` stores usage records. It is not wired into the gateway yet; a later change records each request through it.
+
+- **Driver.** [pgx](https://github.com/jackc/pgx) v5 with its `pgxpool` connection pool, the project's first third-party dependency: the standard library has no PostgreSQL driver, and pgx is the maintained, widely used one. `database/sql` is not used; its generic interface would add nothing here.
+- **Connecting.** `Open(ctx, url)` takes a PostgreSQL URL or key/value connection string and pings the server, so an unreachable database fails at once. Pool settings such as `pool_max_conns` go in the URL, so there is no separate pool configuration. Errors never include the URL: pgx redacts passwords from its parse errors only on a best-effort basis, so a malformed URL produces a fixed message instead.
+
+### Schema
+
+`usage_records` has one row per request, keyed by the gateway's request ID:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `request_id` | `text`, primary key | The request ID returned in `X-Request-ID`. |
+| `received_at` | `timestamptz` | When the request arrived. |
+| `duration_ms` | `integer` | How long the gateway took to answer. |
+| `client_id` | `text` | The authenticated client. |
+| `requested_model` | `text` | The model the client asked for. |
+| `provider` | `text`, nullable | The provider that answered, or the last one that failed; NULL if none was called. |
+| `model` | `text`, nullable | The model the provider reported; NULL on failure. |
+| `status` | `smallint` | The HTTP status sent to the client; 499 (nginx's convention) if the client disconnected first. |
+| `error_code` | `text`, nullable | The public error code; NULL on success. |
+| `input_tokens`, `cache_read_input_tokens`, `cache_write_input_tokens`, `output_tokens` | `integer`, nullable | Token usage as reported, with the cache counts part of `input_tokens`; all NULL if unknown. |
+| `cost_usd` | `numeric(24, 12)`, nullable | Estimated cost in dollars; NULL if unknown. |
+
+- **Exact cost.** A `usage.Cost` in picodollars is written as a `numeric` with twelve decimal places, so no precision is lost and `SUM(cost_usd)` is exact.
+- **Unknown is NULL.** Usage and cost are NULL when unknown, never 0, so sums and averages skip them instead of being pulled toward zero.
+- **Constraints repeat the record's rules**: non-negative counts, all four counts present or none, no more cached than input tokens, no cost without usage, and a valid HTTP status.
+- **Indexes** on `received_at` and on `(client_id, received_at)`, for queries over a time range, overall or per client.
+- **No foreign key to clients.** Clients live in the clients file, not the database, so `client_id` is plain text and records outlive a removed client.
+
+### Migrations
+
+Migrations are SQL files in `internal/postgres/migrations`, named `NNNN_description.sql` and numbered from `0001` without gaps, embedded in the binary.
+
+- **Forward-only.** There are no down migrations; a mistake is corrected by a new migration.
+- **One transaction.** `Migrate` runs all pending migrations and their `schema_migrations` entries in one transaction, after taking a transaction-scoped advisory lock. PostgreSQL DDL is transactional, so a failing migration leaves the schema unchanged, and gateways migrating at the same time apply each migration once. Statements that cannot run in a transaction, such as `CREATE INDEX CONCURRENTLY`, are therefore not allowed.
+- **Migration history is checked.** Applied migrations must be an exact prefix of the embedded files, including their names. Missing or renamed entries are refused. If the database has a migration the gateway does not know, a newer gateway migrated it; `Migrate` and `CheckSchema` fail rather than write to a schema this version was not built for.
+- **`CheckSchema`** reports an error unless the database has applied exactly the known migrations, for a gateway that should not migrate on its own.
+
+### Inserting records
+
+`Insert(ctx, records)` writes a batch in one round trip. pgx sends the batch with a single sync, so PostgreSQL runs it as one implicit transaction: every record is stored or none. Each row is inserted with `ON CONFLICT (request_id) DO NOTHING`, so a batch retried after an uncertain failure, such as a lost commit acknowledgment, creates no duplicates and does not overwrite stored rows. Every record is checked with `usage.Record.Validate` first; if any is invalid, nothing is sent.
+
 ## Server lifecycle
 
 - `http.Server` sets `ReadHeaderTimeout` to 5 seconds and `IdleTimeout` to 2 minutes. Without `IdleTimeout`, net/http would fall back to `ReadTimeout`, and with both unset an idle keep-alive connection would never be closed.
@@ -466,17 +512,18 @@ These limits govern the server's own lifecycle and are separate from the upstrea
 
 ## Testing
 
-All tests run without credentials or network access, using `httptest` servers.
+All tests run without credentials or network access, using `httptest` servers. The PostgreSQL integration tests also need a disposable PostgreSQL, named by `GATEWAY_TEST_DATABASE_URL`; without it they are skipped, except in CI, where they fail.
 
 | Level | What it proves |
 |---|---|
 | `internal/auth` | Key lookup, invalid, empty, and disabled keys, client validation, and concurrent use. |
-| `internal/usage` | Price parsing (decimal places, bounds, malformed values), costs with and without cache reads and writes, exact picodollar results, inconsistent and overflowing usage, missing prices, and concurrent use. |
+| `internal/usage` | Record validation, price parsing (decimal places, bounds, malformed values), costs with and without cache reads and writes, exact picodollar results, inconsistent and overflowing usage, missing prices, and concurrent use. |
+| `internal/postgres` | Migration file naming; against a real PostgreSQL, each test in its own new database: migrating an empty database, idempotent and concurrent migration, a failing migration leaving no trace, applying only pending migrations, refusing a newer schema; inserting success and failure records with exact costs and NULLs for unknown values, skipping already stored request IDs, rejecting invalid records without writing, all-or-nothing batches, cancellation, and concurrent inserts. Errors never reveal the database password. |
 | `internal/ratelimit` | Burst, refill, and sustained rates with exact `RetryAfter`, concurrency limits and release, independent clients, and concurrent use, against a manual clock. |
 | `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers; in `httpapi` also the `Authorization` header rules, 401 and 429 responses, identity in the provider's context, concurrency slots released on every outcome, `client_id` in logs, and a gateway-assigned request ID on every response and in logs. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
 | `cmd/gateway` | Configuration rules, including the clients file, and the complete path: the real handler, router, and both adapters behind an `httptest.Server`, talking to two fake upstreams. It covers routing to each provider, unknown models, upstream failures, retries (recovery for each retryable status, exhaustion, non-retryable statuses, `Retry-After` beyond the budget, refused connections, and client cancellation during a retry wait), fallback (on failures and on a primary timeout, not on a rejected request, both providers failing), circuit breaking (opening, failing fast without calling the upstream, routing straight to the fallback, and one breaker shared by a provider's own route and fallback use), client cancellation and upstream timeouts reaching the upstream, authentication (anonymous, malformed, unknown, provider, and disabled keys rejected before any upstream call; gateway and provider credentials never crossing), per-client rate limits with `Retry-After`, a stalled TLS handshake hitting the connect timeout, and graceful and forced shutdown. |
 
-Tests coordinate with channels. Timeouts are used only as failure guards. CI runs the Makefile's `fmt`, `vet`, `test`, `build`, and `vuln` targets (`make check` locally).
+Tests coordinate with channels. Timeouts are used only as failure guards. CI runs the Makefile's `fmt`, `vet`, `test`, `build`, and `vuln` targets (`make check` locally), with a PostgreSQL service container for the integration tests. Locally, `make db` starts the same PostgreSQL image in Docker.
 
 A separate smoke test (`cmd/gateway/smoke_test.go`, build tag `smoke`, run with `make smoke`) uses real provider keys from the environment and the real handler and adapters against the live APIs. It checks a completion and a `length` stop with usage per configured model, plus the 401 and 429 paths. It is manual only: it costs money and needs credentials, so CI never runs it, but `make vet` compiles it so it cannot rot.
