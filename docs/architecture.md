@@ -469,7 +469,8 @@ An empty `prices` array is valid. A configured model with no entry has unknown c
 `internal/postgres` stores usage records through the asynchronous recorder. The application opens the pool, checks the schema, and starts the writer before listening. An unreachable or incompatible database fails startup; loss of the database afterwards only affects recording.
 
 - **Driver.** [pgx](https://github.com/jackc/pgx) v5 with its `pgxpool` connection pool, the project's first third-party dependency: the standard library has no PostgreSQL driver, and pgx is the maintained, widely used one. `database/sql` is not used; its generic interface would add nothing here.
-- **Connecting.** `Open(ctx, url)` takes a PostgreSQL URL or key/value connection string and pings the server, so an unreachable database fails at once. Pool settings such as `pool_max_conns` go in the URL, so there is no separate pool configuration. Errors never include the URL: pgx redacts passwords from its parse errors only on a best-effort basis, so a malformed URL produces a fixed message instead.
+- **Connecting.** `Open(ctx, url)` takes a PostgreSQL URL or key/value connection string and pings the server, so an unreachable database fails at once. Pool settings such as `pool_max_conns` go in the URL, so there is no separate pool configuration. Errors never include the URL: pgx redacts passwords from its parse errors only on a best-effort basis, so a malformed URL produces a fixed message instead. TLS is configured in the URL too. pgx's default `sslmode=prefer` encrypts when the server offers TLS but does not verify the server, so the README asks for `sslmode=verify-full` for any database not on the local host; the gateway does not enforce it, because the local development database has no TLS.
+- **Retention.** Records are never deleted by the gateway. Operators delete old rows themselves; [usage.md](usage.md#retention) shows a batched delete that uses the `received_at` index.
 
 ### Schema
 
@@ -515,7 +516,7 @@ v0.5's query interface is direct SQL against `usage_records`; there is no admin 
 
 Reports sum the stored exact `numeric` costs and retain NULL when a group has no known costs. Coverage counts distinguish a known subtotal from missing usage or pricing; cache subsets are not added to input tokens a second time. Groups by `model` describe the reported answering model, while `requested_model` describes client demand, including failures and fallback. Database reporting access is separate from gateway authentication and should use a SELECT-only role.
 
-Pricing is applied at record creation, not query time, so changing the file does not reprice historical records. Accounting can lose records, and unsuccessful upstream attempts can incur unreported charges. Query results are therefore estimates over persisted records, not an exact bill or an exhaustive audit. Retention, admin endpoints, and a database-backed clients/keys model are not implemented in v0.5.
+Pricing is applied at record creation, not query time, so changing the file does not reprice historical records. Accounting can lose records, and unsuccessful upstream attempts can incur unreported charges. Query results are therefore estimates over persisted records, not an exact bill or an exhaustive audit. Automatic retention, admin endpoints, and a database-backed clients/keys model are not implemented in v0.5.
 
 ## Asynchronous usage recording
 

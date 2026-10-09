@@ -118,3 +118,21 @@ WHERE request_id = :'request_id';
 ```
 
 An absent row may mean the request was rejected before validation, its record has not flushed yet, or recording lost it. Failure logs carry the same request ID. The query uses the primary key and needs no reporting window.
+
+## Retention
+
+The gateway never deletes usage records, so the table grows with traffic. Choose how long to keep records and delete older ones periodically, for example from a scheduled job. Deleting needs a role with `DELETE` permission on `usage_records`; keep it separate from the read-only reporting role.
+
+Delete in batches, so each statement is short and holds few locks while the gateway keeps inserting:
+
+```sql
+\set cutoff '2026-07-01T00:00:00Z'
+DELETE FROM usage_records
+WHERE request_id IN (
+    SELECT request_id FROM usage_records
+    WHERE received_at < :'cutoff'::timestamptz
+    LIMIT 10000
+);
+```
+
+Repeat until it reports `DELETE 0`. The `received_at` index finds the old rows, and PostgreSQL's autovacuum reclaims their space for new records. Reports for a window that starts before the cutoff will then be incomplete.
