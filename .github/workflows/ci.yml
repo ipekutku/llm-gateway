@@ -23,6 +23,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # A disposable PostgreSQL for the integration tests, the same image as
+    # make db. The tests create and drop their own databases in it.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U gateway"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -31,7 +47,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.mod
+          cache-dependency-path: go.sum
 
       - name: Show Go version
         run: go version
@@ -43,8 +59,11 @@ jobs:
       - name: Vet
         run: make vet
 
+      # The PostgreSQL tests fail rather than skip in CI if this is missing.
       - name: Test
         run: make test
+        env:
+          GATEWAY_TEST_DATABASE_URL: postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable
 
       - name: Build
         run: make build

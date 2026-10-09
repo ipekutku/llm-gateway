@@ -44,6 +44,8 @@ The fifth milestone measures how the gateway is used and what that costs: every 
 
 Prices cannot be configured yet, and usage records are not stored yet.
 
+The PostgreSQL store and embedded migrations are implemented but are not yet wired into gateway startup or request handling. To run their integration tests locally, start the disposable development database with `make db`, set the `GATEWAY_TEST_DATABASE_URL` value it prints, then run `make test`. `make db-stop` stops that container and deletes its data. Without the variable, the database tests skip locally; CI requires and runs them.
+
 ### v0.4 — Authentication and Rate Limiting ✅
 
 The fourth milestone turned the gateway from an anonymous proxy into a multi-client service:
