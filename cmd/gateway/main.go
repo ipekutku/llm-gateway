@@ -15,7 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/httpapi"
+	"github.com/ipekutku/llm-gateway/internal/llm"
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
 	"github.com/ipekutku/llm-gateway/internal/retry"
@@ -65,11 +67,17 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) e
 		return fmt.Errorf("listen: %w", err)
 	}
 	attrs := []any{slog.String("addr", ln.Addr().String())}
-	if cfg.OpenAI != nil {
-		attrs = append(attrs, slog.String("openai_model", cfg.OpenAI.Model))
+	if p := cfg.OpenAI; p != nil {
+		attrs = append(attrs, slog.String("openai_model", p.Model))
+		if p.FallbackTo != "" {
+			attrs = append(attrs, slog.String("openai_fallback", p.FallbackTo))
+		}
 	}
-	if cfg.Anthropic != nil {
-		attrs = append(attrs, slog.String("anthropic_model", cfg.Anthropic.Model))
+	if p := cfg.Anthropic; p != nil {
+		attrs = append(attrs, slog.String("anthropic_model", p.Model))
+		if p.FallbackTo != "" {
+			attrs = append(attrs, slog.String("anthropic_fallback", p.FallbackTo))
+		}
 	}
 	attrs = append(attrs,
 		slog.Duration("upstream_timeout", cfg.UpstreamTimeout),
@@ -77,7 +85,12 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) e
 		slog.Int("retry_max_attempts", cfg.Retry.MaxAttempts),
 		slog.Duration("retry_base_delay", cfg.Retry.BaseDelay),
 		slog.Duration("retry_max_delay", cfg.Retry.MaxDelay),
+		slog.Int("breaker_failures", cfg.Breaker.Failures),
+		slog.Duration("breaker_cooldown", cfg.Breaker.Cooldown),
 	)
+	if (cfg.OpenAI != nil && cfg.OpenAI.FallbackTo != "") || (cfg.Anthropic != nil && cfg.Anthropic.FallbackTo != "") {
+		attrs = append(attrs, slog.Duration("provider_timeout", cfg.ProviderTimeout))
+	}
 	logger.Info("gateway listening", attrs...)
 
 	srv := &http.Server{
@@ -91,34 +104,52 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) e
 }
 
 // newHandler builds the provider clients, router, and HTTP handler for cfg.
-// Each provider client is wrapped with the retry policy, below the router.
-// A nil httpClient uses a client built by newUpstreamClient.
+// Each provider client is wrapped with retries and, above them, a circuit
+// breaker; the router's fallback sits above both. A nil httpClient uses a
+// client built by newUpstreamClient.
 func newHandler(cfg config, httpClient *http.Client, logger *slog.Logger) (http.Handler, error) {
 	if httpClient == nil {
 		httpClient = newUpstreamClient(cfg)
 	}
-	routes := make(map[string]routing.Route)
+
+	type enabled struct {
+		cfg      *providerConfig
+		provider llm.Provider
+	}
+	providers := make(map[string]enabled)
 	if p := cfg.OpenAI; p != nil {
 		c, err := openai.New(p.APIKey, p.BaseURL, httpClient)
 		if err != nil {
 			return nil, err
 		}
-		r, err := retry.New(c, cfg.Retry, logger)
+		wrapped, err := resilient(openai.ProviderName, c, cfg, logger)
 		if err != nil {
 			return nil, err
 		}
-		routes[p.Model] = routing.Route{Provider: r}
+		providers[openai.ProviderName] = enabled{p, wrapped}
 	}
 	if p := cfg.Anthropic; p != nil {
 		c, err := anthropic.New(p.APIKey, p.BaseURL, httpClient)
 		if err != nil {
 			return nil, err
 		}
-		r, err := retry.New(c, cfg.Retry, logger)
+		wrapped, err := resilient(anthropic.ProviderName, c, cfg, logger)
 		if err != nil {
 			return nil, err
 		}
-		routes[p.Model] = routing.Route{Provider: r}
+		providers[anthropic.ProviderName] = enabled{p, wrapped}
+	}
+
+	// A fallback reuses the other provider's wrapped client, so each
+	// provider has exactly one breaker whichever route reaches it.
+	routes := make(map[string]routing.Route, len(providers))
+	for _, e := range providers {
+		route := routing.Route{Provider: e.provider}
+		if e.cfg.FallbackTo != "" {
+			f := providers[e.cfg.FallbackTo]
+			route.Fallback = &routing.Fallback{Model: f.cfg.Model, Provider: f.provider, PrimaryTimeout: cfg.ProviderTimeout}
+		}
+		routes[e.cfg.Model] = route
 	}
 
 	router, err := routing.New(routes, logger)
@@ -126,6 +157,16 @@ func newHandler(cfg config, httpClient *http.Client, logger *slog.Logger) (http.
 		return nil, err
 	}
 	return httpapi.New(router, cfg.UpstreamTimeout, logger)
+}
+
+// resilient wraps a provider client with the retry policy and, above it,
+// a circuit breaker, so the breaker sees one outcome per request.
+func resilient(name string, p llm.Provider, cfg config, logger *slog.Logger) (llm.Provider, error) {
+	r, err := retry.New(p, cfg.Retry, logger)
+	if err != nil {
+		return nil, err
+	}
+	return breaker.New(name, r, cfg.Breaker, logger)
 }
 
 // newUpstreamClient returns the HTTP client shared by all provider

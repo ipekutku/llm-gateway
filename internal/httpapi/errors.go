@@ -23,6 +23,7 @@ const (
 	codeProviderRateLimited = "provider_rate_limited"
 	codeUpstreamError       = "upstream_error"
 	codeUpstreamTimeout     = "upstream_timeout"
+	codeProviderUnavailable = "provider_unavailable"
 	codeInternalError       = "internal_error"
 )
 
@@ -73,6 +74,12 @@ var (
 		code:    codeUpstreamTimeout,
 		message: "The upstream provider did not respond in time.",
 	}
+	errProviderUnavailable = apiError{
+		status:  http.StatusServiceUnavailable,
+		typ:     typeServer,
+		code:    codeProviderUnavailable,
+		message: "The upstream provider is temporarily unavailable after repeated failures.",
+	}
 	errInternal = apiError{
 		status:  http.StatusInternalServerError,
 		typ:     typeServer,
@@ -105,6 +112,8 @@ func classifyChatError(err error) apiError {
 		return errUpstream
 	case errors.Is(err, llm.ErrUnknownModel):
 		return errModelNotFound
+	case errors.Is(err, llm.ErrCircuitOpen):
+		return errProviderUnavailable
 	}
 
 	if pe, ok := errors.AsType[*llm.ProviderError](err); ok {

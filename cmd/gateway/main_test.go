@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/retry"
 )
 
@@ -500,6 +501,207 @@ func TestRequestPathClientCancellationStopsRetries(t *testing.T) {
 	}
 }
 
+// errorCode returns the error code in a gateway error response.
+func errorCode(t *testing.T, data []byte) string {
+	t.Helper()
+	var got struct {
+		Error struct{ Code string } `json:"error"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode error response %s: %v", data, err)
+	}
+	return got.Error.Code
+}
+
+// replyModel returns the model reported in a successful gateway response.
+func replyModel(t *testing.T, data []byte) string {
+	t.Helper()
+	var got struct{ Model string }
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode response %s: %v", data, err)
+	}
+	return got.Model
+}
+
+func TestRequestPathFallsBackToOtherProvider(t *testing.T) {
+	tests := []struct {
+		name     string
+		oaStatus int
+		requests int // primary requests, including retries
+		fallback bool
+		status   int
+	}{
+		{"unavailable after retries", 503, fastRetry.MaxAttempts, true, http.StatusOK},
+		{"rate limited after retries", 429, fastRetry.MaxAttempts, true, http.StatusOK},
+		{"server error", 500, 1, true, http.StatusOK},
+		{"authentication failure", 401, 1, true, http.StatusOK},
+		{"rejected request", 400, 1, false, http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oa := newUpstream(t, "/v1/chat/completions", reply(tt.oaStatus, openaiReply))
+			an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+			gw := gatewayWith(t, oa, an, func(c *config) { c.OpenAI.FallbackTo = "anthropic" })
+
+			resp, data, err := postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+			if err != nil {
+				t.Fatalf("POST error = %v", err)
+			}
+			if resp.StatusCode != tt.status {
+				t.Fatalf("status = %d, want %d (body %s)", resp.StatusCode, tt.status, data)
+			}
+			if got := len(oa.received()); got != tt.requests {
+				t.Errorf("primary received %d requests, want %d", got, tt.requests)
+			}
+			if !tt.fallback {
+				if len(an.received()) != 0 {
+					t.Error("fallback was called for a rejected request")
+				}
+				return
+			}
+			// The fallback received its own model and wire format, and the
+			// response names the model that answered.
+			got := an.received()
+			if len(got) != 1 {
+				t.Fatalf("fallback received %d requests, want 1", len(got))
+			}
+			if got[0].Body["model"] != "claude-opus-5-5" || got[0].Body["system"] != "Be brief." {
+				t.Errorf("fallback body = %v, want the Anthropic model and wire format", got[0].Body)
+			}
+			if got[0].Header.Get("x-api-key") != anthropicKey {
+				t.Error("fallback request does not carry the Anthropic key")
+			}
+			if m := replyModel(t, data); m != "claude-opus-5-5" {
+				t.Errorf("response model = %q, want the fallback model", m)
+			}
+		})
+	}
+}
+
+func TestRequestPathFallsBackAfterPrimaryTimeout(t *testing.T) {
+	slow := newBlockingHandler(t, "")
+	oa := newUpstream(t, "/v1/chat/completions", slow.ServeHTTP)
+	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+	gw := gatewayWith(t, oa, an, func(c *config) {
+		c.OpenAI.FallbackTo = "anthropic"
+		c.ProviderTimeout = 50 * time.Millisecond
+		c.UpstreamTimeout = guard
+	})
+
+	resp, data, err := postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+	if err != nil {
+		t.Fatalf("POST error = %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || replyModel(t, data) != "claude-opus-5-5" {
+		t.Errorf("status = %d, body %s; want 200 from the fallback", resp.StatusCode, data)
+	}
+	// The timed-out primary request was canceled, not left running.
+	waitFor(t, slow.canceled, "cancellation to reach the primary upstream")
+}
+
+func TestRequestPathBothProvidersFail(t *testing.T) {
+	oa := newUpstream(t, "/v1/chat/completions", reply(http.StatusServiceUnavailable, ""))
+	an := newUpstream(t, "/v1/messages", reply(http.StatusTooManyRequests, ""))
+	gw := gatewayWith(t, oa, an, func(c *config) { c.OpenAI.FallbackTo = "anthropic" })
+
+	resp, data, err := postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+	if err != nil {
+		t.Fatalf("POST error = %v", err)
+	}
+	// The last provider tried decides the response: Anthropic's 429.
+	if resp.StatusCode != http.StatusTooManyRequests || errorCode(t, data) != "provider_rate_limited" {
+		t.Errorf("status = %d, body %s; want 429 provider_rate_limited from the fallback", resp.StatusCode, data)
+	}
+	if len(oa.received()) != fastRetry.MaxAttempts || len(an.received()) != fastRetry.MaxAttempts {
+		t.Errorf("requests = openai %d, anthropic %d; want %d each", len(oa.received()), len(an.received()), fastRetry.MaxAttempts)
+	}
+}
+
+func TestRequestPathOpensCircuitAfterRepeatedFailures(t *testing.T) {
+	oa := newUpstream(t, "/v1/chat/completions", reply(http.StatusServiceUnavailable, ""))
+	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+	gw := gatewayWith(t, oa, an, func(c *config) {
+		c.Retry.MaxAttempts = 1
+		c.Breaker = breaker.Settings{Failures: 2, Cooldown: time.Hour}
+	})
+
+	for i := range 2 {
+		resp, _, err := postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+		if err != nil || resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("request %d: status %v, error %v; want 502", i+1, resp, err)
+		}
+	}
+
+	// The circuit is open: the next request fails fast without reaching
+	// the upstream.
+	resp, data, err := postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+	if err != nil {
+		t.Fatalf("POST error = %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || errorCode(t, data) != "provider_unavailable" {
+		t.Errorf("status = %d, body %s; want 503 provider_unavailable", resp.StatusCode, data)
+	}
+	if got := len(oa.received()); got != 2 {
+		t.Errorf("upstream received %d requests, want 2: an open circuit must not call it", got)
+	}
+
+	// The other provider has its own breaker and is unaffected.
+	if resp, _, err := postChat(t, context.Background(), gw.URL, chatBody("claude-opus-5-5")); err != nil || resp.StatusCode != http.StatusOK {
+		t.Errorf("other provider: status %v, error %v; want 200", resp, err)
+	}
+}
+
+func TestRequestPathOpenCircuitGoesStraightToFallback(t *testing.T) {
+	oa := newUpstream(t, "/v1/chat/completions", reply(http.StatusServiceUnavailable, ""))
+	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+	gw := gatewayWith(t, oa, an, func(c *config) {
+		c.OpenAI.FallbackTo = "anthropic"
+		c.Retry.MaxAttempts = 1
+		c.Breaker = breaker.Settings{Failures: 1, Cooldown: time.Hour}
+	})
+
+	for i := range 3 {
+		resp, data, err := postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+		if err != nil || resp.StatusCode != http.StatusOK || replyModel(t, data) != "claude-opus-5-5" {
+			t.Fatalf("request %d: status %v, error %v; want 200 from the fallback", i+1, resp, err)
+		}
+	}
+	// Only the first request reached the failing primary; the open circuit
+	// sent the others straight to the fallback.
+	if got := len(oa.received()); got != 1 {
+		t.Errorf("primary received %d requests, want 1", got)
+	}
+	if got := len(an.received()); got != 3 {
+		t.Errorf("fallback received %d requests, want 3", got)
+	}
+}
+
+func TestRequestPathFallbackSharesProviderBreaker(t *testing.T) {
+	// Anthropic's circuit opens through its own route. When OpenAI then
+	// falls back to Anthropic, the same breaker rejects the fallback.
+	oa := newUpstream(t, "/v1/chat/completions", reply(http.StatusServiceUnavailable, ""))
+	an := newUpstream(t, "/v1/messages", reply(http.StatusServiceUnavailable, ""))
+	gw := gatewayWith(t, oa, an, func(c *config) {
+		c.OpenAI.FallbackTo = "anthropic"
+		c.Retry.MaxAttempts = 1
+		c.Breaker = breaker.Settings{Failures: 1, Cooldown: time.Hour}
+	})
+
+	if resp, _, err := postChat(t, context.Background(), gw.URL, chatBody("claude-opus-5-5")); err != nil || resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("anthropic request: status %v, error %v; want 502", resp, err)
+	}
+	resp, data, err := postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+	if err != nil {
+		t.Fatalf("POST error = %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || errorCode(t, data) != "provider_unavailable" {
+		t.Errorf("status = %d, body %s; want 503 provider_unavailable from the open fallback circuit", resp.StatusCode, data)
+	}
+	if got := len(an.received()); got != 1 {
+		t.Errorf("anthropic received %d requests, want 1: its open circuit must also guard the fallback", got)
+	}
+}
+
 func TestRequestPathTimesOutSlowUpstream(t *testing.T) {
 	for _, tt := range []struct {
 		model, path string
@@ -714,7 +916,9 @@ func gatewayConfig(oa, an *upstream) config {
 		Addr:            "127.0.0.1:0",
 		UpstreamTimeout: defaultUpstreamTimeout,
 		ConnectTimeout:  defaultConnectTimeout,
+		ProviderTimeout: defaultUpstreamTimeout / 2,
 		Retry:           fastRetry,
+		Breaker:         breaker.Settings{Failures: defaultBreakerFailures, Cooldown: defaultBreakerCooldown},
 		OpenAI:          &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: oa.srv.URL},
 		Anthropic:       &providerConfig{Model: "claude-opus-5-5", APIKey: anthropicKey, BaseURL: an.srv.URL},
 	}
