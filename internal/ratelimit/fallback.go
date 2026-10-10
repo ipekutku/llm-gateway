@@ -31,6 +31,10 @@ type FallbackSettings struct {
 	// RetryInterval is how long after a Redis failure the Fallback uses
 	// local limits before it tries Redis again. It must be positive.
 	RetryInterval time.Duration
+	// StartLocal starts the Fallback in LocalMode, for a Redis known to be
+	// unreachable, such as at startup. The first request then probes Redis.
+	// Starting in LocalMode is not a mode change and is not logged.
+	StartLocal bool
 	// OnModeChange, if not nil, is called with the new mode on every mode
 	// change. It is called with the Fallback's lock held, so calls arrive in
 	// order; it must return quickly and must not call the Fallback.
@@ -60,8 +64,9 @@ type Fallback struct {
 	probeAt time.Time // in LocalMode, when Redis may be tried again
 }
 
-// NewFallback returns a Fallback in SharedMode. shared and local should
-// have the same client limits. A nil log uses slog.Default.
+// NewFallback returns a Fallback in SharedMode, or in LocalMode if
+// settings.StartLocal is set. shared and local should have the same client
+// limits. A nil log uses slog.Default.
 func NewFallback(shared *Shared, local *Limiter, settings FallbackSettings, log *slog.Logger) (*Fallback, error) {
 	switch {
 	case shared == nil:
@@ -74,7 +79,11 @@ func NewFallback(shared *Shared, local *Limiter, settings FallbackSettings, log 
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Fallback{shared: shared, local: local, settings: settings, log: log, now: time.Now}, nil
+	f := &Fallback{shared: shared, local: local, settings: settings, log: log, now: time.Now}
+	if settings.StartLocal {
+		f.mode = LocalMode
+	}
+	return f, nil
 }
 
 // Mode returns the current mode.

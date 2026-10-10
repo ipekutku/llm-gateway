@@ -1058,7 +1058,7 @@ func TestRunServesUntilCanceled(t *testing.T) {
 	case <-time.After(guard):
 		t.Fatal("timed out waiting for run to return")
 	}
-	for _, want := range []string{"anthropic_model=claude-opus-5-5", "clients=1", "disabled_clients=0"} {
+	for _, want := range []string{"anthropic_model=claude-opus-5-5", "clients=1", "disabled_clients=0", "rate_limits=local"} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("startup log does not contain %q:\n%s", want, logs.String())
 		}

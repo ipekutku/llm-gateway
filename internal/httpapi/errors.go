@@ -18,12 +18,15 @@ const (
 
 // Error codes returned in the error envelope.
 const (
-	codeInvalidRequest           = "invalid_request"
-	codeRequestTooLarge          = "request_too_large"
-	codeRequestTimeout           = "request_timeout"
-	codeMissingAPIKey            = "missing_api_key"
-	codeInvalidAPIKey            = "invalid_api_key"
-	codeRateLimitExceeded        = "rate_limit_exceeded"
+	codeInvalidRequest    = "invalid_request"
+	codeRequestTooLarge   = "request_too_large"
+	codeRequestTimeout    = "request_timeout"
+	codeMissingAPIKey     = "missing_api_key"
+	codeInvalidAPIKey     = "invalid_api_key"
+	codeRateLimitExceeded = "rate_limit_exceeded"
+	// codeClientClosed is never sent: it records, with status 499, a
+	// request whose client went away.
+	codeClientClosed             = "client_closed"
 	codeConcurrencyLimitExceeded = "concurrency_limit_exceeded"
 	codeModelNotFound            = "model_not_found"
 	codeProviderRateLimited      = "provider_rate_limited"

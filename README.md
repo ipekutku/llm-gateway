@@ -221,6 +221,7 @@ The `model` field must match a configured model exactly; the request is routed t
 | `GATEWAY_PROVIDER_TIMEOUT` | Time a provider with a fallback gets before the fallback takes over. Default half of `GATEWAY_UPSTREAM_TIMEOUT` (`60s`). |
 | `GATEWAY_BREAKER_FAILURES` | Failed requests in a row after which a provider is skipped, from `1` to `100`. Default `5`. |
 | `GATEWAY_BREAKER_COOLDOWN` | How long a provider is skipped before one test request is let through. Default `30s`. |
+| `GATEWAY_REDIS_URL` | Optional. A `redis://` or `rediss://` URL of a Redis that holds the clients' rate limits, so that several gateway instances share them. Unset means each instance limits on its own. See [Shared rate limits](#shared-rate-limits-with-redis). Treat it as a secret if it contains a password; for any Redis not on the local host, use `rediss://` (TLS). |
 
 For example, to fall back from OpenAI to Anthropic:
 
@@ -229,6 +230,26 @@ export OPENAI_FALLBACK=anthropic
 ```
 
 A request for `gpt-4o` that OpenAI cannot serve is then answered by `claude-opus-5-5`; the response's `model` field shows which model answered. While a provider is skipped and no fallback can answer, requests fail with `503 provider_unavailable`.
+
+### Shared rate limits with Redis
+
+Each gateway instance enforces the clients' limits on its own, so N instances allow a client up to N times its limits. With `GATEWAY_REDIS_URL` set, the instances share each client's request rate and concurrent requests through Redis instead:
+
+```bash
+make redis    # disposable local Redis on port 56379, without persistence
+export GATEWAY_REDIS_URL='redis://127.0.0.1:56379/0'
+go run ./cmd/gateway
+```
+
+The startup log then shows `rate_limits=shared`. All instances must use the same Redis and the same clients file: each sends its own limits with every check.
+
+Redis only holds rate-limit state, and the gateway does not depend on it to serve requests:
+
+* If Redis fails or takes longer than 250 ms to answer, the gateway logs one warning and switches to its own per-instance limits, as without Redis. It tries Redis again after a second, and logs once more when Redis answers and shared limits resume.
+* If Redis does not answer at startup, the gateway logs a warning and starts with per-instance limits instead of failing.
+* A request holds its concurrency slot in Redis for at most the body-read time, the upstream timeout, and 30 seconds more, so slots held by an instance that crashed free themselves.
+
+Redis Cluster and Sentinel are not supported; use one Redis endpoint, such as a managed primary. URL options that change retries are overridden: the gateway turns off go-redis's command retries, because a retried rate-limit check could count a request twice.
 
 ### Clients
 
@@ -398,10 +419,10 @@ The gateway's provider endpoints are fixed, so dashboard data comes from real tr
 * TLS handshake failures are not retried.
 * With a fallback configured, a request can be answered by a different model than the one requested. A primary that times out is canceled, but may still bill for the partial generation.
 * Fallback works only between the two configured models; there are no logical model names yet.
-* Circuit breaker state is kept per gateway process; several instances do not share it (planned for v0.7).
+* Circuit breaker state is kept per gateway process; several instances do not share it, even with Redis. See [architecture](docs/architecture.md#shared-limits-in-redis) for why.
 * A request whose upstream timeout expires may still be billed by the provider for the work done before it was canceled.
 * The gateway serves plain HTTP and listens on loopback by default. Gateway keys would cross the network unencrypted, so expose it beyond the host only behind a proxy that terminates TLS.
-* Rate limits and concurrency counts are kept per gateway process; several instances do not share them (planned for v0.7).
+* Without `GATEWAY_REDIS_URL`, and while Redis is unavailable, rate limits and concurrency counts are kept per gateway process: N instances allow a client up to N times its limits. Each rate-limit check with Redis adds one Redis round trip to a request, and releasing its slot another.
 * Clients are read from a file at startup; changing them requires a restart. Each client has one key, so rotating a key briefly means replacing it.
 * `/metrics` has no authentication; it reveals request counts per configured model and status and provider health, never keys, clients, or content. Keep `GATEWAY_METRICS_ADDR` on loopback or a network only Prometheus can reach.
 * With tracing enabled, every request, including rejected ones, produces spans, and a client's `traceparent` decides whether its requests are sampled. Clients cannot see trace data, but anyone who can reach the gateway can add to the collector's load.
@@ -452,7 +473,7 @@ Stopping the container deletes its data. Tests use fake provider servers and the
 
 ### Redis integration tests
 
-The shared rate-limit tests need Redis. Start a disposable Redis 8 container without persistence:
+The shared rate-limit tests, including a complete request path with limits in Redis, need Redis. Start a disposable Redis 8 container without persistence:
 
 ```bash
 make redis
@@ -460,7 +481,7 @@ export GATEWAY_TEST_REDIS_URL='redis://127.0.0.1:56379/0'
 make check
 ```
 
-`make redis` prints the setting above. Its port defaults to `56379`; use `make redis REDIS_PORT=<port>` and the printed URL if that port is occupied. Like `GATEWAY_TEST_DATABASE_URL`, it is a test setting only; the gateway does not use Redis yet. Each test writes only keys under a random prefix of its own and deletes them when it ends, so it never clears other data. Without the variable, the Redis tests skip locally; CI supplies a Redis service and fails if it is missing.
+`make redis` prints the setting above. Its port defaults to `56379`; use `make redis REDIS_PORT=<port>` and the printed URL if that port is occupied. Like `GATEWAY_TEST_DATABASE_URL`, it is a test setting; the gateway reads `GATEWAY_REDIS_URL`. Each test writes only keys under a random prefix of its own and deletes them when it ends, so it never clears other data. Without the variable, the Redis tests skip locally; CI supplies a Redis service and fails if it is missing.
 
 When finished:
 

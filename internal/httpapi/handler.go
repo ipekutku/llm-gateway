@@ -31,11 +31,13 @@ const ChatCompletionsPath = "/v1/chat/completions"
 // assigned to the request.
 const RequestIDHeader = "X-Request-ID"
 
-// bodyReadTimeout bounds how long a client may take to send a request body,
-// counted from when its headers have been read. It also bounds how long the
-// server spends discarding the unread body of a rejected request. Replaced
-// in tests.
-var bodyReadTimeout = 30 * time.Second
+// BodyReadTimeout bounds how long a client may take to send a request
+// body, counted from when its headers have been read. It also bounds how
+// long the server spends discarding the unread body of a rejected request.
+const BodyReadTimeout = 30 * time.Second
+
+// bodyReadTimeout is BodyReadTimeout, replaced in tests.
+var bodyReadTimeout = BodyReadTimeout
 
 type handler struct {
 	provider        llm.Provider
@@ -253,7 +255,9 @@ func bearerToken(header http.Header) (string, error) {
 
 // acquire admits the request under the client's limits. On success the
 // caller must call release when the request has finished. On failure it
-// writes a 429, or a 500 for a client without limits, and returns false.
+// writes a 429, or a 500 for a client without limits or a limiter failure,
+// and returns false. If the client went away while the limiter was
+// deciding, nothing is written.
 func (h *handler) acquire(w http.ResponseWriter, r *http.Request, id auth.Identity) (release func(), ok bool) {
 	release, err := h.limiter.Acquire(r.Context(), id.ClientID)
 	if err == nil {
@@ -261,6 +265,8 @@ func (h *handler) acquire(w http.ResponseWriter, r *http.Request, id auth.Identi
 	}
 	le, isLimit := errors.AsType[*ratelimit.Error](err)
 	switch {
+	case !isLimit && r.Context().Err() != nil:
+		h.abandon(r, err)
 	case !isLimit:
 		h.fail(w, r, errInternal, err)
 	case le.Limit == ratelimit.ConcurrentRequests:
@@ -290,7 +296,7 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 	var chatErr error
 	defer func() {
 		if r.Context().Err() != nil {
-			record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
+			record.Status, record.ErrorCode = usage.StatusClientClosed, codeClientClosed
 		}
 		record.Duration = time.Since(received)
 		h.logOutcome(r.Context(), record, chatErr, stats)
@@ -324,7 +330,7 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 		failure := classifyChatError(err)
 		record.Status, record.ErrorCode = failure.status, failure.code
 		if writeErr := writeError(w, failure); writeErr != nil {
-			record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
+			record.Status, record.ErrorCode = usage.StatusClientClosed, codeClientClosed
 		}
 		return
 	}
@@ -361,7 +367,7 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 		},
 	})
 	if err != nil || r.Context().Err() != nil {
-		record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
+		record.Status, record.ErrorCode = usage.StatusClientClosed, codeClientClosed
 	}
 }
 
@@ -383,6 +389,21 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err e
 	_ = writeError(w, e)
 	received, _ := r.Context().Value(receivedAtKey{}).(time.Time)
 	h.metrics.ObserveRequest("", e.status, e.code, time.Since(received))
+}
+
+// abandon records a request whose client went away before it was
+// admitted. Like a validated request's cancellation, it is logged and
+// counted as 499 client_closed, and nothing is written, since nobody would
+// receive it.
+func (h *handler) abandon(r *http.Request, err error) {
+	h.log.LogAttrs(r.Context(), slog.LevelInfo, "chat completion failed",
+		slog.Int("status", usage.StatusClientClosed),
+		slog.String("code", codeClientClosed),
+		slog.Any("error", err),
+	)
+	annotateSpan(r.Context(), codeClientClosed)
+	received, _ := r.Context().Value(receivedAtKey{}).(time.Time)
+	h.metrics.ObserveRequest("", usage.StatusClientClosed, codeClientClosed, time.Since(received))
 }
 
 // logOutcome logs the one line describing a validated request's outcome,

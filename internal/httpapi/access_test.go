@@ -335,6 +335,36 @@ func TestLimiterErrorIsAnInternalError(t *testing.T) {
 	}
 }
 
+func TestClientGoneDuringAdmissionIsClientClosed(t *testing.T) {
+	p := &recordingProvider{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The client goes away while a limiter that does I/O is deciding.
+	limiter := limiterFunc(func(ctx context.Context, _ string) (func(), error) {
+		cancel()
+		return nil, ctx.Err()
+	})
+	var logs strings.Builder
+	h, err := New(p, testAuthenticator(t), limiter, testTimeout, testAccounting(), nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	rec := serve(t, h, requestWithAuth("Bearer "+keyA).WithContext(ctx))
+
+	if rec.Body.Len() != 0 {
+		t.Errorf("response written to a client that went away: %s", rec.Body)
+	}
+	if p.calls != 0 {
+		t.Errorf("provider called %d times, want 0", p.calls)
+	}
+	for _, want := range []string{"level=INFO", "status=499", "code=client_closed"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log does not contain %q:\n%s", want, logs.String())
+		}
+	}
+}
+
 func waitOrFail(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
 	select {
