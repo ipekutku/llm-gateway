@@ -271,7 +271,10 @@ func retryAfterSeconds(d time.Duration) string {
 func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatRequest) {
 	received, _ := r.Context().Value(receivedAtKey{}).(time.Time)
 	identity, _ := auth.FromContext(r.Context())
-	record := usage.Record{RequestID: requestID(r), Time: received, ClientID: identity.ClientID, RequestedModel: req.Model}
+	record := usage.Record{
+		RequestID: requestID(r), Time: received, ClientID: identity.ClientID, RequestedModel: req.Model,
+		Span: trace.SpanContextFromContext(r.Context()),
+	}
 	ctx, stats := llm.WithStats(r.Context())
 	var chatErr error
 	defer func() {

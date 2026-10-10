@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // serviceName is the default service.name of the gateway's spans;
@@ -41,4 +42,25 @@ func newTracerProvider(ctx context.Context, logger *slog.Logger) (*sdktrace.Trac
 		logger.Warn("tracing error", slog.Any("error", err))
 	}))
 	return sdktrace.NewTracerProvider(sdktrace.WithBatcher(exporter), sdktrace.WithResource(res)), nil
+}
+
+// startTracing returns the tracer provider if tracing is enabled, or nil,
+// and a function that shuts it down, flushing pending spans within a
+// shutdownTimeout budget of its own.
+func startTracing(ctx context.Context, enabled bool, logger *slog.Logger) (trace.TracerProvider, func() error, error) {
+	if !enabled {
+		return nil, func() error { return nil }, nil
+	}
+	tp, err := newTracerProvider(ctx, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tp, func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := tp.Shutdown(ctx); err != nil {
+			return fmt.Errorf("tracing shutdown: %w", err)
+		}
+		return nil
+	}, nil
 }

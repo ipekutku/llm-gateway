@@ -12,6 +12,7 @@ import (
 
 	"github.com/ipekutku/llm-gateway/internal/llm"
 	"github.com/ipekutku/llm-gateway/internal/usage"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type fakeStartupStore struct {
@@ -30,7 +31,9 @@ func runWithFakeDatabase(ctx context.Context, vars map[string]string, logger *sl
 			return []byte(`{"prices":[]}`), nil
 		}
 		return os.ReadFile(path)
-	}, func(context.Context, string) (accountingStore, error) { return &fakeStartupStore{}, nil }, logger)
+	}, func(context.Context, string, trace.TracerProvider) (accountingStore, error) {
+		return &fakeStartupStore{}, nil
+	}, logger)
 }
 
 func TestAccountingConfigurationIsRequired(t *testing.T) {
@@ -131,11 +134,13 @@ func TestStartupRequiresReachableCurrentDatabase(t *testing.T) {
 	vars := map[string]string{"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey, clientsFileVar: clientsPath, databaseURLVar: testDatabaseURL, pricingFileVar: pricingPath}
 	readFile := files(map[string]string{clientsPath: testClientsFile, pricingPath: `{"prices":[]}`})
 	store := &fakeStartupStore{schemaErr: errors.New("database is not migrated")}
-	err := runWith(t.Context(), env(vars), readFile, func(context.Context, string) (accountingStore, error) { return store, nil }, slog.New(slog.DiscardHandler))
+	err := runWith(t.Context(), env(vars), readFile, func(context.Context, string, trace.TracerProvider) (accountingStore, error) { return store, nil }, slog.New(slog.DiscardHandler))
 	if err == nil || !strings.Contains(err.Error(), "database schema") || !store.closed {
 		t.Errorf("run = %v; store closed = %v", err, store.closed)
 	}
-	err = runWith(t.Context(), env(vars), readFile, func(context.Context, string) (accountingStore, error) { return nil, errors.New("unreachable") }, slog.New(slog.DiscardHandler))
+	err = runWith(t.Context(), env(vars), readFile, func(context.Context, string, trace.TracerProvider) (accountingStore, error) {
+		return nil, errors.New("unreachable")
+	}, slog.New(slog.DiscardHandler))
 	if err == nil || !strings.Contains(err.Error(), "database: unreachable") {
 		t.Errorf("run = %v", err)
 	}

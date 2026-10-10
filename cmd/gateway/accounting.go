@@ -132,15 +132,25 @@ func warnPricingGaps(cfg config, logger *slog.Logger) {
 	}
 }
 
-// migrate needs only database configuration and never calls a provider.
-func migrate(ctx context.Context, getenv func(string) string, logger *slog.Logger) error {
+// migrate needs only database configuration, and the OTLP settings if its
+// spans are to be exported. It never calls a provider.
+func migrate(ctx context.Context, getenv func(string) string, logger *slog.Logger) (result error) {
 	url, err := loadDatabaseURL(getenv)
 	if err != nil {
 		return err
 	}
+	tracing, err := loadTracing(getenv)
+	if err != nil {
+		return err
+	}
+	tp, stopTracing, err := startTracing(ctx, tracing, logger)
+	if err != nil {
+		return err
+	}
+	defer func() { result = errors.Join(result, stopTracing()) }()
 	ctx, cancel := context.WithTimeout(ctx, migrationTimeout)
 	defer cancel()
-	store, err := postgres.Open(ctx, url)
+	store, err := postgres.Open(ctx, url, tp)
 	if err != nil {
 		return err
 	}
