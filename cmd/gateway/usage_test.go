@@ -59,7 +59,7 @@ func usageGateway(t *testing.T, oa, an *upstream, edit func(*config)) (*httptest
 		t.Fatal(err)
 	}
 	capture := &usageCapture{records: make(chan usage.Record, 100), accept: true, metrics: m}
-	h, err := newHandler(cfg, nil, capture, m, slog.New(slog.DiscardHandler))
+	h, err := newHandler(cfg, nil, capture, m, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestDatabaseWriteFailureDoesNotFailCompletion(t *testing.T) {
 	})
 	oa := newUpstream(t, "/v1/chat/completions", reply(200, openaiReply))
 	an := newUpstream(t, "/v1/messages", reply(200, anthropicReply))
-	h, err := newHandler(gatewayConfig(oa, an), nil, recorder, nil, logger)
+	h, err := newHandler(gatewayConfig(oa, an), nil, recorder, nil, nil, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +337,7 @@ func TestHTTPShutdownRecordsCanceledRequestsBeforeDraining(t *testing.T) {
 			slow := newBlockingHandler(t, "")
 			oa := newUpstream(t, "/v1/chat/completions", slow.ServeHTTP)
 			an := newUpstream(t, "/v1/messages", reply(200, anthropicReply))
-			h, err := newHandler(gatewayConfig(oa, an), nil, recorder, nil, logger)
+			h, err := newHandler(gatewayConfig(oa, an), nil, recorder, nil, nil, logger)
 			if err != nil {
 				t.Fatal(err)
 			}

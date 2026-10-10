@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Route is the configuration for one model.
@@ -96,7 +98,8 @@ func New(routes map[string]Route, log *slog.Logger) (*Router, error) {
 // no retry or fallback loop. If the fallback also fails, its error is
 // returned, annotated with the primary failure's message; only the fallback
 // error is wrapped, so the response reflects the last provider tried. A
-// fallback is recorded in the llm.Stats carried by ctx, if any.
+// fallback is recorded in the llm.Stats carried by ctx, if any, and as a
+// "fallback" event on the trace span in ctx, if any.
 func (r *Router) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatResponse, error) {
 	route, ok := r.routes[req.Model]
 	if !ok {
@@ -123,6 +126,11 @@ func (r *Router) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespons
 	)
 
 	llm.StatsFrom(ctx).SetFallback()
+	event := []attribute.KeyValue{attribute.String("gateway.fallback.model", f.Model)}
+	if pe, ok := errors.AsType[*llm.ProviderError](primaryErr); ok {
+		event = append(event, attribute.String("gateway.fallback.from_provider", pe.Provider))
+	}
+	trace.SpanFromContext(ctx).AddEvent("fallback", trace.WithAttributes(event...))
 	if f.OnFallback != nil {
 		f.OnFallback()
 	}

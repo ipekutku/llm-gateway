@@ -62,7 +62,7 @@ func TestRequestPathLogsCarryRequestContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newLogger() error = %v", err)
 	}
-	h, err := newHandler(cfg, nil, discardRecorder{}, nil, logger)
+	h, err := newHandler(cfg, nil, discardRecorder{}, nil, nil, logger)
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -105,7 +105,7 @@ func loggedGateway(t *testing.T, oa, an *upstream, edit func(*config)) (*httptes
 	if err != nil {
 		t.Fatalf("newLogger() error = %v", err)
 	}
-	h, err := newHandler(cfg, nil, discardRecorder{}, nil, logger)
+	h, err := newHandler(cfg, nil, discardRecorder{}, nil, nil, logger)
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}

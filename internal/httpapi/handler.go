@@ -20,6 +20,8 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/llm"
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/usage"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ChatCompletionsPath is the path of the chat completions endpoint.
@@ -110,6 +112,9 @@ type Accounting struct {
 //
 // metrics observes every request to the endpoint, rejections included. A
 // nil metrics observes nothing.
+//
+// If the request context carries a trace span, such as the server span of
+// tracing.Handler, the request ID, client ID, and outcome are added to it.
 func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *ratelimit.Limiter, upstreamTimeout time.Duration, accounting Accounting, metrics Metrics, log *slog.Logger) (http.Handler, error) {
 	switch {
 	case provider == nil:
@@ -156,6 +161,7 @@ func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *rate
 		w.Header().Set(RequestIDHeader, id)
 		ctx := context.WithValue(r.Context(), requestIDKey{}, id)
 		ctx = context.WithValue(ctx, receivedAtKey{}, received)
+		trace.SpanFromContext(ctx).SetAttributes(attribute.String("gateway.request_id", id))
 		mux.ServeHTTP(w, r.WithContext(ctx))
 	}), nil
 }
@@ -166,6 +172,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r = r.WithContext(auth.NewContext(r.Context(), id))
+	trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("gateway.client_id", id.ClientID))
 
 	release, ok := h.acquire(w, r, id)
 	if !ok {
@@ -273,6 +280,11 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 		}
 		record.Duration = time.Since(received)
 		h.logOutcome(r.Context(), record, chatErr, stats)
+		annotateSpan(r.Context(), record.ErrorCode,
+			attribute.String("gen_ai.request.model", record.RequestedModel),
+			attribute.Int("gateway.retry_count", stats.Retries()),
+			attribute.Bool("gateway.fallback", stats.Fallback()),
+		)
 		h.metrics.ObserveRequest(record.RequestedModel, record.Status, record.ErrorCode, record.Duration)
 		// The recorder drops invalid records, such as inconsistent token
 		// counts; metrics skip them too, so both agree.
@@ -353,6 +365,7 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err e
 		attrs = append(attrs, slog.Any("error", err))
 	}
 	h.log.LogAttrs(r.Context(), statusLevel(e.status), "chat completion failed", attrs...)
+	annotateSpan(r.Context(), e.code)
 	_ = writeError(w, e)
 	received, _ := r.Context().Value(receivedAtKey{}).(time.Time)
 	h.metrics.ObserveRequest("", e.status, e.code, time.Since(received))
@@ -388,6 +401,16 @@ func (h *handler) logOutcome(ctx context.Context, record usage.Record, err error
 		level = slog.LevelInfo
 	}
 	h.log.LogAttrs(ctx, level, "request completed", attrs...)
+}
+
+// annotateSpan adds a request's outcome to the span in ctx, the server span
+// when tracing is enabled: its error code as error.type, if any, and attrs.
+// Like logs, spans contain no credentials or content.
+func annotateSpan(ctx context.Context, code string, attrs ...attribute.KeyValue) {
+	if code != "" {
+		attrs = append(attrs, attribute.String("error.type", code))
+	}
+	trace.SpanFromContext(ctx).SetAttributes(attrs...)
 }
 
 // statusLevel is the log level for a response status: error for 5xx, warn

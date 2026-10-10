@@ -11,6 +11,7 @@ import (
 
 	"github.com/ipekutku/llm-gateway/internal/llm"
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // jsonLines parses logs as one JSON object per line.
@@ -191,5 +192,28 @@ func TestOutcomeLogNotWrittenForRejectedRequests(t *testing.T) {
 
 	if strings.Contains(logs.String(), "request completed") || !strings.Contains(logs.String(), "chat completion failed") {
 		t.Errorf("a validation failure must log only its rejection:\n%s", logs)
+	}
+}
+
+func TestLogHandlerAddsTraceID(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(NewLogHandler(slog.NewJSONHandler(&logs, nil)))
+	traceID := trace.TraceID{0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36}
+	ctx := trace.ContextWithSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: traceID, SpanID: trace.SpanID{1}, TraceFlags: trace.FlagsSampled,
+	}))
+
+	logger.InfoContext(ctx, "traced")
+	logger.InfoContext(context.Background(), "untraced")
+
+	lines := jsonLines(t, &logs)
+	if len(lines) != 2 {
+		t.Fatalf("got %d log lines, want 2", len(lines))
+	}
+	if lines[0]["trace_id"] != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Errorf("traced line trace_id = %v", lines[0]["trace_id"])
+	}
+	if _, ok := lines[1]["trace_id"]; ok {
+		t.Errorf("untraced line has a trace_id: %v", lines[1])
 	}
 }

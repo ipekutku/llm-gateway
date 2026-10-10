@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -90,6 +91,9 @@ type config struct {
 	Clients []auth.Client
 	// RateLimits holds the limits of every client in Clients, by ID.
 	RateLimits map[string]ratelimit.Limits
+	// Tracing is true when an OTLP endpoint is configured. The exporter
+	// reads its settings from the OTEL_* variables itself.
+	Tracing bool
 }
 
 // providerConfig enables one provider for exactly one model.
@@ -151,6 +155,9 @@ func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error
 		errs = append(errs, err)
 	}
 	if cfg.Clients, cfg.RateLimits, err = loadClients(getenv, readFile); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.Tracing, err = loadTracing(getenv); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -313,6 +320,44 @@ func loadClients(getenv func(string) string, readFile func(string) ([]byte, erro
 		return nil, nil, fmt.Errorf("%s: %w", clientsFileVar, err)
 	}
 	return clients, limits, nil
+}
+
+// Standard OpenTelemetry variables read by the gateway. The OTLP exporter
+// reads these and the other OTEL_EXPORTER_OTLP_* variables itself.
+const (
+	otlpEndpointVar       = "OTEL_EXPORTER_OTLP_ENDPOINT"
+	otlpTracesEndpointVar = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+	otlpProtocolVar       = "OTEL_EXPORTER_OTLP_PROTOCOL"
+	otlpTracesProtocolVar = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"
+)
+
+// loadTracing reports whether tracing is enabled: whether either OTLP
+// endpoint variable is set. The exporter ignores an endpoint it cannot
+// parse and sends to its default, so the endpoints are checked here, and
+// so is the protocol, since only OTLP over HTTP is supported. Errors never
+// include the values: an endpoint may contain credentials.
+func loadTracing(getenv func(string) string) (bool, error) {
+	var errs []error
+	enabled := false
+	for _, name := range []string{otlpEndpointVar, otlpTracesEndpointVar} {
+		v := strings.TrimSpace(getenv(name))
+		if v == "" {
+			continue
+		}
+		enabled = true
+		if u, err := url.Parse(v); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("%s must be an http or https URL", name))
+		}
+	}
+	for _, name := range []string{otlpProtocolVar, otlpTracesProtocolVar} {
+		if v := strings.TrimSpace(getenv(name)); v != "" && v != "http/protobuf" {
+			errs = append(errs, fmt.Errorf("%s must be http/protobuf, the only OTLP protocol the gateway supports", name))
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return false, err
+	}
+	return enabled, nil
 }
 
 // loadDuration parses a positive Go duration such as "90s", returning def
