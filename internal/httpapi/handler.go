@@ -59,7 +59,9 @@ type Accounting struct {
 
 // New returns the gateway's HTTP handler. It serves POST
 // /v1/chat/completions and sends every request to provider, which is
-// normally the router. A nil log uses slog.Default.
+// normally the router. A nil log uses slog.Default. Unless its handler
+// comes from NewLogHandler, log is wrapped with one, so the handler's own
+// logs always carry the request and client IDs.
 //
 // Every request must carry a gateway API key accepted by authenticator, as
 // "Authorization: Bearer <key>", and is then subject to the client's limits
@@ -99,6 +101,9 @@ func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *rate
 	}
 	if log == nil {
 		log = slog.Default()
+	}
+	if _, ok := log.Handler().(logHandler); !ok {
+		log = slog.New(NewLogHandler(log.Handler()))
 	}
 	models := make(map[string]string, len(accounting.Models))
 	for provider, model := range accounting.Models {
@@ -252,8 +257,6 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 			record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
 			// The client is gone; there is nobody to write a response to.
 			h.log.LogAttrs(r.Context(), slog.LevelInfo, "client canceled request",
-				requestIDAttr(r),
-				clientAttr(r),
 				slog.String("model", req.Model),
 				slog.Any("error", err),
 			)
@@ -277,7 +280,7 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 	if costErr == nil {
 		record.Cost = &cost
 	} else if !errors.Is(costErr, usage.ErrNoPrice) {
-		h.log.Warn("usage cost could not be estimated", requestIDAttr(r), slog.Any("error", costErr))
+		h.log.LogAttrs(r.Context(), slog.LevelWarn, "usage cost could not be estimated", slog.Any("error", costErr))
 	}
 	err = writeJSON(w, http.StatusOK, chatResponse{
 		ID:      "chatcmpl-" + requestID(r),
@@ -305,11 +308,10 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 
 // fail logs a failed request once and writes the error envelope. Logs
 // contain no credentials, prompt or completion content, or raw upstream
-// bodies; err must follow the same rule, as llm.ProviderError does.
+// bodies; err must follow the same rule, as llm.ProviderError does. The
+// request and client IDs come from the context through logHandler.
 func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err error, attrs ...slog.Attr) error {
 	attrs = append(attrs,
-		requestIDAttr(r),
-		clientAttr(r),
 		slog.Int("status", e.status),
 		slog.String("code", e.code),
 	)
@@ -343,20 +345,6 @@ type receivedAtKey struct{}
 func requestID(r *http.Request) string {
 	id, _ := r.Context().Value(requestIDKey{}).(string)
 	return id
-}
-
-func requestIDAttr(r *http.Request) slog.Attr {
-	return slog.String("request_id", requestID(r))
-}
-
-// clientAttr is the authenticated client's ID for logs. Before
-// authentication it is the empty Attr, which slog omits.
-func clientAttr(r *http.Request) slog.Attr {
-	id, ok := auth.FromContext(r.Context())
-	if !ok {
-		return slog.Attr{}
-	}
-	return slog.String("client_id", id.ClientID)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) error {
