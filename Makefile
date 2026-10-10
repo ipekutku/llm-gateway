@@ -25,10 +25,10 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test build vuln smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check build vuln smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
-check: fmt vet test build vuln
+check: fmt vet test bench-check build vuln
 
 ## fmt: fail if any Go file is not gofmt-formatted
 fmt:
@@ -48,6 +48,15 @@ vet:
 ## and the Redis ones only when GATEWAY_TEST_REDIS_URL is set (see redis).
 test:
 	go test -race -timeout 2m ./...
+
+## bench: measure request-path components locally, with allocation counts.
+## The shared limiter benchmark needs GATEWAY_TEST_REDIS_URL (see redis).
+bench:
+	go test -run '^$$' -bench . -benchmem ./...
+
+## bench-check: run each benchmark once for correctness, without timing gates.
+bench-check:
+	go test -run '^$$' -bench . -benchtime=1x ./...
 
 ## build: build the gateway without leaving a binary behind
 build:
