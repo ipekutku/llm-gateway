@@ -38,7 +38,7 @@ func TestLogHandlerAddsIDsToEveryRequestLog(t *testing.T) {
 		return llm.ChatResponse{}, &llm.ProviderError{Provider: "openai", StatusCode: http.StatusServiceUnavailable}
 	})
 	limiter := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
-	h, err := New(p, testAuthenticator(t), limiter, testTimeout, testAccounting(), logger)
+	h, err := New(p, testAuthenticator(t), limiter, testTimeout, testAccounting(), nil, logger)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -107,7 +107,7 @@ func newJSONHandler(t *testing.T, p llm.Provider) (http.Handler, *bytes.Buffer) 
 	t.Helper()
 	var logs bytes.Buffer
 	limiter := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
-	h, err := New(p, testAuthenticator(t), limiter, testTimeout, testAccounting(), slog.New(slog.NewJSONHandler(&logs, nil)))
+	h, err := New(p, testAuthenticator(t), limiter, testTimeout, testAccounting(), nil, slog.New(slog.NewJSONHandler(&logs, nil)))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

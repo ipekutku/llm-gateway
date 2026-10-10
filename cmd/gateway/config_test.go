@@ -93,6 +93,9 @@ func TestLoadConfig(t *testing.T) {
 		c.Retry = defaultRetry
 		c.Breaker = breaker.Settings{Failures: defaultBreakerFailures, Cooldown: defaultBreakerCooldown}
 		c.Clients, c.RateLimits = testClients, testRateLimits
+		if c.MetricsAddr == "" {
+			c.MetricsAddr = defaultMetricsAddr
+		}
 		return c
 	}
 
@@ -112,20 +115,20 @@ func TestLoadConfig(t *testing.T) {
 			want: withDefaults(config{Addr: defaultAddr, Anthropic: anthropicCfg}),
 		},
 		{
-			name: "both providers and custom address",
+			name: "both providers and custom addresses",
 			vars: map[string]string{
 				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
 				"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey,
-				"GATEWAY_ADDR": ":9090",
+				"GATEWAY_ADDR": ":9090", "GATEWAY_METRICS_ADDR": "127.0.0.1:9191",
 			},
-			want: withDefaults(config{Addr: ":9090", OpenAI: openaiCfg, Anthropic: anthropicCfg}),
+			want: withDefaults(config{Addr: ":9090", MetricsAddr: "127.0.0.1:9191", OpenAI: openaiCfg, Anthropic: anthropicCfg}),
 		},
 		{
 			name: "blank variables count as absent",
 			vars: map[string]string{
 				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
 				"ANTHROPIC_MODEL": " ", "ANTHROPIC_API_KEY": "",
-				"GATEWAY_ADDR": "  ",
+				"GATEWAY_ADDR": "  ", "GATEWAY_METRICS_ADDR": " ",
 			},
 			want: withDefaults(config{Addr: defaultAddr, OpenAI: openaiCfg}),
 		},
@@ -142,7 +145,7 @@ func TestLoadConfig(t *testing.T) {
 			},
 			want: config{
 				DatabaseURL: testDatabaseURL, Pricing: testPricing,
-				Addr: defaultAddr, OpenAI: openaiCfg,
+				Addr: defaultAddr, MetricsAddr: defaultMetricsAddr, OpenAI: openaiCfg,
 				UpstreamTimeout: 45 * time.Second, ConnectTimeout: 1500 * time.Millisecond,
 				ProviderTimeout: 22500 * time.Millisecond, // half the upstream timeout
 				Retry:           defaultRetry,

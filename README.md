@@ -31,38 +31,54 @@ The long-term goal is to build infrastructure similar to an internal AI platform
 
 The project is intentionally developed **incrementally**. Each milestone should leave the repository in a working and testable state rather than introducing the entire platform at once.
 
-## Current Milestone
+## Project Status
+
+v0.1 through v0.5 are complete; v0.6 observability is in progress. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+
+```text
+v0.1  Provider abstraction + routing          ✅
+v0.2  Timeouts + retries                      ✅
+v0.3  Provider fallback + circuit breakers    ✅
+v0.4  Authentication + rate limiting          ✅
+v0.5  Usage + cost tracking + PostgreSQL      ✅
+v0.6  Prometheus + OpenTelemetry              in progress
+v0.7  Redis + multi-instance behavior
+v0.8  Load testing + performance work
+v0.9  Docker + Kubernetes + Helm
+v1.0  AWS deployment with Terraform
+```
+
+### v0.6 — Observability (in progress)
+
+Implemented so far (see [Logs and metrics](#logs-and-metrics)):
+
+* structured logs as text or JSON; every line logged while handling a request carries its request ID and, once authenticated, its client ID, including retry, fallback, and circuit breaker lines
+* one outcome line per validated request with status, provider, latency, retry count, and whether a fallback ran
+* Prometheus metrics on a separate, unauthenticated listener: request counts by model, status, and error code, and request latency by model, with model labels limited to the configured models
+
+Still to come: provider, retry, fallback, and circuit breaker metrics; token and estimated cost metrics; OpenTelemetry tracing; a local Prometheus, Grafana, and tracing stack with dashboards.
 
 ### v0.5 — Usage and Cost Accounting ✅
 
-Milestone 5 is feature-complete. It adds per-client usage records and estimated costs, persisted in PostgreSQL. The following components are implemented and tested:
+Per-client usage records and estimated costs, persisted in PostgreSQL:
 
 * token usage keeps the prompt-cache detail providers price differently: cached input read (OpenAI and Anthropic) and written (Anthropic), as part of the input count
 * the provider that answered is known for every response, including one served by a fallback
-* every request gets a gateway-assigned ID, returned in the `X-Request-ID` header and logged with failures
+* every request gets a gateway-assigned ID, returned in the `X-Request-ID` header
 * cost estimation from per-model prices for input, cached input read and written, and output tokens, with exact integer arithmetic; a model without a price has an unknown cost, never zero
 * a PostgreSQL connection pool and usage store, with embedded forward-only migrations protected by an advisory lock, exact cost storage, and integration tests against disposable databases
-* an asynchronous recorder with a bounded queue, batch writes, write timeouts, and shutdown draining; queue overflow is logged as a periodic count and failed writes are logged, and accepted records survive request cancellation
-* required database and pricing-file configuration, an explicit migration command, startup schema checks, and one usage record for each validated request, including failures and cancellations
-* documented SQL reports for usage and estimated cost per client, answering model, and UTC day, with coverage counts for unknown usage and cost
-
-Usage accounting is connected to the request path and verified with fake upstreams and PostgreSQL. See [Querying usage and estimated cost](docs/usage.md) for reports and request lookups. Costs are estimates, and asynchronous recording can lose records during overload, database failures, or shutdown deadlines. v0.6 observability is next; metrics, tracing, and dashboards are not implemented yet.
-
-See [Project Status](#project-status) for component status, [Development](#development) for the database test workflow, and [docs/ROADMAP.md](docs/ROADMAP.md#milestone-5--usage-and-cost-accounting) for milestone scope and exit criteria.
+* an asynchronous recorder with a bounded queue, batch writes, write timeouts, and shutdown draining; queue overflow is logged as a periodic count, failed writes are logged, and accepted records survive request cancellation
+* an explicit migration command, startup schema checks, and one usage record for each validated request, including failures and cancellations
+* documented SQL reports for usage and estimated cost per client, answering model, and UTC day; see [Querying usage and estimated cost](docs/usage.md)
 
 ### v0.4 — Authentication and Rate Limiting ✅
-
-The fourth milestone turned the gateway from an anonymous proxy into a multi-client service:
 
 * every request needs a gateway-issued API key, sent as `Authorization: Bearer <key>`; anonymous requests get `401`
 * gateway keys are separate from the provider keys, which stay server-side and never reach clients
 * only SHA-256 hashes of keys are stored, in a clients file; keys can be disabled
-* a client identity attached to every request and to its failure logs
 * per-client rate limits: requests per minute with bursts, and concurrent requests, answered with `429` and `Retry-After`
 
 ### v0.3 — Provider Failover and Circuit Breaking ✅
-
-The third milestone let requests survive the degradation of one provider:
 
 * fallback pairs: a configured model can fall back to the other provider's configured model, tried once and never back again
 * fallback on provider failures (timeouts, unavailability, rate limiting, server errors), not on rejected requests or client cancellations
@@ -70,32 +86,21 @@ The third milestone let requests survive the degradation of one provider:
 * a circuit breaker per provider: after repeated failures the provider is skipped for a cooldown, then probed with a single request
 * no retry/fallback loops: retries stay inside each provider, and fallback runs at most once per request
 
-Requests may be answered by a different model than requested; the response's `model` field always names the model that answered.
-
 ### v0.2 — Timeouts and Retry Policy ✅
 
-The second milestone made calls to unreliable upstream providers safer:
-
-* explicit, configurable upstream timeouts: one time budget per request, plus connection-setup limits
-* bounded retries for transient failures: `429`, `502`, `503`, `504`, Anthropic's `529`, and failures to connect (`502` and `504` can come from a provider's proxy after the request reached the model, a small duplicate-generation risk)
+* one upstream time budget per request, plus connection-setup limits
+* bounded retries for transient failures: `429`, `502`, `503`, `504`, Anthropic's `529`, and failures to connect
 * exponential backoff with jitter, honoring the provider's `Retry-After` header
-* no retries of timeouts or failures after the request was sent, because a chat completion is not idempotent and a retry could produce a second, separately billed generation
+* no retries of timeouts or failures after the request was sent, because a chat completion is not idempotent
 * cancellation stops retries immediately; all attempts share the request's time budget
 
 ### v0.1 — Provider Abstraction and Routing ✅
 
-The first milestone focused only on the core gateway architecture:
-
-* Go HTTP service
-* OpenAI-compatible `/v1/chat/completions` endpoint
-* vendor-neutral request and response models
-* interchangeable LLM provider interface
-* two provider implementations
-* static model-to-provider routing
-* automated tests
-* continuous integration
-
-Retries, failover, and authentication were added in subsequent milestones. Observability and deployment infrastructure remain later roadmap work.
+* Go HTTP service with an OpenAI-compatible subset of `/v1/chat/completions`
+* vendor-neutral request and response types behind a small provider interface
+* OpenAI and Anthropic adapters
+* static, exact-match model-to-provider routing
+* automated tests and continuous integration
 
 ## Engineering Principles
 
@@ -160,7 +165,7 @@ export ANTHROPIC_API_KEY=sk-ant-...     # your Anthropic key
 go run ./cmd/gateway
 ```
 
-The gateway listens on `127.0.0.1:8080` and logs the configured models and the number of clients. Stop it with `Ctrl+C` or `SIGTERM`; in-flight requests get up to 5 seconds to finish, then pending handlers and usage writes share an additional 5-second drain budget.
+The gateway listens on `127.0.0.1:8080`, serves Prometheus metrics on `http://127.0.0.1:9464/metrics`, and logs the configured models and the number of clients. Stop it with `Ctrl+C` or `SIGTERM`; in-flight requests get up to 5 seconds to finish, then pending handlers and usage writes share an additional 5-second drain budget.
 
 Send a request to either model:
 
@@ -199,7 +204,8 @@ The `model` field must match a configured model exactly; the request is routed t
 | `OPENAI_MODEL`, `OPENAI_API_KEY` | Enable OpenAI for one model. Set both or neither. |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Enable Anthropic for one model. Set both or neither. |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
-| `GATEWAY_LOG_FORMAT` | Log format on standard error: `text` (default) or `json`, one JSON object per line. Lines logged while handling a request carry its `request_id` and, once authenticated, its `client_id`. Each request that passes validation ends with one `request completed` line giving its status, provider, latency, `retry_count`, and whether a `fallback` ran; prompts and completions are never logged. |
+| `GATEWAY_METRICS_ADDR` | Listen address of the unauthenticated Prometheus endpoint, `/metrics`. Default `127.0.0.1:9464`. Must differ from `GATEWAY_ADDR`. See [Logs and metrics](#logs-and-metrics). |
+| `GATEWAY_LOG_FORMAT` | `text` (default) or `json`, written to standard error. See [Logs and metrics](#logs-and-metrics). |
 | `GATEWAY_UPSTREAM_TIMEOUT` | Time limit for all upstream work on one request, as a Go duration such as `90s` or `2m`. Default `120s`. If it expires, the client gets `504 upstream_timeout`. |
 | `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Time limit for connecting to a provider (TCP dial and TLS handshake). Default `10s`. |
 | `GATEWAY_RETRY_MAX_ATTEMPTS` | Total attempts per request, including the first, from `1` to `10`. Default `3`. Set `1` to disable retries. |
@@ -280,6 +286,46 @@ Live runs have not covered refusals (`content_filter`), Anthropic prompt-cache r
 
 The response contains exactly one choice with `finish_reason` `stop`, `length`, or `content_filter`, plus token usage. Every response, including errors, carries an `X-Request-ID` header; quote it when reporting a problem. A successful response's `id` is `chatcmpl-` followed by the same ID. An `X-Request-ID` sent by the client is ignored. Errors use the envelope `{"error": {"message", "type", "code"}}`; see [docs/architecture.md](docs/architecture.md#error-mapping) for the full status mapping.
 
+### Logs and metrics
+
+Logs go to standard error, as text by default or as one JSON object per line with `GATEWAY_LOG_FORMAT=json`. Every line logged while handling a request carries its `request_id`, the same ID returned in `X-Request-ID`, and, once the client is authenticated, its `client_id`. That includes the intermediate lines for retries, fallbacks, and circuit breaker changes, so all lines of one request can be found by its ID.
+
+Each request that passes validation ends with exactly one `request completed` line:
+
+```json
+{"time":"2026-10-10T14:03:12.418+03:00","level":"INFO","msg":"request completed","model":"gpt-4o","status":200,"provider":"anthropic","latency":2350417000,"retry_count":2,"fallback":true,"request_id":"K5JDK633MTRLLKL7DSKKFGWKRU","client_id":"my-app"}
+```
+
+| Field | Meaning |
+|---|---|
+| `model` | The requested model. With a fallback, `provider` names the provider that actually answered. |
+| `status`, `code` | The HTTP status and gateway error code, the same values as the usage record. `499` with `client_closed` means the client went away. `code` is absent on success. |
+| `provider`, `upstream_status`, `error` | The provider that answered or failed, and the provider's status and error on failure. |
+| `latency` | Time from receiving the request to finishing it; nanoseconds in JSON, a duration such as `2.35s` in text. |
+| `retry_count`, `fallback` | Repeated upstream attempts over all providers tried, and whether a fallback provider was called. |
+
+Successes and cancellations log at `INFO`, `4xx` responses at `WARN`, and `5xx` responses at `ERROR`. A request rejected before reaching a provider (`401`, `429`, or an invalid body) logs one `chat completion failed` line instead. Logs never contain prompts, completions, keys, or upstream response bodies.
+
+Prometheus metrics are served on a separate listener, `GATEWAY_METRICS_ADDR`:
+
+```bash
+curl -s http://127.0.0.1:9464/metrics | grep '^gateway_'
+```
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `gateway_requests_total` | `model`, `status`, `code` | Chat completion requests, including authentication, rate-limit, and validation rejections. `code` is empty on success. |
+| `gateway_request_duration_seconds` | `model` | Histogram of request latency, from 10 ms to 120 s. |
+
+`model` is one of the configured models or `unknown`, so model names sent by clients cannot create new series; requests rejected before their body was read are also `unknown`. Client IDs are never labels; per-client usage is in PostgreSQL. Go runtime (`go_*`) and process (`process_*`) metrics are included. A minimal Prometheus scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: llm-gateway
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
+```
+
 ### Limitations
 
 * One model per provider, matched by exact name; no aliases or wildcards.
@@ -293,6 +339,7 @@ The response contains exactly one choice with `finish_reason` `stop`, `length`, 
 * The gateway serves plain HTTP and listens on loopback by default. Gateway keys would cross the network unencrypted, so expose it beyond the host only behind a proxy that terminates TLS.
 * Rate limits and concurrency counts are kept per gateway process; several instances do not share them (planned for v0.7).
 * Clients are read from a file at startup; changing them requires a restart. Each client has one key, so rotating a key briefly means replacing it.
+* `/metrics` has no authentication; it reveals request counts per configured model and status, never keys, clients, or content. Keep `GATEWAY_METRICS_ADDR` on loopback or a network only Prometheus can reach.
 * Every rejected key logs one warning, and there is no per-IP limit on unauthenticated requests; anyone who can reach the port can fill the logs. Another reason to keep the gateway behind a proxy.
 * A request body must arrive within 30 seconds (otherwise `408`), and idle keep-alive connections close after 2 minutes. Both are fixed.
 * Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
@@ -347,85 +394,6 @@ make smoke
 **This makes real, billed API calls** (a few short completions per provider, typically well under one cent). Configure one or both providers. For each model it checks a normal completion and a `length` stop, both with token usage. It also checks that unknown and missing gateway keys get `401`, and that a client over its limit gets `429` with `Retry-After`. It uses fresh random gateway keys and ignores other `GATEWAY_*` settings in the environment. It prints the model each provider reported and fails on any mismatch. It never runs in CI.
 
 The smoke harness injects a fake recorder and an empty pricing table, so it needs no database or pricing file and does not persist usage.
-
-## Project Status
-
-v0.5 is feature-complete, including usage persistence, cost estimation, migrations, and documented SQL queries. The next roadmap milestone is v0.6 observability; no v0.6 implementation is included yet.
-
-### v0.5
-
-| Component | Status |
-|---|---|
-| Provider and prompt-cache tokens in neutral usage (`internal/llm`, `internal/provider/*`) | ✅ Done |
-| Request IDs (`internal/httpapi`) | ✅ Done |
-| Pricing and cost estimation (`internal/usage`) | ✅ Done |
-| PostgreSQL store and embedded migrations (`internal/postgres`) | ✅ Done |
-| Asynchronous usage recorder (`internal/usage`) | ✅ Done |
-| Usage accounting configuration, migration command, wiring, and end-to-end tests | ✅ Done |
-| Usage queries and documentation | ✅ Done |
-
-The complete request path is tested against fake providers and a fake recorder, with an additional integration test that migrates a disposable PostgreSQL database and persists request records through the background writer. [Documented SQL queries](docs/usage.md) cover reporting without adding an admin API. See the [v0.5 exit criteria](docs/ROADMAP.md#milestone-5--usage-and-cost-accounting) for the milestone close-out.
-
-### v0.4
-
-| Component | Status |
-|---|---|
-| Client API keys and identity (`internal/auth`) | ✅ Done |
-| Per-client rate limiting (`internal/ratelimit`) | ✅ Done |
-| Clients file configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ✅ Done |
-
-### v0.3
-
-| Component | Status |
-|---|---|
-| Circuit breaker per provider (`internal/breaker`) | ✅ Done |
-| Provider fallback and failure classification (`internal/routing`) | ✅ Done |
-| Failover configuration, wiring, end-to-end tests, and error mapping (`cmd/gateway`, `internal/httpapi`) | ✅ Done |
-
-### v0.2
-
-| Component | Status |
-|---|---|
-| Upstream timeouts: request time budget and connection-setup limits (`internal/httpapi`, `cmd/gateway`) | ✅ Done |
-| Retry policy: failure classification, backoff with jitter, `Retry-After` (`internal/retry`) | ✅ Done |
-| Retry configuration, wiring, and end-to-end tests (`cmd/gateway`) | ✅ Done |
-
-### v0.1
-
-| Component | Status |
-|---|---|
-| Vendor-neutral types and provider interface (`internal/llm`) | ✅ Done |
-| Static model routing (`internal/routing`) | ✅ Done |
-| `/v1/chat/completions` handler, validation, and error mapping (`internal/httpapi`) | ✅ Done |
-| OpenAI provider adapter (`internal/provider/openai`) | ✅ Done |
-| Anthropic provider adapter (`internal/provider/anthropic`) | ✅ Done |
-| Configuration, server wiring, and end-to-end tests (`cmd/gateway`) | ✅ Done |
-
-Design decisions are documented in [docs/architecture.md](docs/architecture.md).
-
-## Planned Evolution
-
-```text
-v0.1  Provider abstraction + routing
-  ↓
-v0.2  Timeouts + retries
-  ↓
-v0.3  Provider fallback + circuit breakers
-  ↓
-v0.4  Authentication + rate limiting
-  ↓
-v0.5  Usage + cost tracking + PostgreSQL
-  ↓
-v0.6  Prometheus + OpenTelemetry
-  ↓
-v0.7  Redis + multi-instance behavior
-  ↓
-v0.8  Load testing + performance work
-  ↓
-v0.9  Docker + Kubernetes + Helm
-  ↓
-v1.0  AWS deployment with Terraform
-```
 
 ## AI-Assisted Development
 

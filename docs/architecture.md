@@ -8,6 +8,7 @@ This document describes the implemented gateway through v0.5 usage accounting. T
 HTTP request → httpapi (auth → rate limit) → routing (fallback) → breaker → retry → provider adapter → upstream HTTP request
                   └──────────────────────────── shared internal/llm types ────────────────────────────┘
                   └─ validated request outcome → usage.Recorder → postgres → PostgreSQL
+                  └─ every request outcome → metrics ← GET /metrics on a separate listener
 ```
 
 The handler authenticates the client and applies its rate limits before reading the request body (see [Client authentication](#client-authentication) and [Rate limiting](#rate-limiting)). The incoming request's `context.Context`, carrying the client's identity, request ID, and arrival time, is passed through every step to the outbound upstream request. The handler derives it once, adding the upstream deadline (see [Upstream timeouts](#upstream-timeouts)); upstream work never detaches from it. Usage persistence deliberately has a separate lifetime, described in [Asynchronous usage recording](#asynchronous-usage-recording).
@@ -24,6 +25,7 @@ The handler authenticates the client and applies its rate limits before reading 
 | `internal/ratelimit` | Per-client request rate and concurrency limits. |
 | `internal/usage` | Model prices, cost estimation, the usage record type, and asynchronous recording. |
 | `internal/postgres` | PostgreSQL connection pool, schema migrations, and storage of usage records. |
+| `internal/metrics` | Prometheus collectors in a private registry, bounded label values, and the `/metrics` handler. |
 | `internal/httpapi` | Public wire DTOs, validation, handler, error responses. |
 | `internal/provider/openai` | OpenAI Chat Completions client with private wire types. |
 | `internal/provider/anthropic` | Anthropic Messages client with private wire types. |
@@ -35,6 +37,7 @@ Rules:
 - Provider-specific request and response types are unexported inside their provider package.
 - The HTTP layer never depends on a concrete provider. It depends only on `llm.Provider`.
 - `postgres` depends on `usage`; only `cmd/gateway` constructs and owns the database store. The HTTP handler accepts a small recorder interface and a pricing table, without depending on PostgreSQL.
+- Only `metrics` imports Prometheus. The HTTP handler accepts a one-method `Metrics` interface, and `cmd/gateway` owns the metrics listener.
 - `llm` types carry no JSON tags. Public wire formats live in `httpapi`, and upstream wire formats live in each provider package.
 
 ## Provider contract
@@ -261,6 +264,7 @@ Configuration is read once at startup in `cmd/gateway`: settings from the enviro
 | `GATEWAY_DATABASE_URL` | Required. PostgreSQL connection setting; never logged. Connection and schema checks share a 10-second startup budget. |
 | `GATEWAY_PRICING_FILE` | Required. Path of the JSON pricing file, described below. |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. The gateway serves plain HTTP, so gateway keys would cross the network unencrypted; exposing it beyond the host needs TLS terminated in front of it. |
+| `GATEWAY_METRICS_ADDR` | Listen address of the unauthenticated `/metrics` endpoint. Default `127.0.0.1:9464`. It must differ from `GATEWAY_ADDR`; a conflict fails at listen time. |
 | `GATEWAY_LOG_FORMAT` | `text` (default) or `json`. Read before the rest of the configuration, so configuration errors are logged in the chosen format; any other value fails startup. |
 | `GATEWAY_UPSTREAM_TIMEOUT` | Upstream time budget per request, as a Go duration (`90s`, `2m`). Default `120s`. |
 | `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Limit on the upstream TCP dial and, separately, the TLS handshake. Default `10s`. |
@@ -535,6 +539,23 @@ On upstream success, the record contains the answering provider, reported respon
 - **Context ownership.** The writer uses a context created when the recorder starts, separate from any request context. This intentionally departs from the usual request-cancellation rule: a client disconnecting after upstream work must not cancel a record already accepted by the queue. The separate context is limited for each write and canceled if shutdown's drain deadline expires.
 - **Shutdown.** `Close(ctx)` atomically stops new records, drains the queue, and waits for the writer. If its context expires, it cancels the current insert and returns the context error; queued records may be lost. The store must honor context cancellation for this bound to hold. Repeated and concurrent calls are safe.
 
+## Metrics
+
+`internal/metrics` exposes Prometheus metrics in the text format on `GET /metrics` of a separate listener, `GATEWAY_METRICS_ADDR` (default `127.0.0.1:9464`). The metrics listener serves nothing else, and the API listener does not serve `/metrics`.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `gateway_requests_total` | counter | `model`, `status`, `code` | Requests to the chat completions endpoint, including authentication, rate-limit, and validation rejections. `status` is the HTTP status, or `499` when the client went away; `code` is the gateway error code, empty on success. |
+| `gateway_request_duration_seconds` | histogram | `model` | Time from receiving a request to finishing it, rejections included. Buckets from 10 ms to 120 s. |
+
+Go runtime (`go_*`) and process (`process_*`) metrics are included.
+
+- **Same values as logs and usage.** A validated request is observed in the same deferred step that logs its outcome line and submits its usage record, so its status and code match both. A rejection is observed where its `chat completion failed` line is logged. Requests to other paths or with other methods (404, 405) are not counted.
+- **Bounded labels.** `model` is a configured model name or `unknown`. The requested model is used, so arbitrary names sent by clients, unknown models, and requests rejected before their body was read all become `unknown` and cannot create new series. `status` and `code` come from the gateway's fixed set. Client IDs and request IDs are never labels; per-client usage is in PostgreSQL.
+- **Private registry.** Collectors are registered in a registry owned by `metrics.Metrics`, not the global default, so tests and any library code cannot interfere with each other.
+- **No authentication.** Anyone who can reach the metrics listener can read request counts per model and status, but no keys, client IDs, prompts, or completions. The loopback default keeps it local; expose it only to the scraper.
+- **Dependency.** `github.com/prometheus/client_golang`, the official Prometheus Go client, is the second third-party dependency. Writing the text exposition format, histograms, and runtime metrics by hand would duplicate a maintained, widely used library. It brings `client_model`, `common`, `procfs`, and `protobuf` transitively; `make vuln` covers them.
+
 ## Server lifecycle
 
 - `http.Server` sets `ReadHeaderTimeout` to 5 seconds and `IdleTimeout` to 2 minutes. Without `IdleTimeout`, net/http would fall back to `ReadTimeout`, and with both unset an idle keep-alive connection would never be closed.
@@ -543,6 +564,7 @@ On upstream success, the record contains the answering provider, reported respon
 - `signal.NotifyContext` cancels on `SIGINT` or `SIGTERM`. Shutdown then runs with a fresh 5-second context; the signal context is already canceled.
 - During graceful shutdown the listener closes and in-flight requests finish normally. If they are still running after 5 seconds, the server is closed. That cancels their request contexts, and the cancellation propagates to the upstream calls. The process then exits non-zero.
 - After HTTP shutdown, canceled handlers and the recorder share another 5-second budget. An application-owned handler tracker stops admitting new work and waits for accepted handlers to enqueue their final records before closing the recorder. The queue is then drained or canceled, and the database pool closes afterwards. Accounting cleanup also runs on startup/listen errors after the writer was created.
+- The metrics listener is opened right after the API listener, and both start serving together. Cancellation shuts both down with the same 5-second budget; if either server fails, the other is shut down too. The metrics server has a 5-second read timeout and a 10-second write timeout, since it never waits for an upstream.
 - `http.ErrServerClosed` counts as a normal stop. Configuration, listen, and serve errors are logged and exit with status 1.
 
 These limits govern the server's own lifecycle and are separate from the upstream timeouts. A shutdown can therefore cut off a request that is still within its upstream timeout.
@@ -555,11 +577,12 @@ Automated tests use synthetic credentials, fake upstream HTTP servers, and fake 
 |---|---|
 | `internal/auth` | Key lookup, invalid, empty, and disabled keys, client validation, and concurrent use. |
 | `internal/usage` | Record validation, price parsing (decimal places, bounds, malformed values), costs with and without cache reads and writes, exact picodollar results, inconsistent and overflowing usage, and concurrent use. Recorder tests use a fake store for batching, interval flush, queue overflow with periodic and shutdown drop summaries, failed and timed-out writes, a single retry of a failed batch and none after a timeout, shutdown drain and cancellation, record snapshots, and concurrent Record/Close. |
+| `internal/metrics` | Counter and histogram values per label set, model labels limited to configured names under arbitrary requested names, the text format, and runtime metrics. |
 | `internal/postgres` | Migration file naming; against a real PostgreSQL, each test in its own new database: migrating an empty database, idempotent and concurrent migration, a failing migration leaving no trace, applying only pending migrations, refusing a newer schema; inserting success and failure records with exact costs and NULLs for unknown values, skipping already stored request IDs, rejecting invalid records without writing, all-or-nothing batches, cancellation, and concurrent inserts. Errors never reveal the database password. |
 | `internal/ratelimit` | Burst, refill, and sustained rates with exact `RetryAfter`, concurrency limits and release, independent clients, and concurrent use, against a manual clock. |
 | `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers; in `httpapi` also the `Authorization` header rules, 401 and 429 responses, identity in the provider's context, concurrency slots released on every outcome, `client_id` in logs, a gateway-assigned request ID on every response and in logs, the log handler adding both IDs to records logged with a request's context, and exactly one outcome line per validated request with its status, provider, retry count, and fallback, and none with prompt or completion content. `retry` and `routing` tests check the retry count and fallback recorded in `llm.Stats`. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
-| `cmd/gateway` | Configuration rules, including the log format, clients, required database/pricing settings, strict price parsing, and startup warnings for unpriced models and unused prices. Startup and lifecycle tests inject a fake store. Complete-path tests use the real handler, router, and both adapters with fake upstreams: routing, errors, retries, fallback, circuit breaking, authentication, rate limits, cancellation, deadlines, graceful/forced shutdown, and JSON logs in which every retry and outcome line carries the request and client IDs. One outcome line is logged per request, with the right `retry_count` and `fallback`, for success, upstream failure, retry exhaustion, fallback success, and client cancellation. Accounting tests verify one record per validated outcome, cache-aware and fallback prices, NULL costs for unpriced models, and no writes for pre-validation rejections. A disposable PostgreSQL test verifies unmigrated startup failure, the independent migration command, and actual handler → recorder → database persistence. |
+| `cmd/gateway` | Configuration rules, including the log format, clients, required database/pricing settings, strict price parsing, and startup warnings for unpriced models and unused prices. Startup and lifecycle tests inject a fake store. Complete-path tests use the real handler, router, and both adapters with fake upstreams: routing, errors, retries, fallback, circuit breaking, authentication, rate limits, cancellation, deadlines, graceful/forced shutdown, and JSON logs in which every retry and outcome line carries the request and client IDs. One outcome line is logged per request, with the right `retry_count` and `fallback`, for success, upstream failure, retry exhaustion, fallback success, and client cancellation. Metrics tests count successes, upstream failures, unknown models, and authentication and validation rejections with bounded labels, and check that `/metrics` is served without a key only on the metrics listener, never on the API port. Accounting tests verify one record per validated outcome, cache-aware and fallback prices, NULL costs for unpriced models, and no writes for pre-validation rejections. A disposable PostgreSQL test verifies unmigrated startup failure, the independent migration command, and actual handler → recorder → database persistence. |
 
 Tests coordinate with channels. Timeouts are used only as failure guards. CI runs the Makefile's `fmt`, `vet`, `test`, `build`, and `vuln` targets (`make check` locally), with a PostgreSQL service container for the integration tests. Locally, `make db` starts the same PostgreSQL image in Docker.
 

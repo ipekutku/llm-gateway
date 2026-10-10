@@ -38,7 +38,7 @@ func TestAccountingRetainsUsageWhenClientCannotReceiveSuccess(t *testing.T) {
 			prices, _ := usage.NewPricing(map[usage.Model]usage.Price{{Provider: "provider", Model: "configured"}: {Input: 1_000_000}})
 			var got usage.Record
 			models := map[string]string{"provider": "configured"}
-			h, err := New(p, testAuthenticator(t), testLimiter(t, map[string]ratelimit.Limits{"team-a": generous}), testTimeout, Accounting{Recorder: recordFunc(func(r usage.Record) bool { got = r; return true }), Pricing: prices, Models: models}, slog.New(slog.DiscardHandler))
+			h, err := New(p, testAuthenticator(t), testLimiter(t, map[string]ratelimit.Limits{"team-a": generous}), testTimeout, Accounting{Recorder: recordFunc(func(r usage.Record) bool { got = r; return true }), Pricing: prices, Models: models}, nil, slog.New(slog.DiscardHandler))
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -19,6 +19,7 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/httpapi"
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"github.com/ipekutku/llm-gateway/internal/metrics"
 	"github.com/ipekutku/llm-gateway/internal/postgres"
 	"github.com/ipekutku/llm-gateway/internal/provider/anthropic"
 	"github.com/ipekutku/llm-gateway/internal/provider/openai"
@@ -40,6 +41,9 @@ const (
 	// shutdownTimeout bounds graceful shutdown. In-flight requests still
 	// running afterwards are cut off.
 	shutdownTimeout = 5 * time.Second
+
+	// metricsWriteTimeout bounds writing one metrics response.
+	metricsWriteTimeout = 10 * time.Second
 
 	// idleConnTimeout is how long an unused upstream connection stays in
 	// the pool.
@@ -112,7 +116,11 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 			logger.Info("usage recorder stopped")
 		}
 	}()
-	handler, err := newHandler(cfg, nil, recorder, logger)
+	m, err := metrics.New(configuredModels(cfg))
+	if err != nil {
+		return err
+	}
+	handler, err := newHandler(cfg, nil, recorder, m, logger)
 	if err != nil {
 		return err
 	}
@@ -122,7 +130,12 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	attrs := []any{slog.String("addr", ln.Addr().String())}
+	metricsLn, err := net.Listen("tcp", cfg.MetricsAddr)
+	if err != nil {
+		ln.Close()
+		return fmt.Errorf("metrics listen: %w", err)
+	}
+	attrs := []any{slog.String("addr", ln.Addr().String()), slog.String("metrics_addr", metricsLn.Addr().String())}
 	if p := cfg.OpenAI; p != nil {
 		attrs = append(attrs, slog.String("openai_model", p.Model))
 		if p.FallbackTo != "" {
@@ -156,9 +169,51 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	attrs = append(attrs, slog.Int("clients", len(cfg.Clients)-disabled), slog.Int("disabled_clients", disabled))
 	logger.Info("gateway listening", attrs...)
 
+	// Both servers shut down when ctx is canceled, and either one failing
+	// stops the other.
+	ctx, stopServers := context.WithCancel(ctx)
+	defer stopServers()
+	metricsDone := make(chan error, 1)
+	go func() {
+		err := serve(ctx, newMetricsServer(m.Handler(logger), logger), metricsLn, shutdownTimeout)
+		stopServers()
+		metricsDone <- err
+	}()
 	err = serve(ctx, newServer(active, logger), ln, shutdownTimeout)
-	logger.Info("HTTP server stopped")
+	stopServers()
+	if metricsErr := <-metricsDone; metricsErr != nil {
+		err = errors.Join(err, fmt.Errorf("metrics: %w", metricsErr))
+	}
+	logger.Info("HTTP servers stopped")
 	return err
+}
+
+// configuredModels returns the configured model names, the only model
+// label values of the metrics.
+func configuredModels(cfg config) []string {
+	var models []string
+	for _, p := range []*providerConfig{cfg.OpenAI, cfg.Anthropic} {
+		if p != nil {
+			models = append(models, p.Model)
+		}
+	}
+	return models
+}
+
+// newMetricsServer returns the server for the metrics listener. It serves
+// GET /metrics without authentication, so its address must be reachable
+// only by the metrics scraper.
+func newMetricsServer(metricsHandler http.Handler, logger *slog.Logger) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metricsHandler)
+	return &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readHeaderTimeout,
+		WriteTimeout:      metricsWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
 }
 
 // newServer returns the gateway's HTTP server. Request bodies are bounded
@@ -177,8 +232,8 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 // rate limiter, and HTTP handler for cfg. Each provider client is wrapped
 // with retries and, above them, a circuit breaker; the router's fallback
 // sits above both. A nil httpClient uses a client built by
-// newUpstreamClient.
-func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecorder, logger *slog.Logger) (http.Handler, error) {
+// newUpstreamClient, and a nil m records no metrics.
+func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecorder, m httpapi.Metrics, logger *slog.Logger) (http.Handler, error) {
 	if httpClient == nil {
 		httpClient = newUpstreamClient(cfg)
 	}
@@ -239,7 +294,7 @@ func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecor
 	for name, e := range providers {
 		models[name] = e.cfg.Model
 	}
-	return httpapi.New(router, authenticator, limiter, cfg.UpstreamTimeout, httpapi.Accounting{Recorder: recorder, Pricing: cfg.Pricing, Models: models}, logger)
+	return httpapi.New(router, authenticator, limiter, cfg.UpstreamTimeout, httpapi.Accounting{Recorder: recorder, Pricing: cfg.Pricing, Models: models}, m, logger)
 }
 
 // resilient wraps a provider client with the retry policy and, above it,

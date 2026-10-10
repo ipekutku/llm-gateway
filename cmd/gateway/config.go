@@ -24,6 +24,10 @@ const (
 	// defaultAddr is the listen address when GATEWAY_ADDR is unset.
 	defaultAddr = "127.0.0.1:8080"
 
+	// defaultMetricsAddr is the metrics listen address when
+	// GATEWAY_METRICS_ADDR is unset.
+	defaultMetricsAddr = "127.0.0.1:9464"
+
 	// defaultUpstreamTimeout bounds all upstream work for one request when
 	// GATEWAY_UPSTREAM_TIMEOUT is unset.
 	defaultUpstreamTimeout = 120 * time.Second
@@ -63,7 +67,9 @@ const (
 
 // config is the gateway's startup configuration.
 type config struct {
-	Addr        string
+	Addr string
+	// MetricsAddr is the separate listen address serving /metrics.
+	MetricsAddr string
 	DatabaseURL string
 	Pricing     *usage.Pricing
 	// UpstreamTimeout bounds all upstream work for one request.
@@ -101,9 +107,12 @@ type providerConfig struct {
 // is unset or blank counts as absent. Errors name the offending variables
 // but never include their values.
 func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error)) (config, error) {
-	cfg := config{Addr: defaultAddr}
+	cfg := config{Addr: defaultAddr, MetricsAddr: defaultMetricsAddr}
 	if addr := getenv("GATEWAY_ADDR"); strings.TrimSpace(addr) != "" {
 		cfg.Addr = addr
+	}
+	if addr := getenv("GATEWAY_METRICS_ADDR"); strings.TrimSpace(addr) != "" {
+		cfg.MetricsAddr = addr
 	}
 
 	var errs []error
