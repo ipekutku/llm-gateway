@@ -23,8 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
-    # A disposable PostgreSQL for the integration tests, the same image as
-    # make db. The tests create and drop their own databases in it.
+    # A disposable PostgreSQL and Redis for the integration tests, the same
+    # images as make db and make redis. The PostgreSQL tests create and drop
+    # their own databases; the Redis tests use and delete their own keys.
     services:
       postgres:
         image: postgres:18
@@ -35,6 +36,15 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd "pg_isready -h 127.0.0.1 -U gateway"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+      redis:
+        image: redis:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 2s
           --health-timeout 5s
           --health-retries 15
@@ -59,11 +69,13 @@ jobs:
       - name: Vet
         run: make vet
 
-      # The PostgreSQL tests fail rather than skip in CI if this is missing.
+      # The PostgreSQL and Redis tests fail rather than skip in CI if these
+      # are missing.
       - name: Test
         run: make test
         env:
           GATEWAY_TEST_DATABASE_URL: postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable
+          GATEWAY_TEST_REDIS_URL: redis://localhost:6379/0
 
       - name: Build
         run: make build

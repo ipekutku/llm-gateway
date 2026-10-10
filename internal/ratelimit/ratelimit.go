@@ -4,9 +4,10 @@
 // token bucket, and a cap on concurrent requests. A request that exceeds
 // either is rejected at once; the limiter never queues or waits.
 //
-// State is kept per process for a fixed set of clients known at
-// construction, so memory does not grow with traffic. Several gateway
-// instances each enforce their own limits.
+// A Limiter keeps its state per process for a fixed set of clients known
+// at construction, so memory does not grow with traffic. Several gateway
+// instances each enforce their own limits. A Shared limiter keeps the
+// request rate in Redis instead, so instances share it.
 package ratelimit
 
 import (
@@ -97,27 +98,37 @@ type client struct {
 // New returns a Limiter for the clients in limits, keyed by client ID.
 // Every bucket starts full.
 func New(limits map[string]Limits) (*Limiter, error) {
-	if len(limits) == 0 {
-		return nil, errors.New("ratelimit: no clients")
+	if err := validate(limits); err != nil {
+		return nil, err
 	}
 	l := &Limiter{clients: make(map[string]*client, len(limits)), now: time.Now}
 	for id, lim := range limits {
-		switch {
-		case strings.TrimSpace(id) == "":
-			return nil, errors.New("ratelimit: blank client ID")
-		case !inRange(lim.RequestsPerMinute):
-			return nil, fmt.Errorf("ratelimit: client %s: requests per minute must be from 1 to %d", id, MaxLimit)
-		case !inRange(lim.Burst):
-			return nil, fmt.Errorf("ratelimit: client %s: burst must be from 1 to %d", id, MaxLimit)
-		case !inRange(lim.MaxConcurrent):
-			return nil, fmt.Errorf("ratelimit: client %s: max concurrent must be from 1 to %d", id, MaxLimit)
-		}
 		// Truncated to whole nanoseconds: a rate that does not divide a
 		// minute evenly is exceeded by under 1ns per request.
 		interval := time.Minute / time.Duration(lim.RequestsPerMinute)
 		l.clients[id] = &client{limits: lim, interval: interval, tolerance: time.Duration(lim.Burst-1) * interval}
 	}
 	return l, nil
+}
+
+// validate checks the limits given to New and NewShared.
+func validate(limits map[string]Limits) error {
+	if len(limits) == 0 {
+		return errors.New("ratelimit: no clients")
+	}
+	for id, lim := range limits {
+		switch {
+		case strings.TrimSpace(id) == "":
+			return errors.New("ratelimit: blank client ID")
+		case !inRange(lim.RequestsPerMinute):
+			return fmt.Errorf("ratelimit: client %s: requests per minute must be from 1 to %d", id, MaxLimit)
+		case !inRange(lim.Burst):
+			return fmt.Errorf("ratelimit: client %s: burst must be from 1 to %d", id, MaxLimit)
+		case !inRange(lim.MaxConcurrent):
+			return fmt.Errorf("ratelimit: client %s: max concurrent must be from 1 to %d", id, MaxLimit)
+		}
+	}
+	return nil
 }
 
 // Acquire admits one request for clientID, or rejects it with an *Error if

@@ -23,7 +23,7 @@ The handler authenticates the client and applies its rate limits before reading 
 | `internal/retry` | Bounded retries of transient upstream failures, as an `llm.Provider` that wraps another. |
 | `internal/breaker` | Circuit breaker for one provider, as an `llm.Provider` that wraps another. |
 | `internal/auth` | Gateway client API keys and the request's client identity. |
-| `internal/ratelimit` | Per-client request rate and concurrency limits. |
+| `internal/ratelimit` | Per-client request rate and concurrency limits, in process or, for the request rate, shared through Redis. |
 | `internal/usage` | Model prices, cost estimation, the usage record type, and asynchronous recording. |
 | `internal/postgres` | PostgreSQL connection pool, schema migrations, and storage of usage records. |
 | `internal/metrics` | Prometheus collectors in a private registry, bounded label values, and the `/metrics` handler. |
@@ -41,6 +41,7 @@ Rules:
 - `postgres` depends on `usage`; only `cmd/gateway` constructs and owns the database store. The HTTP handler accepts a small recorder interface and a pricing table, without depending on PostgreSQL.
 - Only `metrics` imports Prometheus. It depends on `llm`, `breaker` (for the state type), and `usage` (for the cost type); none of them depends on it. The HTTP handler accepts a small `Metrics` interface (`ObserveRequest`, `ObserveUsage`); retry, routing, and breaker expose optional callbacks; `cmd/gateway` connects them and owns the metrics listener.
 - Only `cmd/gateway` imports the OpenTelemetry SDK and exporter; it owns the tracer provider and its shutdown. `tracing` creates spans through the OTel API, given a `TracerProvider`, and depends on `llm` and `httpapi` (for the route path). `httpapi`, `retry`, and `routing` import only the OTel API, to annotate the span already in the context (`trace.SpanFromContext`); without tracing that span is a no-op. `postgres` creates its database spans with a `TracerProvider` passed to `Open`, and `usage.Record` carries the request's `trace.SpanContext` for linking. `llm` and the provider adapters do not import OpenTelemetry.
+- Only `ratelimit` imports go-redis. `ratelimit.Shared` accepts a `redis.Scripter`, so its caller creates and owns the Redis client.
 - `llm` types carry no JSON tags. Public wire formats live in `httpapi`, and upstream wire formats live in each provider package.
 
 ## Provider contract
@@ -406,7 +407,7 @@ Decisions:
 
 - **Consecutive failures, not a failure rate.** A count is simple, needs no time window, and is easy to test. A rate over a window can come later if a provider fails intermittently enough to matter.
 - **Stale results are ignored.** Every state change starts a new generation, and a result from a call admitted under an earlier generation is dropped. Otherwise a slow call that started while closed could close the breaker while a half-open probe is still deciding.
-- **State is per process.** Several gateway instances each keep their own breaker; shared state is a Milestone 7 (Redis) concern.
+- **State is per process.** Several gateway instances each keep their own breaker. Sharing it through Redis was considered for v0.7 and deferred; see [Shared limits in Redis](#shared-limits-in-redis).
 - **Transitions are logged**: `circuit opened` at warn (provider, previous state, consecutive failures, cooldown), and `circuit half-open, probing provider` and `circuit closed` at info.
 
 ## Client authentication
@@ -460,9 +461,47 @@ Decisions:
 - **GCRA form of the token bucket.** Instead of a token count, each client stores the time its bucket would be full again. This is equivalent to a token bucket but needs only integer time arithmetic, so refills and `RetryAfter` are exact and tests are deterministic. The one rounding is the time between requests, `1m / RequestsPerMinute`, truncated to whole nanoseconds. When the rate does not divide a minute evenly (for example 7 per minute), the effective rate is higher by less than one nanosecond per request, which is negligible.
 - **Fixed clients, per-client locks.** The set of clients is fixed when the limiter is built, so its memory does not grow with traffic, and each client has its own lock, so clients never wait on each other.
 - **Values from 1 to 1,000,000.** The bound keeps the arithmetic far from overflow. There is no "unlimited" value.
-- **State is per process.** Several gateway instances each enforce their own limits, so a client can use up to N times its limit across N instances. Shared limits are a Milestone 7 (Redis) concern.
+- **State is per process.** Several gateway instances each enforce their own limits, so a client can use up to N times its limit across N instances. Shared limits are being added in Milestone 7; see [Shared limits in Redis](#shared-limits-in-redis).
 - **Retry-After for the request rate.** A `rate_limit_exceeded` response sets `Retry-After` to `RetryAfter` in whole seconds, rounded up and at least 1, so a client that waits that long is admitted. A `concurrency_limit_exceeded` response has no `Retry-After`.
 - **Logged at the handler.** Each rejection is logged once with the client and the limit, like any other failed request; the limiter itself does not log.
+
+### Shared limits in Redis
+
+`ratelimit.Shared` keeps each client's request rate in Redis, so gateway instances using the same Redis and key prefix share one bucket per client. It implements `httpapi.Limiter` like `ratelimit.Limiter`. **It is not wired into the gateway yet**: the gateway still uses the in-process limiter, and `Shared` does not yet enforce `MaxConcurrent` (validated, not applied). Shared concurrency limits, behavior when Redis is unavailable, and configuration follow in later v0.7 changes.
+
+**What Redis is for.** Redis holds only state that must be shared for several instances to behave as one: rate-limit state. It is not a general store.
+
+| Candidate | Decision | Reason |
+|---|---|---|
+| Per-client request rate and concurrency | In Redis | Without it, N instances allow N times each limit. |
+| Circuit breaker state | Per instance | Per-instance breakers cost at most `GATEWAY_BREAKER_FAILURES` failed requests and one probe per instance and cooldown. Sharing state would let a Redis outage affect provider routing and needs cross-instance probe rules. To revisit with v0.8 measurements. |
+| Response caching | Not implemented | No requirement; listed under possible future milestones. |
+| Coordination | Not needed | Migrations already serialize on a PostgreSQL advisory lock. |
+
+**The request rate.** One Lua script applies a request atomically, so concurrent instances cannot both take the last token:
+
+1. It reads the time from Redis `TIME`, in microseconds, so instances whose clocks differ still agree.
+2. It reads the client's theoretical arrival time, the same GCRA state the in-process limiter keeps in memory; a missing key is a full bucket.
+3. If the request is over the rate, it returns the exact wait, and writes nothing, so a rejected request consumes nothing.
+4. Otherwise it moves the arrival time one interval later and stores it with an expiry at the moment the bucket would be full again, so idle and removed clients leave no keys behind.
+
+| Element | Rule |
+|---|---|
+| Key | `<prefix>{<client id>}:rate`, prefix `llm-gateway:ratelimit:` by default. The braces are a Redis Cluster hash tag, so all of a client's keys share a slot and one script can use them. Client IDs contain no braces. |
+| Interval | `1m / RequestsPerMinute`, truncated to whole microseconds, the resolution of `TIME`: a rate that does not divide a minute evenly is exceeded by under 1 µs per request. |
+| Number precision | Lua numbers are doubles, exact for integers up to 2⁵³; Unix time in microseconds is far below that. Values are written with `%.0f`, since Lua's default formatting would store them in exponent notation, rounded to tenths of a second. |
+| Limits | Sent with every call from the instance's own configuration, not stored in Redis. Instances must therefore use the same clients file; otherwise each applies its own limits to the shared state. |
+| Script loading | `EVALSHA`, falling back to `EVAL` when Redis does not have the script cached, for example after a restart. |
+| Timeout | Each call is bounded by `SharedOptions.Timeout` within the request context's deadline. A failure or timeout is an error that is not a `*ratelimit.Error`; it wraps the context error when the context ended first. The Redis client must be created with `ContextTimeoutEnabled` so that deadlines interrupt a blocked network read. |
+| Unknown client | `ErrUnknownClient`, without a Redis call. |
+
+Decisions:
+
+- **A script, not `INCR` with expiry or a transaction.** A fixed-window counter (`INCR` + `EXPIRE`) allows bursts of twice the limit around window edges and would not match the in-process limiter's semantics. `WATCH`/`MULTI` retries under contention. A script runs atomically on the server in one round trip.
+- **Redis time, not instance time.** Passing each instance's clock would let a skewed instance refill buckets early or late for every other instance.
+- **The store is `redis.Scripter`.** `NewShared` accepts the small go-redis interface that runs scripts, so the caller creates and owns the client and its lifecycle.
+- **Dependency.** [go-redis](https://github.com/redis/go-redis) v9 (BSD-2-Clause), the official Redis Go client: connection pooling, `redis://` and `rediss://` URLs, and script caching. A hand-written RESP client would duplicate it; `rueidis` is less widely used. It adds `go.uber.org/atomic`, `zeebo/xxh3`, and `klauspost/cpuid` transitively (`cespare/xxhash` and `x/sys` were already present); `make vuln` covers them. Until the gateway creates a Redis client, the binary grows by under 0.1 MB.
+- **Redis 8 for local and CI tests.** `make redis` and the CI service run the `redis:8` image, as `make db` pins a PostgreSQL major version. The gateway uses only `EVAL`/`EVALSHA`, `GET`, `SET … PX`, and `TIME`, which Redis-compatible servers such as Valkey also support.
 
 ## Cost estimation
 
@@ -668,7 +707,7 @@ These limits govern the server's own lifecycle and are separate from the upstrea
 
 ## Testing
 
-Automated tests use synthetic credentials, fake upstream HTTP servers, and fake recorders/stores, with no paid provider calls. PostgreSQL integration tests also need a disposable PostgreSQL, named by `GATEWAY_TEST_DATABASE_URL`; without it they are skipped, except in CI, where they fail.
+Automated tests use synthetic credentials, fake upstream HTTP servers, and fake recorders/stores, with no paid provider calls. PostgreSQL integration tests also need a disposable PostgreSQL, named by `GATEWAY_TEST_DATABASE_URL`, and Redis integration tests a disposable Redis, named by `GATEWAY_TEST_REDIS_URL`; without them they are skipped, except in CI, where they fail.
 
 | Level | What it proves |
 |---|---|
@@ -677,12 +716,12 @@ Automated tests use synthetic credentials, fake upstream HTTP servers, and fake 
 | `internal/metrics` | Counter and histogram values per label set, model labels limited to configured names under arbitrary requested names, the text format, and runtime metrics; token types with cache tokens kept out of `input`, cost in dollars and none when unknown, attempt outcomes and error statuses through `Instrument`, retry, fallback, and circuit state values, series starting at zero, a nil `Metrics` doing nothing, and every metric queried by the provisioned Grafana dashboard being exported. `breaker`, `retry`, and `routing` tests check that `OnStateChange` reports every transition in order, `OnRetry` runs once per repeated attempt, and `OnFallback` only when falling back. |
 | `internal/tracing` | Against an in-memory span recorder: server span names, kinds, status attributes, and error status only for 5xx; client-chosen paths not used as names; a valid incoming `traceparent` becoming the remote parent and a malformed one starting a new trace; `http.ResponseController` still reaching the connection; the exact attribute sets of route, provider, and attempt spans, so no content is added; `error.type` and error status per failure kind; nesting; and a nil `Tracer` wrapping nothing. `httpapi` tests check `trace_id` in logs. |
 | `internal/postgres` | Migration file naming; against a real PostgreSQL, each test in its own new database: migrating an empty database, idempotent and concurrent migration, a failing migration leaving no trace, applying only pending migrations, refusing a newer schema; inserting success and failure records with exact costs and NULLs for unknown values, skipping already stored request IDs, rejecting invalid records without writing, all-or-nothing batches, cancellation, and concurrent inserts. Errors never reveal the database password. Spans, recorded in memory: one root client span per non-empty batch with its record and inserted-row counts, links only to sampled request spans, the SQLSTATE as `error.type` on failure, no record values or URL; a `migrate` span with the applied count and a child per migration, and error status on the run and the failing migration. |
-| `internal/ratelimit` | Burst, refill, and sustained rates with exact `RetryAfter`, concurrency limits and release, independent clients, and concurrent use, against a manual clock. |
+| `internal/ratelimit` | Burst, refill, and sustained rates with exact `RetryAfter`, concurrency limits and release, independent clients, and concurrent use, against a manual clock. `Shared`, against a real Redis with a key prefix per test that is deleted afterwards: burst then rejection with a `RetryAfter` within one interval, rejections consuming nothing, refill after waiting `RetryAfter`, independent clients, two limiters with their own connections sharing one bucket and admitting exactly the burst under concurrent calls, a separate prefix being separate state, the key's expiry, and the stored time being an exact integer. Without Redis: constructor validation, key names and microsecond intervals, unknown clients without a Redis call, a server that never answers bounded by the timeout with an error that is not a rejection, and a canceled request. |
 | `internal/routing`, `internal/httpapi` | Routing, validation, response translation, and error mapping, using fake providers; in `httpapi` also the `Authorization` header rules, 401 and 429 responses, identity in the provider's context, the limiter receiving the request context with the client and request IDs, a non-limit limiter error answered as 500, concurrency slots released on every outcome, `client_id` in logs, a gateway-assigned request ID on every response and in logs, the log handler adding both IDs to records logged with a request's context, and exactly one outcome line per validated request with its status, provider, retry count, and fallback, and none with prompt or completion content. `retry` and `routing` tests check the retry count and fallback recorded in `llm.Stats`. |
 | `internal/provider/*` | Wire format, headers, status handling, malformed and oversized responses, transport failure, cancellation, and slow upstreams, against fake provider servers. |
 | `cmd/gateway` | Configuration rules, including the log format, clients, required database/pricing settings, strict price parsing, and startup warnings for unpriced models and unused prices. Startup and lifecycle tests inject a fake store. Complete-path tests use the real handler, router, and both adapters with fake upstreams: routing, errors, retries, fallback, circuit breaking, authentication, rate limits, cancellation, deadlines, graceful/forced shutdown, and JSON logs in which every retry and outcome line carries the request and client IDs. One outcome line is logged per request, with the right `retry_count` and `fallback`, for success, upstream failure, retry exhaustion, fallback success, and client cancellation. Metrics tests count successes, upstream failures, unknown models, and authentication and validation rejections with bounded labels, and check that `/metrics` is served without a key only on the metrics listener, never on the API port. Provider metrics match retries that recover, retry exhaustion followed by a fallback, and a circuit that opens and then rejects without an attempt. Token and cost metrics equal the usage record of a direct and a fallback request with cache reads and writes; an unpriced model adds tokens but no cost; failures add neither. Accounting tests verify one record per validated outcome, cache-aware and fallback prices, NULL costs for unpriced models, and no writes for pre-validation rejections. Tracing tests use the real handler, router, and adapters with an in-memory span processor: the span tree for success, retries (one span per attempt, one `retry` event per retry), fallback (a `fallback` event and a span per provider), an unknown model, and a rejection before routing; server, attempt, and retry-event attributes; a client's `traceparent` continuing into the gateway while no upstream request carries trace headers; `trace_id` on every log line; and no prompt, completion, gateway key, provider key, or baggage in any span. A startup test exports to a fake OTLP/HTTP collector and checks that shutdown flushes the spans. Against PostgreSQL, batch insert spans start their own traces and link to the spans of the requests they store, and the `migrate` command exports its migration spans, without the database URL. Configuration tests reject invalid OTLP endpoints and protocols without printing them. A disposable PostgreSQL test verifies unmigrated startup failure, the independent migration command, and actual handler → recorder → database persistence. |
 
-Tests coordinate with channels. Timeouts are used only as failure guards. CI runs the Makefile's `fmt`, `vet`, `test`, `build`, and `vuln` targets (`make check` locally), with a PostgreSQL service container for the integration tests. Locally, `make db` starts the same PostgreSQL image in Docker.
+Tests coordinate with channels. Timeouts are used only as failure guards. CI runs the Makefile's `fmt`, `vet`, `test`, `build`, and `vuln` targets (`make check` locally), with PostgreSQL and Redis service containers for the integration tests. Locally, `make db` and `make redis` start the same images in Docker.
 
 The v0.6 closeout adds `TestObservabilityExcludesSensitiveData`, which checks text/JSON logs, scraped metrics, and in-memory exported spans together using marker prompts, completions, gateway/provider keys, key hashes, upstream response values, and baggage. Positive assertions ensure requests reached the real adapters and all three telemetry outputs were produced. Success, retries, fallback, authentication/validation failures, and malformed upstream responses are covered. Unexpected response roles, content types, and finish reasons are reported with fixed diagnostics instead of echoing upstream strings. Additional regression tests prove that database server errors and collector responses stay out of diagnostics, and that provider redirects cannot send requests to another destination. Existing PostgreSQL tests verify linked batch writes; existing fake OTLP collector tests verify serialized export and shutdown flushing.
 
