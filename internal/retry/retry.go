@@ -34,6 +34,9 @@ type Policy struct {
 	// may ask for in Retry-After. If it asks for longer, retrying stops,
 	// so the caller (a fallback, or the client) is not held waiting.
 	MaxDelay time.Duration
+	// OnRetry, if not nil, is called just before each repeated attempt. It
+	// must be safe for concurrent use.
+	OnRetry func()
 }
 
 // Provider retries a wrapped provider according to a Policy. It is safe
@@ -105,6 +108,9 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespo
 			return llm.ChatResponse{}, fmt.Errorf("%w while waiting to retry: %w", ctxErr, attempts(attempt, err))
 		}
 		llm.StatsFrom(ctx).AddRetry()
+		if p.policy.OnRetry != nil {
+			p.policy.OnRetry()
+		}
 	}
 }
 

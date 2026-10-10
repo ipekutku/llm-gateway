@@ -31,21 +31,28 @@ type Settings struct {
 	// Cooldown is how long the breaker stays open before it lets a probe
 	// through.
 	Cooldown time.Duration
+	// OnStateChange, if not nil, is called with the new state on every
+	// state change. It is called with the breaker's lock held, so calls
+	// arrive in order; it must return quickly and must not call the
+	// Breaker.
+	OnStateChange func(State)
 }
 
-type state int
+// State is a breaker's state. A new Breaker is Closed.
+type State int
 
+// Breaker states.
 const (
-	closed state = iota
-	open
-	halfOpen
+	Closed State = iota
+	Open
+	HalfOpen
 )
 
-func (s state) String() string {
+func (s State) String() string {
 	switch s {
-	case closed:
+	case Closed:
 		return "closed"
-	case open:
+	case Open:
 		return "open"
 	default:
 		return "half-open"
@@ -72,7 +79,7 @@ type Breaker struct {
 	now      func() time.Time // replaced in tests
 
 	mu       sync.Mutex
-	state    state
+	state    State
 	failures int       // consecutive failures while closed
 	openedAt time.Time // when the breaker last opened
 	probing  bool      // a half-open probe is in flight
@@ -121,12 +128,12 @@ func (b *Breaker) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespon
 func (b *Breaker) admit(ctx context.Context) (uint64, error) {
 	b.mu.Lock()
 	var halfOpened bool
-	if b.state == open && b.now().Sub(b.openedAt) >= b.settings.Cooldown {
-		b.setState(halfOpen)
+	if b.state == Open && b.now().Sub(b.openedAt) >= b.settings.Cooldown {
+		b.setState(HalfOpen)
 		halfOpened = true
 	}
-	admitted := b.state == closed || (b.state == halfOpen && !b.probing)
-	if admitted && b.state == halfOpen {
+	admitted := b.state == Closed || (b.state == HalfOpen && !b.probing)
+	if admitted && b.state == HalfOpen {
 		b.probing = true
 	}
 	gen := b.generation
@@ -151,13 +158,13 @@ func (b *Breaker) record(ctx context.Context, gen uint64, o outcome) {
 	from := b.state
 	failures := 1 // consecutive failures, for the log when the breaker opens
 	switch {
-	case b.state == halfOpen && o == ignored:
+	case b.state == HalfOpen && o == ignored:
 		// The probe told us nothing, for example because the client went
 		// away. The next call probes instead.
 		b.probing = false
-	case b.state == halfOpen && o == success:
-		b.setState(closed)
-	case b.state == halfOpen && o == failure:
+	case b.state == HalfOpen && o == success:
+		b.setState(Closed)
+	case b.state == HalfOpen && o == failure:
 		b.trip()
 	case o == success:
 		b.failures = 0
@@ -173,30 +180,33 @@ func (b *Breaker) record(ctx context.Context, gen uint64, o outcome) {
 
 	switch {
 	case from == to:
-	case to == open:
+	case to == Open:
 		b.log.LogAttrs(ctx, slog.LevelWarn, "circuit opened",
 			slog.String("provider", b.name),
 			slog.String("from", from.String()),
 			slog.Int("consecutive_failures", failures),
 			slog.Duration("cooldown", b.settings.Cooldown),
 		)
-	case to == closed:
+	case to == Closed:
 		b.log.LogAttrs(ctx, slog.LevelInfo, "circuit closed", slog.String("provider", b.name))
 	}
 }
 
 // trip opens the breaker. b.mu must be held.
 func (b *Breaker) trip() {
-	b.setState(open)
+	b.setState(Open)
 	b.openedAt = b.now()
 }
 
 // setState moves to s and starts a new generation. b.mu must be held.
-func (b *Breaker) setState(s state) {
+func (b *Breaker) setState(s State) {
 	b.state = s
 	b.failures = 0
 	b.probing = false
 	b.generation++
+	if b.settings.OnStateChange != nil {
+		b.settings.OnStateChange(s)
+	}
 }
 
 // classify maps a call result to its effect on the breaker. Failures are

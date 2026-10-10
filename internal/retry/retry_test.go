@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -487,5 +488,19 @@ func TestChatDoesNotCountRetryCanceledDuringWait(t *testing.T) {
 
 	if stats.Retries() != 0 {
 		t.Errorf("Retries() = %d, want 0: no second attempt was made", stats.Retries())
+	}
+}
+
+func TestChatCallsOnRetryBeforeEachRepeatedAttempt(t *testing.T) {
+	var retries atomic.Int64
+	policy := testPolicy
+	policy.OnRetry = func() { retries.Add(1) }
+	next := &scripted{results: []error{statusErr(http.StatusServiceUnavailable)}}
+	p, _ := newTestProvider(t, next, policy)
+
+	_, _ = p.Chat(context.Background(), testRequest)
+
+	if got := retries.Load(); got != int64(next.Calls()-1) || got != int64(testPolicy.MaxAttempts-1) {
+		t.Errorf("OnRetry called %d times for %d attempts, want %d", got, next.Calls(), testPolicy.MaxAttempts-1)
 	}
 }

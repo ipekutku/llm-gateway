@@ -32,6 +32,9 @@ type Fallback struct {
 	// PrimaryTimeout bounds the route's primary provider, so a primary that
 	// hangs leaves the fallback the rest of the request's time.
 	PrimaryTimeout time.Duration
+	// OnFallback, if not nil, is called just before the fallback provider
+	// is called. It must be safe for concurrent use.
+	OnFallback func()
 }
 
 // Router routes chat requests to providers using a static model table.
@@ -120,6 +123,9 @@ func (r *Router) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespons
 	)
 
 	llm.StatsFrom(ctx).SetFallback()
+	if f.OnFallback != nil {
+		f.OnFallback()
+	}
 	fallbackReq := req
 	fallbackReq.Model = f.Model
 	resp, err := f.Provider.Chat(ctx, fallbackReq)

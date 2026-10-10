@@ -233,7 +233,7 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 // with retries and, above them, a circuit breaker; the router's fallback
 // sits above both. A nil httpClient uses a client built by
 // newUpstreamClient, and a nil m records no metrics.
-func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecorder, m httpapi.Metrics, logger *slog.Logger) (http.Handler, error) {
+func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecorder, m *metrics.Metrics, logger *slog.Logger) (http.Handler, error) {
 	if httpClient == nil {
 		httpClient = newUpstreamClient(cfg)
 	}
@@ -248,7 +248,7 @@ func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecor
 		if err != nil {
 			return nil, err
 		}
-		wrapped, err := resilient(openai.ProviderName, c, cfg, logger)
+		wrapped, err := resilient(openai.ProviderName, c, cfg, m, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -259,7 +259,7 @@ func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecor
 		if err != nil {
 			return nil, err
 		}
-		wrapped, err := resilient(anthropic.ProviderName, c, cfg, logger)
+		wrapped, err := resilient(anthropic.ProviderName, c, cfg, m, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -269,11 +269,15 @@ func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecor
 	// A fallback reuses the other provider's wrapped client, so each
 	// provider has exactly one breaker whichever route reaches it.
 	routes := make(map[string]routing.Route, len(providers))
-	for _, e := range providers {
+	for name, e := range providers {
 		route := routing.Route{Provider: e.provider}
-		if e.cfg.FallbackTo != "" {
-			f := providers[e.cfg.FallbackTo]
-			route.Fallback = &routing.Fallback{Model: f.cfg.Model, Provider: f.provider, PrimaryTimeout: cfg.ProviderTimeout}
+		if to := e.cfg.FallbackTo; to != "" {
+			f := providers[to]
+			m.AddFallbackRoute(name, to)
+			route.Fallback = &routing.Fallback{
+				Model: f.cfg.Model, Provider: f.provider, PrimaryTimeout: cfg.ProviderTimeout,
+				OnFallback: func() { m.ObserveFallback(name, to) },
+			}
 		}
 		routes[e.cfg.Model] = route
 	}
@@ -298,13 +302,18 @@ func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecor
 }
 
 // resilient wraps a provider client with the retry policy and, above it,
-// a circuit breaker, so the breaker sees one outcome per request.
-func resilient(name string, p llm.Provider, cfg config, logger *slog.Logger) (llm.Provider, error) {
-	r, err := retry.New(p, cfg.Retry, logger)
+// a circuit breaker, so the breaker sees one outcome per request. The client
+// itself is instrumented, so m counts every attempt.
+func resilient(name string, p llm.Provider, cfg config, m *metrics.Metrics, logger *slog.Logger) (llm.Provider, error) {
+	policy := cfg.Retry
+	policy.OnRetry = func() { m.ObserveRetry(name) }
+	r, err := retry.New(m.Instrument(name, p), policy, logger)
 	if err != nil {
 		return nil, err
 	}
-	return breaker.New(name, r, cfg.Breaker, logger)
+	settings := cfg.Breaker
+	settings.OnStateChange = func(s breaker.State) { m.SetCircuitState(name, s) }
+	return breaker.New(name, r, settings, logger)
 }
 
 // newUpstreamClient returns the HTTP client shared by all provider
