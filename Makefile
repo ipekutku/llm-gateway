@@ -10,7 +10,15 @@ DB_IMAGE := postgres:18
 DB_PORT ?= 55432
 DB_URL := postgres://gateway:gateway@127.0.0.1:$(DB_PORT)/gateway?sslmode=disable
 
-.PHONY: check fmt vet test build vuln smoke db db-stop
+# Local Prometheus, Grafana, and Jaeger for a gateway running on the host,
+# and the loopback ports they are published on.
+OBSERVABILITY := docker compose -f deploy/observability/compose.yaml
+export PROMETHEUS_PORT ?= 9090
+export GRAFANA_PORT ?= 3000
+export JAEGER_UI_PORT ?= 16686
+export OTLP_HTTP_PORT ?= 4318
+
+.PHONY: check fmt vet test build vuln smoke db db-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test build vuln
@@ -59,3 +67,16 @@ db:
 ## db-stop: stop the local PostgreSQL and delete its data
 db-stop:
 	docker stop $(DB_CONTAINER)
+
+## observability: start Prometheus, Grafana, and Jaeger in Docker for a
+## gateway running on the host (see the README). Not needed by CI.
+observability:
+	$(OBSERVABILITY) up -d --wait
+	@echo "Grafana:    http://127.0.0.1:$(GRAFANA_PORT)"
+	@echo "Prometheus: http://127.0.0.1:$(PROMETHEUS_PORT)"
+	@echo "Jaeger:     http://127.0.0.1:$(JAEGER_UI_PORT)"
+	@echo "export OTEL_EXPORTER_OTLP_ENDPOINT='http://127.0.0.1:$(OTLP_HTTP_PORT)'"
+
+## observability-stop: stop the stack and delete its data
+observability-stop:
+	$(OBSERVABILITY) down -v
