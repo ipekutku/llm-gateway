@@ -13,6 +13,7 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/auth"
 	"github.com/ipekutku/llm-gateway/internal/httpapi"
 	"github.com/ipekutku/llm-gateway/internal/metrics"
+	"github.com/redis/go-redis/v9"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
@@ -26,6 +27,7 @@ func TestObservabilityExcludesSensitiveData(t *testing.T) {
 		key            = "GATEWAY-KEY-MARKER-429f3a"
 		upstreamSecret = "UPSTREAM-BODY-MARKER-157ade"
 		baggage        = "BAGGAGE-MARKER-493fb0"
+		redisSecret    = "REDIS-PASSWORD-MARKER-8e21c4"
 	)
 	oaReply := strings.Replace(openaiReply, "from openai", completion, 1)
 	anReply := strings.Replace(anthropicReply, "from anthropic", completion, 1)
@@ -80,6 +82,10 @@ func TestObservabilityExcludesSensitiveData(t *testing.T) {
 					if tt.fallback {
 						cfg.OpenAI.FallbackTo = "anthropic"
 					}
+					// Shared limits through a Redis that is down and needs a
+					// password: every request goes through the fallback to
+					// local limits, which logs the Redis failure.
+					cfg.Redis = &redis.Options{Addr: "127.0.0.1:1", Password: redisSecret}
 					m, err := metrics.New(configuredModels(cfg))
 					if err != nil {
 						t.Fatal(err)
@@ -92,7 +98,12 @@ func TestObservabilityExcludesSensitiveData(t *testing.T) {
 					exporter := tracetest.NewInMemoryExporter()
 					tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter), sdktrace.WithSampler(sdktrace.AlwaysSample()))
 					t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
-					h, err := newHandler(cfg, nil, discardRecorder{}, m, tp, logger)
+					limiter, closeLimiter, err := newLimiter(t.Context(), cfg, m, logger)
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = closeLimiter() })
+					h, err := newHandlerWithLimiter(cfg, nil, limiter, discardRecorder{}, m, tp, logger)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -134,14 +145,17 @@ func TestObservabilityExcludesSensitiveData(t *testing.T) {
 						t.Fatal(err)
 					}
 					metricText := scrapeMetrics(t, m.Handler(slog.New(slog.DiscardHandler)))
-					if !strings.Contains(metricText, "gateway_requests_total{") {
-						t.Fatal("request metric missing")
+					if !strings.Contains(metricText, "gateway_requests_total{") || !strings.Contains(metricText, "gateway_ratelimit_store_up 0") {
+						t.Fatal("request or rate-limit store metric missing")
+					}
+					if !strings.Contains(logs.String(), "rate limit store unreachable at startup") {
+						t.Fatal("Redis failure not logged")
 					}
 					if id := resp.Header().Get(httpapi.RequestIDHeader); id == "" || !strings.Contains(logs.String(), id) {
 						t.Fatal("request log missing")
 					}
 					for surface, output := range map[string]string{"logs": logs.String(), "metrics": metricText, "exported spans": string(spanJSON)} {
-						for _, secret := range []string{prompt, completion, key, fmt.Sprintf("%x", auth.HashKey(key)), openaiKey, anthropicKey, upstreamSecret, baggage} {
+						for _, secret := range []string{prompt, completion, key, fmt.Sprintf("%x", auth.HashKey(key)), openaiKey, anthropicKey, upstreamSecret, baggage, redisSecret} {
 							if strings.Contains(output, secret) {
 								t.Errorf("%s contains sensitive marker %q", surface, secret)
 							}

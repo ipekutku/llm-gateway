@@ -20,6 +20,7 @@ import (
 
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/usage"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -56,6 +57,10 @@ const picodollarsPerDollar = 1e12
 // seconds. They span quick rejections to the default 120s upstream budget.
 var requestBuckets = []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120}
 
+// storeBuckets are the rate-limit store call duration buckets, in seconds:
+// sub-millisecond answers up to the gateway's 250ms Redis call timeout.
+var storeBuckets = []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25}
+
 // Metrics holds the gateway's collectors. It is safe for concurrent use.
 type Metrics struct {
 	registry *prometheus.Registry
@@ -73,6 +78,12 @@ type Metrics struct {
 
 	tokens *prometheus.CounterVec
 	cost   *prometheus.CounterVec
+
+	// The rate-limit store metrics have no series until AddRateLimitStore,
+	// so a gateway without Redis does not report a store as down.
+	storeUp       *prometheus.GaugeVec
+	storeDuration *prometheus.HistogramVec
+	storeErrors   *prometheus.CounterVec
 }
 
 // New returns Metrics whose model labels are limited to models, the
@@ -123,6 +134,19 @@ func New(models []string) (*Metrics, error) {
 			Name: "gateway_estimated_cost_dollars_total",
 			Help: "Estimated cost in US dollars from the configured prices, as a float; PostgreSQL usage records hold the exact values. Requests with unknown cost are not counted.",
 		}, []string{"provider", "model"}),
+		storeUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gateway_ratelimit_store_up",
+			Help: "1 while rate limits are shared through Redis, 0 while the gateway uses its own local limits because Redis failed. Absent without Redis.",
+		}, nil),
+		storeDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gateway_ratelimit_store_call_duration_seconds",
+			Help:    "Duration of rate-limit calls to Redis by operation (acquire, release), all outcomes.",
+			Buckets: storeBuckets,
+		}, []string{"operation"}),
+		storeErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_ratelimit_store_errors_total",
+			Help: "Failed or timed-out rate-limit calls to Redis by operation (acquire, release).",
+		}, []string{"operation"}),
 	}
 	for _, model := range models {
 		if strings.TrimSpace(model) == "" || model == UnknownModel {
@@ -143,8 +167,48 @@ func New(models []string) (*Metrics, error) {
 		m.circuitState,
 		m.tokens,
 		m.cost,
+		m.storeUp,
+		m.storeDuration,
+		m.storeErrors,
 	)
 	return m, nil
+}
+
+// AddRateLimitStore starts the rate-limit store series: the store state at
+// mode, and the error counts at zero. Call it only when Redis is
+// configured.
+func (m *Metrics) AddRateLimitStore(mode ratelimit.Mode) {
+	if m == nil {
+		return
+	}
+	m.SetRateLimitMode(mode)
+	for _, op := range []string{ratelimit.OpAcquire, ratelimit.OpRelease} {
+		m.storeErrors.WithLabelValues(op)
+	}
+}
+
+// SetRateLimitMode records whether rate limits are shared through Redis.
+func (m *Metrics) SetRateLimitMode(mode ratelimit.Mode) {
+	if m == nil {
+		return
+	}
+	up := 0.0
+	if mode == ratelimit.SharedMode {
+		up = 1
+	}
+	m.storeUp.WithLabelValues().Set(up)
+}
+
+// ObserveRateLimitStoreCall records one call to Redis by operation op,
+// ratelimit.OpAcquire or ratelimit.OpRelease, and whether it failed.
+func (m *Metrics) ObserveRateLimitStoreCall(op string, d time.Duration, err error) {
+	if m == nil {
+		return
+	}
+	m.storeDuration.WithLabelValues(op).Observe(d.Seconds())
+	if err != nil {
+		m.storeErrors.WithLabelValues(op).Inc()
+	}
 }
 
 // ObserveRequest records one finished chat completion request. model is the

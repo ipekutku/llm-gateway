@@ -14,6 +14,7 @@ import (
 
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/usage"
 )
 
@@ -245,4 +246,49 @@ func TestObserveUsage(t *testing.T) {
 			t.Errorf("metrics contain %s", absent)
 		}
 	}
+}
+
+func TestRateLimitStoreMetrics(t *testing.T) {
+	m := newTestMetrics(t)
+	// Without Redis, there is no store to report.
+	for _, name := range []string{"gateway_ratelimit_store_up", "gateway_ratelimit_store_errors_total", "gateway_ratelimit_store_call_duration_seconds_count"} {
+		if lines := seriesLines(scrape(t, m), name); len(lines) != 0 {
+			t.Errorf("%s before AddRateLimitStore: %v", name, lines)
+		}
+	}
+
+	m.AddRateLimitStore(ratelimit.SharedMode)
+	text := scrape(t, m)
+	for _, want := range []string{
+		"gateway_ratelimit_store_up 1",
+		`gateway_ratelimit_store_errors_total{operation="acquire"} 0`,
+		`gateway_ratelimit_store_errors_total{operation="release"} 0`,
+	} {
+		if !strings.Contains(text, want+"\n") {
+			t.Errorf("scrape does not contain %q", want)
+		}
+	}
+
+	m.SetRateLimitMode(ratelimit.LocalMode)
+	m.ObserveRateLimitStoreCall(ratelimit.OpAcquire, 2*time.Millisecond, nil)
+	m.ObserveRateLimitStoreCall(ratelimit.OpAcquire, 250*time.Millisecond, errors.New("timeout"))
+	m.ObserveRateLimitStoreCall(ratelimit.OpRelease, time.Millisecond, nil)
+	text = scrape(t, m)
+	for _, want := range []string{
+		"gateway_ratelimit_store_up 0",
+		`gateway_ratelimit_store_errors_total{operation="acquire"} 1`,
+		`gateway_ratelimit_store_errors_total{operation="release"} 0`,
+		`gateway_ratelimit_store_call_duration_seconds_count{operation="acquire"} 2`,
+		`gateway_ratelimit_store_call_duration_seconds_bucket{operation="acquire",le="0.0025"} 1`,
+		`gateway_ratelimit_store_call_duration_seconds_count{operation="release"} 1`,
+	} {
+		if !strings.Contains(text, want+"\n") {
+			t.Errorf("scrape does not contain %q", want)
+		}
+	}
+
+	var nilMetrics *Metrics
+	nilMetrics.AddRateLimitStore(ratelimit.SharedMode)
+	nilMetrics.SetRateLimitMode(ratelimit.LocalMode)
+	nilMetrics.ObserveRateLimitStoreCall(ratelimit.OpAcquire, time.Millisecond, nil)
 }

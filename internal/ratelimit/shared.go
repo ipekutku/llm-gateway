@@ -28,7 +28,19 @@ type SharedOptions struct {
 	// must be positive, and longer than any request can run; otherwise a
 	// slot is freed while its request is still in progress.
 	Lease time.Duration
+	// OnCall, if not nil, is called after every Redis call with its
+	// operation (OpAcquire or OpRelease), its duration, and its error, nil
+	// if Redis answered. It is not called for an Acquire whose request
+	// context ended first, since that says nothing about Redis. It must
+	// return quickly.
+	OnCall func(op string, d time.Duration, err error)
 }
+
+// Operations reported to SharedOptions.OnCall.
+const (
+	OpAcquire = "acquire"
+	OpRelease = "release"
+)
 
 // Shared enforces each client's request rate and concurrency in Redis, so
 // every gateway instance using the same Redis and key prefix shares one
@@ -41,6 +53,7 @@ type Shared struct {
 	store   redis.Scripter
 	timeout time.Duration
 	lease   int64 // microseconds
+	onCall  func(op string, d time.Duration, err error)
 	// clients is built by NewShared and never modified afterwards.
 	clients map[string]sharedClient
 }
@@ -73,7 +86,11 @@ func NewShared(store redis.Scripter, limits map[string]Limits, opts SharedOption
 	if prefix == "" {
 		prefix = DefaultKeyPrefix
 	}
-	s := &Shared{store: store, timeout: opts.Timeout, lease: opts.Lease.Microseconds(), clients: make(map[string]sharedClient, len(limits))}
+	onCall := opts.OnCall
+	if onCall == nil {
+		onCall = func(string, time.Duration, error) {}
+	}
+	s := &Shared{store: store, timeout: opts.Timeout, lease: opts.Lease.Microseconds(), onCall: onCall, clients: make(map[string]sharedClient, len(limits))}
 	for id, lim := range limits {
 		// Truncated to whole microseconds, the resolution of Redis TIME: a
 		// rate that does not divide a minute evenly is exceeded by under
@@ -156,7 +173,7 @@ var releaseScript = redis.NewScript(`return redis.call('ZREM', KEYS[1], ARGV[1])
 // has finished, to free its concurrency slot. Further calls do nothing.
 // Release removes the slot in Redis within the timeout, even if ctx has
 // been canceled by then; if that fails, the slot stays held until its
-// lease expires.
+// lease expires, and the failure is reported only to OnCall.
 //
 // An unconfigured client returns an error wrapping ErrUnknownClient
 // without contacting Redis. If Redis fails or does not answer within the
@@ -171,10 +188,14 @@ func (s *Shared) Acquire(ctx context.Context, clientID string) (release func(), 
 	defer cancel()
 
 	token := rand.Text()
+	start := time.Now()
 	res, err := acquireScript.Run(callCtx, s.store, []string{c.rateKey, c.activeKey},
 		c.interval, c.tolerance, c.maxConcurrent, s.lease, token).Int64Slice()
 	if err == nil && len(res) != 2 {
 		err = fmt.Errorf("unexpected reply of %d values", len(res))
+	}
+	if err == nil || ctx.Err() == nil {
+		s.onCall(OpAcquire, time.Since(start), err)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("ratelimit: client %s: shared limits: %w", clientID, contextCause(callCtx, err))
@@ -197,7 +218,9 @@ func (s *Shared) Acquire(ctx context.Context, clientID string) (release func(), 
 		once.Do(func() {
 			ctx, cancel := context.WithTimeout(releaseCtx, s.timeout)
 			defer cancel()
-			_ = releaseScript.Run(ctx, s.store, []string{c.activeKey}, token).Err()
+			start := time.Now()
+			err := releaseScript.Run(ctx, s.store, []string{c.activeKey}, token).Err()
+			s.onCall(OpRelease, time.Since(start), err)
 		})
 	}, nil
 }

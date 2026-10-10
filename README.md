@@ -350,6 +350,9 @@ curl -s http://127.0.0.1:9464/metrics | grep '^gateway_'
 | `gateway_provider_circuit_state` | `provider` | Circuit breaker state: `0` closed, `1` half-open, `2` open. |
 | `gateway_tokens_total` | `provider`, `model`, `type` | Provider-reported tokens; `type` is `input` (uncached), `cache_read`, `cache_write`, or `output`. |
 | `gateway_estimated_cost_dollars_total` | `provider`, `model` | Estimated cost from the pricing file, in US dollars. |
+| `gateway_ratelimit_store_up` | none | With `GATEWAY_REDIS_URL` only: `1` while rate limits are shared through Redis, `0` while this instance uses its own limits because Redis failed. |
+| `gateway_ratelimit_store_call_duration_seconds` | `operation` | With Redis only: histogram of rate-limit calls to Redis, from 0.5 ms to 250 ms; `operation` is `acquire` (the admission check) or `release` (freeing the request's slot). |
+| `gateway_ratelimit_store_errors_total` | `operation` | With Redis only: failed or timed-out calls to Redis. |
 
 `model` is one of the configured models or `unknown`, so model names sent by clients cannot create new series; requests rejected before their body was read are also `unknown`. Token and cost metrics use the configured model of the provider that answered, the name in the pricing file, and match the usage records: a request with unknown cost adds tokens but no cost. The metric cost is a floating-point estimate that resets on restart; the exact picodollar values are in PostgreSQL. Client IDs are never labels; per-client usage is in PostgreSQL. Go runtime (`go_*`) and process (`process_*`) metrics are included. A minimal Prometheus scrape configuration:
 
@@ -403,13 +406,13 @@ go run ./cmd/gateway
 | Jaeger | http://127.0.0.1:16686 | Traces: search for service `llm-gateway`; the dashboard links here |
 | OTLP receiver | http://127.0.0.1:4318 | Jaeger's OTLP/HTTP endpoint, the gateway's `OTEL_EXPORTER_OTLP_ENDPOINT` |
 
-The dashboard shows request volume, error rate, and p50/p95/p99 latency; errors by status and code; upstream attempts by outcome, provider latency, provider error rate, errors by upstream status, retries, fallbacks, and each circuit's state; tokens by type and model; and estimated cost per hour and over the selected range.
+The dashboard shows request volume, error rate, and p50/p95/p99 latency; errors by status and code; upstream attempts by outcome, provider latency, provider error rate, errors by upstream status, retries, fallbacks, and each circuit's state; tokens by type and model; estimated cost per hour and over the selected range; and, with Redis, each instance's rate-limit mode (shared or local), Redis call latency, and Redis call errors.
 
 All ports are published on loopback only, and Grafana lets anyone who reaches it in as an administrator, so the stack is for local development. If a port is taken, override it, for example `make observability PROMETHEUS_PORT=19090`; the others are `GRAFANA_PORT`, `JAEGER_UI_PORT`, and `OTLP_HTTP_PORT` (then use that port in `OTEL_EXPORTER_OTLP_ENDPOINT`). `make observability-stop` stops the stack and deletes its data. CI does not use it.
 
 Prometheus scrapes `host.docker.internal:9464`, the default `GATEWAY_METRICS_ADDR`. With Docker Desktop or Colima on macOS, that reaches the gateway's loopback listener. On Linux, `host.docker.internal` is the Docker bridge address, so the gateway must listen there instead, for example `GATEWAY_METRICS_ADDR=172.17.0.1:9464`; this has not been tested. For another metrics port, edit [`prometheus.yml`](deploy/observability/prometheus.yml).
 
-The gateway's provider endpoints are fixed, so dashboard data comes from real traffic. Requests with an unknown model or a wrong gateway key fill the request panels without calling a provider; provider, token, and cost panels need completions from the configured providers.
+The gateway's provider endpoints are fixed, so dashboard data comes from real traffic. Requests with an unknown model or a wrong gateway key fill the request panels without calling a provider; provider, token, and cost panels need completions from the configured providers. The rate-limit store panels need `GATEWAY_REDIS_URL` (for example `make redis`) and requests from an authenticated client, since the limits are checked after authentication.
 
 ### Limitations
 

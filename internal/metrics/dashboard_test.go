@@ -10,6 +10,7 @@ import (
 
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/usage"
 )
 
@@ -47,6 +48,8 @@ func TestDashboardQueriesExportedMetrics(t *testing.T) {
 	m.SetCircuitState("openai", breaker.Closed)
 	cost := usage.Cost(1)
 	m.ObserveUsage("openai", "gpt-4o", llm.Usage{InputTokens: 2, OutputTokens: 1}, &cost)
+	m.AddRateLimitStore(ratelimit.SharedMode)
+	m.ObserveRateLimitStoreCall(ratelimit.OpAcquire, time.Millisecond, nil)
 	text := scrape(t, m)
 
 	queries := 0
