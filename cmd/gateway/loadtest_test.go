@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -104,11 +105,16 @@ func TestLoadtestScriptValidation(t *testing.T) {
 	if out, err := loadtestCommand(t, "bash", "-n", loadtestDir+"/run.sh").CombinedOutput(); err != nil {
 		t.Fatalf("script syntax: %v\n%s", err, out)
 	}
+	if out, err := loadtestCommand(t, "bash", "-n", loadtestDir+"/binary-size.sh").CombinedOutput(); err != nil {
+		t.Fatalf("size script syntax: %v\n%s", err, out)
+	}
 	for _, tt := range []struct {
 		name, setting, want string
 	}{
 		{"missing database", "", "Set GATEWAY_DATABASE_URL"},
 		{"provider", "LOADTEST_PROVIDER=remote", "LOADTEST_PROVIDER must be"},
+		{"Redis remote", "LOADTEST_REDIS_URL=redis://:synthetic-secret-marker@remote:6379/0", "LOADTEST_REDIS_URL must name"},
+		{"Redis port", "LOADTEST_REDIS_URL=redis://127.0.0.1:99999/0", "Redis port must be"},
 		{"scenario", "LOADTEST_SCENARIO=invalid", "LOADTEST_SCENARIO must be"},
 		{"missing open rate", "LOADTEST_SCENARIO=C", "LOADTEST_OPEN_RATE must be"},
 		{"unused open rate", "LOADTEST_OPEN_RATE=100", "LOADTEST_OPEN_RATE is only allowed"},
@@ -129,6 +135,80 @@ func TestLoadtestScriptValidation(t *testing.T) {
 				t.Fatalf("validation: %v\n%s", err, out)
 			}
 		})
+	}
+}
+
+func TestLoadtestRedisAndConnectionSummary(t *testing.T) {
+	report := `{"latencies":{"50th":1,"95th":2,"99th":3},"requests":100,"rate":100,"throughput":100,"success":1,"status_codes":{"200":100}}`
+	common := "process_cpu_seconds_total 1\ngo_gc_duration_seconds_count 1\ngo_gc_duration_seconds_sum 1\ngo_memstats_alloc_bytes_total 1\n"
+	store := func(count int, sum float64) string {
+		text := "gateway_ratelimit_store_up 1\n"
+		for _, op := range []string{"acquire", "release"} {
+			text += fmt.Sprintf("gateway_ratelimit_store_call_duration_seconds_count{operation=%q} %d\ngateway_ratelimit_store_call_duration_seconds_sum{operation=%q} %g\ngateway_ratelimit_store_errors_total{operation=%q} 0\n", op, count, op, sum, op)
+		}
+		return text
+	}
+	for _, tt := range []struct{ name, change, want string }{
+		{"valid", "", "Redis release: 100 calls; mean 1.000 ms; errors 0"},
+		{"missing calls", "missing", "Missing metric"},
+		{"reset", "reset", "Metric counter decreased"},
+		{"failed release", "error", "Missing/failed Redis calls"},
+		{"degraded", "mode", "Redis degraded"},
+		{"missing connection count", "connections", "Missing accepted-connection count"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			after, samples := common+store(110, 0.11), "process_resident_memory_bytes 1\ngo_goroutines 1\ngateway_ratelimit_store_up 1\n"
+			connection := "fake provider stopped connections=501\n"
+			switch tt.change {
+			case "missing":
+				after = common
+			case "reset":
+				after = common + store(1, 0.001)
+			case "error":
+				after = strings.Replace(after, "gateway_ratelimit_store_errors_total{operation=\"release\"} 0", "gateway_ratelimit_store_errors_total{operation=\"release\"} 1", 1)
+			case "mode":
+				samples += "gateway_ratelimit_store_up 0\n"
+			case "connections":
+				connection = ""
+			}
+			for name, text := range map[string]string{"baseline.json": report, "gateway.json": report, "before.prom": common + store(10, 0.01), "after.prom": after, "samples.prom": samples, "gateway.log": "", "fake-baseline.log": connection, "fake.log": connection} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := loadtestCommand(t, "awk", "-v", "dir="+dir, "-v", "shared=1", "-v", "connections=1", "-f", loadtestDir+"/summary.awk").CombinedOutput()
+			if (err != nil) != (tt.change != "") || !strings.Contains(string(out), tt.want) {
+				t.Fatalf("summary: %v\n%s", err, out)
+			}
+			if tt.change == "" && !strings.Contains(string(out), "direct 501; gateway upstream 501") {
+				t.Fatalf("missing counts: %s", out)
+			}
+		})
+	}
+}
+
+func TestBinarySizeSymbolAttribution(t *testing.T) {
+	dir := t.TempDir()
+	packages := filepath.Join(dir, "packages.txt")
+	symbols := filepath.Join(dir, "symbols.txt")
+	if err := os.WriteFile(packages, []byte("net stdlib\nnet/http stdlib\ngithub.com/example/module dep\ngithub.com/example/module/sub dep\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(symbols, []byte("100 10 T net/http.Func\n100 10 T net/http.Alias\n110 20 T github.com/example/module/sub.Func\n130 30 T github.com/example/module-other.Func\n160 8388608 B net.bigZeroMemory\n170 99 R net.metadata\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := loadtestCommand(t, "awk", "-f", loadtestDir+"/symbols.awk", packages, symbols).CombinedOutput()
+	if err != nil {
+		t.Fatalf("symbols: %v %s", err, out)
+	}
+	for _, want := range []string{"10 stdlib\n", "20 dep\n", "30 unassigned\n"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("missing %q: %s", want, out)
+		}
+	}
+	if len(strings.Split(strings.TrimSpace(string(out)), "\n")) != 3 {
+		t.Fatalf("unexpected attribution: %s", out)
 	}
 }
 

@@ -16,6 +16,14 @@ provider=${LOADTEST_PROVIDER:-openai}
 selected=${LOADTEST_SCENARIO:-all}
 [[ "$selected" == all || "$selected" == A || "$selected" == B || "$selected" == C ]] || fail 'LOADTEST_SCENARIO must be all, A, B, or C'
 open_rate=${LOADTEST_OPEN_RATE:-}
+redis_url=${LOADTEST_REDIS_URL:-}
+shared=0
+if [[ -n "$redis_url" ]]; then
+    [[ "$redis_url" =~ ^redis://127\.0\.0\.1:([0-9]+)/([0-9]+)$ ]] ||
+        fail 'LOADTEST_REDIS_URL must name a disposable loopback Redis: redis://127.0.0.1:PORT/DB (no credentials or options)'
+    positive 'Redis port' "${BASH_REMATCH[1]}" 65535
+    shared=1
+fi
 if [[ "$selected" == C ]]; then
     positive LOADTEST_OPEN_RATE "$open_rate" 1000000
 elif [[ -n "$open_rate" ]]; then
@@ -76,7 +84,7 @@ vegeta="$run_dir/bin/vegeta"
     uname -a
     printf 'Vegeta=%s GOMAXPROCS=%s provider=%s scenarios=%s workers=%s seconds=%s warmup=%s profile=%s cooldown=%s FD-limit=%s\n' \
         "$vegeta_module" "$cpus" "$provider" "$selected" "$workers" "$seconds" "$warmup" "$profile" "$cooldown" "$(ulimit -n)"
-    printf 'local limits; tracing off; JSON outcome logs; default recorder; HTTP/1.1 loopback; database supplied by operator\n'
+    printf 'shared limits=%s; tracing off; JSON outcome logs; default recorder; HTTP/1.1 loopback; stores supplied by operator\n' "$shared"
 } > "$run_dir/environment.txt"
 sed "s/FAKE_PORT/$fake_port/g" "deploy/loadtest/baseline-$provider.targets" > "$run_dir/baseline.targets"
 sed "s/GATEWAY_PORT/$gateway_port/g" "deploy/loadtest/gateway-$provider.targets" > "$run_dir/gateway.targets"
@@ -123,16 +131,29 @@ scenario() {
     printf 'Cooling down for %s seconds before %s (socket state from earlier phases).\n' "$cooldown" "$name"
     sleep "$cooldown"
     printf 'Running %s: delay=%s, rate=%s, initial workers=%s, maximum=%s\n' "$name" "$delay" "$rate" "$workers" "$max_workers"
+    "$run_dir/bin/fakeprovider" -addr="127.0.0.1:$fake_port" -delay="$delay" > "$dir/fake-baseline.log" 2>&1 &
+    fake_pid=$!
+    ready "$fake_pid" "http://127.0.0.1:$fake_port/" false
+    attack "$run_dir/baseline.targets" "$dir/warmup-baseline.bin" "$warmup" 100/s "$max_workers"
+    attack "$run_dir/baseline.targets" "$dir/baseline.bin" "$seconds" "$rate" "$max_workers"
+    "$vegeta" -cpus="$cpus" report -type=json "$dir/baseline.bin" > "$dir/baseline.json"
+    "$vegeta" -cpus="$cpus" report "$dir/baseline.bin" > "$dir/baseline.txt"
+    kill -TERM "$fake_pid"; wait "$fake_pid"; fake_pid=
+    # Separate accepted-connection counters for direct and upstream traffic.
     "$run_dir/bin/fakeprovider" -addr="127.0.0.1:$fake_port" -delay="$delay" > "$dir/fake.log" 2>&1 &
     fake_pid=$!
     ready "$fake_pid" "http://127.0.0.1:$fake_port/" false
+    # Unique clients keep Redis runs/phases isolated; only expiring fixture
+    # keys are created. Never flush a store or change production key prefixes.
+    sed "s/\"loadtest\"/\"loadtest-${run_dir##*.}-$name\"/" deploy/loadtest/clients.json > "$dir/clients.json"
     # env -i prevents inherited provider, retry/fallback, Redis, OTLP, or proxy
     # settings changing the scenario. No values from these settings are logged.
     env -i PATH="$PATH" GOMAXPROCS="$cpus" \
         GATEWAY_DATABASE_URL="$GATEWAY_DATABASE_URL" \
+        GATEWAY_REDIS_URL="$redis_url" \
         GATEWAY_ADDR="127.0.0.1:$gateway_port" GATEWAY_METRICS_ADDR="127.0.0.1:$metrics_port" \
         GATEWAY_PPROF=true GATEWAY_LOG_FORMAT=json \
-        GATEWAY_CLIENTS_FILE="$PWD/deploy/loadtest/clients.json" \
+        GATEWAY_CLIENTS_FILE="$dir/clients.json" \
         GATEWAY_PRICING_FILE="$PWD/deploy/loadtest/prices.json" \
         OPENAI_MODEL=local-openai OPENAI_API_KEY=synthetic-openai-key \
         ANTHROPIC_MODEL=local-anthropic ANTHROPIC_API_KEY=synthetic-anthropic-key \
@@ -141,11 +162,7 @@ scenario() {
     gateway_pid=$!
     ready "$gateway_pid" "http://127.0.0.1:$metrics_port/metrics" true
     ready "$gateway_pid" "http://127.0.0.1:$gateway_port/" false
-    attack "$run_dir/baseline.targets" "$dir/warmup-baseline.bin" "$warmup" 100/s "$max_workers"
     attack "$run_dir/gateway.targets" "$dir/warmup-gateway.bin" "$warmup" 100/s "$max_workers"
-    attack "$run_dir/baseline.targets" "$dir/baseline.bin" "$seconds" "$rate" "$max_workers"
-    "$vegeta" -cpus="$cpus" report -type=json "$dir/baseline.bin" > "$dir/baseline.json"
-    "$vegeta" -cpus="$cpus" report "$dir/baseline.bin" > "$dir/baseline.txt"
     scrape > "$dir/before.prom"
     cp "$dir/before.prom" "$dir/samples.prom"
     # One curl process reuses its connection throughout the measurement. An
@@ -176,7 +193,7 @@ scenario() {
     # Graceful shutdown flushes final queue-full drop summaries and drains usage.
     kill -TERM "$gateway_pid"; wait "$gateway_pid"; gateway_pid=
     kill -TERM "$fake_pid"; wait "$fake_pid"; fake_pid=
-    awk -v dir="$dir" -v rate="${rate%/s}" -f deploy/loadtest/summary.awk > "$dir/summary.md"
+    awk -v dir="$dir" -v rate="${rate%/s}" -v shared="$shared" -v connections=1 -f deploy/loadtest/summary.awk > "$dir/summary.md"
     cat "$dir/summary.md"
 }
 

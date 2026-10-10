@@ -734,7 +734,7 @@ The implemented responsibilities, failure behavior, and the decisions behind wha
 
 **Target version:** `v0.8.0`
 
-**Status:** In progress. Request-path benchmarks, reproducible end-to-end load scenarios, CPU/heap captures, and [baseline measurements](performance.md) are implemented. The measurable-results exit criterion is demonstrated, including throughput, percentile comparison differences, memory, error rates, and accounting loss. Redis comparisons and connection-management/scaling-limit analysis remain; the milestone is not yet feature-complete.
+**Status:** In progress. Request-path benchmarks, reproducible end-to-end load scenarios, CPU/heap captures, and [measurements](performance.md) cover throughput, percentile comparison differences, memory, errors, accounting loss, Redis admission/release and pool waits, HTTP/1.1/TLS/HTTP/2 reuse, inbound keep-alives, and binary size. The measurable-results exit criterion is demonstrated. HTTP/1.1 upstream churn justifies a separate pooling follow-up with before/after measurements; production defaults remain unchanged and the milestone is not yet feature-complete.
 
 ## Objective
 

@@ -42,6 +42,24 @@ function count200(data) {
     if (!match(data, /"200"[[:space:]]*:/)) return 0
     return number(data, "200")
 }
+function delta(name,    value) {
+    value = metric(after, name) - metric(before, name)
+    if (value < 0) {
+        print "Metric counter decreased; measurement is invalid" > "/dev/stderr"
+        exit 1
+    }
+    return value
+}
+function accepted(file,    line, value, found) {
+    while ((getline line < file) > 0) {
+        if (line ~ /^fake provider stopped connections=[0-9]+$/) {
+            sub(/^.*=/, "", line); value = line + 0; found = 1
+        }
+    }
+    close(file)
+    if (!found) { print "Missing accepted-connection count: " file > "/dev/stderr"; exit 1 }
+    return value
+}
 BEGIN {
     if (mode == "rate") {
         printf "%.0f\n", number(report(file), "throughput") * 0.7
@@ -87,6 +105,32 @@ BEGIN {
     printf "Queue-full drops: %.0f; failed-batch records: %.0f (process total, includes warmup and shutdown).\n", drops, lost
     print "RSS/goroutines sampled about once per second; CPU/GC/allocation deltas cover the metric-sampling window."
     print "Percentile differences are independent distributions, not per-request overhead or a capacity guarantee."
+    if (connections) {
+        printf "Fake accepted connections: direct %.0f; gateway upstream %.0f (each includes its warmup and readiness probe).\n",
+            accepted(dir "/fake-baseline.log"), accepted(dir "/fake.log")
+    }
+    if (shared) {
+        while ((getline line < (dir "/samples.prom")) > 0) {
+            if (line ~ /^gateway_ratelimit_store_up / && line !~ / 1$/) {
+                print "Redis degraded during sampling; not a healthy shared-limit comparison" > "/dev/stderr"; exit 1
+            }
+        }
+        close(dir "/samples.prom")
+        if (metric(before, "gateway_ratelimit_store_up") != 1 || metric(after, "gateway_ratelimit_store_up") != 1) {
+            print "Redis not in shared mode" > "/dev/stderr"; exit 1
+        }
+        for (i = 1; i <= 2; i++) {
+            op = (i == 1 ? "acquire" : "release")
+            label = "{operation=\"" op "\"}"
+            calls = delta("gateway_ratelimit_store_call_duration_seconds_count" label)
+            total = delta("gateway_ratelimit_store_call_duration_seconds_sum" label)
+            errors = delta("gateway_ratelimit_store_errors_total" label)
+            if (calls <= 0 || errors != 0) {
+                print "Missing/failed Redis calls; not a healthy shared-limit comparison" > "/dev/stderr"; exit 1
+            }
+            printf "Redis %s: %.0f calls; mean %.3f ms; errors %.0f (metric-sampling window).\n", op, calls, total * 1000 / calls, errors
+        }
+    }
     # Saturation may produce real HTTP errors. Retain them visibly rather than
     # hiding the scaling limit or mistaking successful RPS for attempted RPS.
     if (number(baseline, "success") != 1 || number(gateway, "success") != 1 ||
