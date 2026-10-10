@@ -680,6 +680,8 @@ The implemented log fields, metric names, and the decisions behind deviations fr
 
 **Target version:** `v0.7.0`
 
+**Status:** Feature-complete. Per-client rate limits and concurrency limits can be shared through Redis (`GATEWAY_REDIS_URL`), with per-instance limits while Redis is unavailable; store metrics and dashboard panels show which applies. Circuit breakers stay per instance by decision. Milestone 8 is next. Release tagging follows merged-commit CI and the [release checks](../README.md#development).
+
 ## Objective
 
 Prepare the gateway for multiple running instances.
@@ -718,11 +720,13 @@ Test:
 * Redis failure
 * recovery after Redis outage
 
+The implemented responsibilities, failure behavior, and the decisions behind what stays out of Redis are in [architecture.md](architecture.md#shared-limits-in-redis).
+
 ## Exit Criteria
 
-* horizontal replicas behave consistently
-* Redis responsibilities are clearly documented
-* Redis failure behavior is predictable
+* [x] horizontal replicas behave consistently — complete-gateway tests run two instances against one Redis: a client's request rate and concurrent requests are shared across them, other clients stay independent, and a crashed instance's slots free themselves when their lease expires
+* [x] Redis responsibilities are clearly documented — Redis holds only rate-limit state; circuit breaker state, caching, and coordination stay out, each with its reason, in the [architecture](architecture.md#shared-limits-in-redis); setup and limits are in the [README](../README.md#shared-rate-limits-with-redis)
+* [x] Redis failure behavior is predictable — a documented [event table](architecture.md#when-redis-is-unavailable): a failed or slow Redis switches each instance to its own limits with one warning, one probe per second restores shared limits, and startup does not require Redis; unit tests with a switchable store and two-instance tests through a TCP proxy that is cut and restored verify outage and recovery, and `gateway_ratelimit_store_*` metrics show the mode, latency, and errors
 
 ---
 

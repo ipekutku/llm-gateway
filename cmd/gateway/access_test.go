@@ -40,13 +40,16 @@ func TestRequestPathDoesNotFollowProviderRedirects(t *testing.T) {
 	}
 }
 
+// teamBKey is the gateway key of team-b in withClients.
+const teamBKey = "gw-team-b-key"
+
 // withClients configures two enabled clients, team-a (clientKey) and
-// team-b, and a disabled one, all with the given limits.
+// team-b (teamBKey), and a disabled one, all with the given limits.
 func withClients(limits ratelimit.Limits) func(*config) {
 	return func(cfg *config) {
 		cfg.Clients = []auth.Client{
 			{ID: "team-a", KeyHash: auth.HashKey(clientKey)},
-			{ID: "team-b", KeyHash: auth.HashKey("gw-team-b-key")},
+			{ID: "team-b", KeyHash: auth.HashKey(teamBKey)},
 			{ID: "team-old", KeyHash: auth.HashKey("gw-team-old-key"), Disabled: true},
 		}
 		cfg.RateLimits = map[string]ratelimit.Limits{"team-a": limits, "team-b": limits, "team-old": limits}
@@ -172,7 +175,7 @@ func TestRequestPathRateLimitsEachClient(t *testing.T) {
 
 	// team-b's limit is untouched by team-a's requests.
 	for i := range 2 {
-		if resp, data := post("gw-team-b-key"); resp.StatusCode != http.StatusOK {
+		if resp, data := post(teamBKey); resp.StatusCode != http.StatusOK {
 			t.Errorf("team-b request %d: status = %d, want 200 (body %s)", i+1, resp.StatusCode, data)
 		}
 	}
