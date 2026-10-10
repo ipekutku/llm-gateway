@@ -59,8 +59,7 @@ Implemented so far (see [Logs, metrics, and traces](#logs-metrics-and-traces)):
 * token and estimated cost metrics per provider and model, matching the usage records
 * OpenTelemetry traces exported over OTLP/HTTP when an endpoint is configured: one span per request, routing step, provider, and upstream attempt, with retries and fallbacks as events, and the trace ID in every log line
 * traces of usage database writes, linked to the requests they record, and of migrations
-
-Still to come: a local Prometheus, Grafana, and tracing stack with dashboards.
+* a local Prometheus, Grafana, and Jaeger stack (`make observability`) with a provisioned dashboard
 
 ### v0.5 — Usage and Cost Accounting ✅
 
@@ -364,6 +363,31 @@ Failed spans have an error status and an `error.type`. A request rejected before
 Usage records are written in the background, so each batch insert is a trace of its own, `INSERT usage_records`, with the number of records and of rows inserted. It links to the request spans of the records it stores, so a tracing UI can navigate from a write to its requests. `go run ./cmd/gateway migrate` reads the same `OTEL_*` variables and exports a `migrate` span with one child per migration applied. Database spans never contain record values, SQL parameters, or the database URL.
 
 A client may send a W3C `traceparent` header; the gateway's spans then join the client's trace, and the client's sampling decision applies. The gateway never sends trace headers to OpenAI or Anthropic. Spans are exported in batches in the background; failed exports are logged as `tracing error` warnings and never affect requests. Shutdown flushes pending spans last, after the usage records are written, within a 5-second budget of its own. Only OTLP over HTTP is supported: an endpoint that is not an `http` or `https` URL, or `OTEL_EXPORTER_OTLP_PROTOCOL` other than `http/protobuf`, fails startup. Use `https` for a collector on another host, and put collector credentials in `OTEL_EXPORTER_OTLP_HEADERS`, not in the URL, which can appear in export error logs.
+
+#### Local dashboards
+
+`make observability` starts Prometheus, Grafana, and Jaeger in Docker (Compose files in [`deploy/observability`](deploy/observability)) for a gateway running on the host:
+
+```bash
+make observability
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+go run ./cmd/gateway
+```
+
+| Service | Address | Use |
+|---|---|---|
+| Grafana | http://127.0.0.1:3000 | The provisioned **LLM Gateway** dashboard, the home page; no login |
+| Prometheus | http://127.0.0.1:9090 | Scrapes the gateway's `/metrics` every 5 seconds; keeps 2 days |
+| Jaeger | http://127.0.0.1:16686 | Traces: search for service `llm-gateway`; the dashboard links here |
+| OTLP receiver | http://127.0.0.1:4318 | Jaeger's OTLP/HTTP endpoint, the gateway's `OTEL_EXPORTER_OTLP_ENDPOINT` |
+
+The dashboard shows request volume, error rate, and p50/p95/p99 latency; errors by status and code; upstream attempts by outcome, provider latency, provider error rate, errors by upstream status, retries, fallbacks, and each circuit's state; tokens by type and model; and estimated cost per hour and over the selected range.
+
+All ports are published on loopback only, and Grafana lets anyone who reaches it in as an administrator, so the stack is for local development. If a port is taken, override it, for example `make observability PROMETHEUS_PORT=19090`; the others are `GRAFANA_PORT`, `JAEGER_UI_PORT`, and `OTLP_HTTP_PORT` (then use that port in `OTEL_EXPORTER_OTLP_ENDPOINT`). `make observability-stop` stops the stack and deletes its data. CI does not use it.
+
+Prometheus scrapes `host.docker.internal:9464`, the default `GATEWAY_METRICS_ADDR`. With Docker Desktop or Colima on macOS, that reaches the gateway's loopback listener. On Linux, `host.docker.internal` is the Docker bridge address, so the gateway must listen there instead, for example `GATEWAY_METRICS_ADDR=172.17.0.1:9464`; this has not been tested. For another metrics port, edit [`prometheus.yml`](deploy/observability/prometheus.yml).
+
+The gateway's provider endpoints are fixed, so dashboard data comes from real traffic. Requests with an unknown model or a wrong gateway key fill the request panels without calling a provider; provider, token, and cost panels need completions from the configured providers.
 
 ### Limitations
 
