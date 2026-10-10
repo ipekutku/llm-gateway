@@ -74,7 +74,7 @@ func TestNewRequiresAccounting(t *testing.T) {
 	a := testAuthenticator(t)
 	l := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
 	for _, accounting := range []Accounting{{}, {Recorder: discardRecorder{}}, {Pricing: testAccounting().Pricing}} {
-		if _, err := New(okProvider, a, l, testTimeout, accounting, nil); err == nil {
+		if _, err := New(okProvider, a, l, testTimeout, accounting, nil, nil); err == nil {
 			t.Error("New accepted incomplete accounting dependencies")
 		}
 	}
@@ -127,7 +127,7 @@ func newHandlerWithTimeout(t *testing.T, p llm.Provider, timeout time.Duration) 
 func newHandlerWith(t *testing.T, p llm.Provider, limiter *ratelimit.Limiter, timeout time.Duration) (http.Handler, *bytes.Buffer) {
 	t.Helper()
 	var logs bytes.Buffer
-	h, err := New(p, testAuthenticator(t), limiter, timeout, testAccounting(), slog.New(slog.NewTextHandler(&logs, nil)))
+	h, err := New(p, testAuthenticator(t), limiter, timeout, testAccounting(), nil, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -182,13 +182,13 @@ const validBody = `{"model":"model-a","messages":[{"role":"user","content":"hi"}
 func TestNewRejectsNilDependencies(t *testing.T) {
 	a := testAuthenticator(t)
 	l := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
-	if _, err := New(nil, a, l, testTimeout, testAccounting(), nil); err == nil {
+	if _, err := New(nil, a, l, testTimeout, testAccounting(), nil, nil); err == nil {
 		t.Error("New(nil provider) error = nil, want error")
 	}
-	if _, err := New(okProvider, nil, l, testTimeout, testAccounting(), nil); err == nil {
+	if _, err := New(okProvider, nil, l, testTimeout, testAccounting(), nil, nil); err == nil {
 		t.Error("New(nil authenticator) error = nil, want error")
 	}
-	if _, err := New(okProvider, a, nil, testTimeout, testAccounting(), nil); err == nil {
+	if _, err := New(okProvider, a, nil, testTimeout, testAccounting(), nil, nil); err == nil {
 		t.Error("New(nil limiter) error = nil, want error")
 	}
 }
@@ -197,7 +197,7 @@ func TestNewRejectsNonPositiveTimeout(t *testing.T) {
 	a := testAuthenticator(t)
 	l := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
 	for _, timeout := range []time.Duration{0, -time.Second} {
-		if _, err := New(okProvider, a, l, timeout, testAccounting(), nil); err == nil {
+		if _, err := New(okProvider, a, l, timeout, testAccounting(), nil, nil); err == nil {
 			t.Errorf("New(timeout %v) error = nil, want error", timeout)
 		}
 	}

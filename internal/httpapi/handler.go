@@ -42,12 +42,26 @@ type handler struct {
 	upstreamTimeout time.Duration
 	log             *slog.Logger
 	accounting      Accounting
+	metrics         Metrics
 }
 
 // UsageRecorder accepts records without waiting for persistent storage.
 type UsageRecorder interface {
 	Record(usage.Record) bool
 }
+
+// Metrics receives one observation per request to the chat completions
+// endpoint, including rejected and abandoned ones. model is the requested
+// model, or empty if the request was rejected before it was known. code is
+// the error code, or empty on success. Implementations bound the label
+// values themselves.
+type Metrics interface {
+	ObserveRequest(model string, status int, code string, d time.Duration)
+}
+
+type noMetrics struct{}
+
+func (noMetrics) ObserveRequest(string, int, string, time.Duration) {}
 
 // Accounting provides the recorder, prices, and each provider's configured
 // model name. Pricing uses configured names rather than response snapshots.
@@ -86,7 +100,10 @@ type Accounting struct {
 //
 // accounting records every validated request once, including failures and
 // cancellations. Admission and validation rejections are not recorded.
-func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *ratelimit.Limiter, upstreamTimeout time.Duration, accounting Accounting, log *slog.Logger) (http.Handler, error) {
+//
+// metrics observes every request to the endpoint, rejections included. A
+// nil metrics observes nothing.
+func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *ratelimit.Limiter, upstreamTimeout time.Duration, accounting Accounting, metrics Metrics, log *slog.Logger) (http.Handler, error) {
 	switch {
 	case provider == nil:
 		return nil, errors.New("httpapi: nil provider")
@@ -102,6 +119,9 @@ func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *rate
 	if log == nil {
 		log = slog.Default()
 	}
+	if metrics == nil {
+		metrics = noMetrics{}
+	}
 	if _, ok := log.Handler().(logHandler); !ok {
 		log = slog.New(NewLogHandler(log.Handler()))
 	}
@@ -110,7 +130,7 @@ func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *rate
 		models[provider] = model
 	}
 	accounting.Models = models
-	h := &handler{provider: provider, auth: authenticator, limiter: limiter, upstreamTimeout: upstreamTimeout, accounting: accounting, log: log}
+	h := &handler{provider: provider, auth: authenticator, limiter: limiter, upstreamTimeout: upstreamTimeout, accounting: accounting, metrics: metrics, log: log}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+ChatCompletionsPath, h.chatCompletions)
@@ -246,6 +266,7 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 		}
 		record.Duration = time.Since(received)
 		h.logOutcome(r.Context(), record, chatErr, stats)
+		h.metrics.ObserveRequest(record.RequestedModel, record.Status, record.ErrorCode, record.Duration)
 		h.accounting.Recorder.Record(record)
 	}()
 	ctx, cancel := context.WithTimeout(ctx, h.upstreamTimeout)
@@ -321,6 +342,8 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err e
 	}
 	h.log.LogAttrs(r.Context(), statusLevel(e.status), "chat completion failed", attrs...)
 	_ = writeError(w, e)
+	received, _ := r.Context().Value(receivedAtKey{}).(time.Time)
+	h.metrics.ObserveRequest("", e.status, e.code, time.Since(received))
 }
 
 // logOutcome logs the one line describing a validated request's outcome,

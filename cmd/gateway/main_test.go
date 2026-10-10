@@ -111,7 +111,7 @@ func gatewayWith(t *testing.T, oa, an *upstream, edit func(*config)) *httptest.S
 	cfg.Retry = fastRetry
 	edit(&cfg)
 
-	h, err := newHandler(cfg, nil, discardRecorder{}, slog.New(slog.DiscardHandler))
+	h, err := newHandler(cfg, nil, discardRecorder{}, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -461,7 +461,7 @@ func TestRequestPathRetriesConnectionFailures(t *testing.T) {
 		newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply)))
 	cfg.OpenAI.BaseURL = refused
 	var logs syncBuffer
-	h, err := newHandler(cfg, nil, discardRecorder{}, slog.New(slog.NewTextHandler(&logs, nil)))
+	h, err := newHandler(cfg, nil, discardRecorder{}, nil, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -497,7 +497,7 @@ func TestRequestPathClientCancellationStopsRetries(t *testing.T) {
 	cfg := gatewayConfig(oa, an)
 	cfg.UpstreamTimeout = 2 * time.Hour
 	cfg.Retry.MaxDelay = 2 * time.Hour
-	h, err := newHandler(cfg, nil, discardRecorder{}, slog.New(slog.DiscardHandler))
+	h, err := newHandler(cfg, nil, discardRecorder{}, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -887,7 +887,7 @@ func TestServeShutsDownGracefully(t *testing.T) {
 	slow := newBlockingHandler(t, openaiReply)
 	oa := newUpstream(t, "/v1/chat/completions", slow.ServeHTTP)
 	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
-	h, err := newHandler(gatewayConfig(oa, an), nil, discardRecorder{}, slog.New(slog.DiscardHandler))
+	h, err := newHandler(gatewayConfig(oa, an), nil, discardRecorder{}, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -940,7 +940,7 @@ func TestServeCutsOffRequestsAfterShutdownTimeout(t *testing.T) {
 	slow := newBlockingHandler(t, openaiReply)
 	oa := newUpstream(t, "/v1/chat/completions", slow.ServeHTTP)
 	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
-	h, err := newHandler(gatewayConfig(oa, an), nil, discardRecorder{}, slog.New(slog.DiscardHandler))
+	h, err := newHandler(gatewayConfig(oa, an), nil, discardRecorder{}, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -1034,7 +1034,7 @@ func TestRunServesUntilCanceled(t *testing.T) {
 	go func() {
 		result <- runWithFakeDatabase(ctx, map[string]string{
 			"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey,
-			"GATEWAY_ADDR": "127.0.0.1:0", clientsFileVar: clientsFile,
+			"GATEWAY_ADDR": "127.0.0.1:0", "GATEWAY_METRICS_ADDR": "127.0.0.1:0", clientsFileVar: clientsFile,
 		}, slog.New(slog.NewTextHandler(&logs, nil)))
 	}()
 

@@ -99,7 +99,7 @@ func TestUsageAccountingWithPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := newHandler(cfg, nil, recorder, logger)
+	h, err := newHandler(cfg, nil, recorder, nil, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
