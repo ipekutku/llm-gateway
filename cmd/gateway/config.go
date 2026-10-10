@@ -19,6 +19,7 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/retry"
 	"github.com/ipekutku/llm-gateway/internal/usage"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -94,6 +95,12 @@ type config struct {
 	// Tracing is true when an OTLP endpoint is configured. The exporter
 	// reads its settings from the OTEL_* variables itself.
 	Tracing bool
+	// Redis, parsed from GATEWAY_REDIS_URL, holds the rate limits shared
+	// by gateway instances. Nil means each instance limits on its own.
+	Redis *redis.Options
+	// RedisKeyPrefix replaces ratelimit.DefaultKeyPrefix when not empty.
+	// It has no environment variable; tests use it for isolation.
+	RedisKeyPrefix string
 }
 
 // providerConfig enables one provider for exactly one model.
@@ -158,6 +165,9 @@ func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error
 		errs = append(errs, err)
 	}
 	if cfg.Tracing, err = loadTracing(getenv); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.Redis, err = loadRedis(getenv); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {

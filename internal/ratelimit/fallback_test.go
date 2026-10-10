@@ -426,3 +426,37 @@ func TestFallbackReleasesToTheAdmittingLimiter(t *testing.T) {
 
 // generousLimits are limits that tests not about them never reach.
 var generousLimits = Limits{RequestsPerMinute: MaxLimit, Burst: MaxLimit, MaxConcurrent: MaxLimit}
+
+func TestFallbackStartLocal(t *testing.T) {
+	client, prefix := testRedis(t)
+	limits := map[string]Limits{"a": generousLimits}
+	local, _ := newTestLimiter(t, limits)
+	store := &switchStore{target: client}
+	shared := newSharedWith(t, store, limits, SharedOptions{KeyPrefix: prefix, Timeout: testTimeout, Lease: testLease})
+	var logs bytes.Buffer
+	var modes []Mode
+	f, err := NewFallback(shared, local, FallbackSettings{
+		RetryInterval: testRetryInterval,
+		StartLocal:    true,
+		OnModeChange:  func(m Mode) { modes = append(modes, m) },
+	}, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("NewFallback: %v", err)
+	}
+	if f.Mode() != LocalMode {
+		t.Fatalf("mode = %s, want local", f.Mode())
+	}
+
+	// The first request probes Redis at once and, since it answers,
+	// returns to shared limits.
+	fallbackAcquire(t, f, "a")
+	if f.Mode() != SharedMode || store.runs() == 0 {
+		t.Errorf("mode = %s after %d Redis calls, want shared after a probe", f.Mode(), store.runs())
+	}
+	if len(modes) != 1 || modes[0] != SharedMode {
+		t.Errorf("reported modes = %v, want [shared]", modes)
+	}
+	if strings.Contains(logs.String(), msgUnavailable) || !strings.Contains(logs.String(), msgRecovered) {
+		t.Errorf("want only the recovery logged:\n%s", logs.String())
+	}
+}

@@ -108,6 +108,13 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	if err != nil {
 		return fmt.Errorf("database schema: %w", err)
 	}
+	limiter, closeLimiter, err := newLimiter(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	// Deferred before the recorder's drain below, so it runs after the
+	// handlers have finished and released their Redis leases.
+	defer func() { result = errors.Join(result, closeLimiter()) }()
 	recorder, err := usage.NewRecorder(store, logger, usage.DefaultRecorderOptions())
 	if err != nil {
 		return err
@@ -129,7 +136,7 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	if err != nil {
 		return err
 	}
-	handler, err := newHandler(cfg, nil, recorder, m, traces, logger)
+	handler, err := newHandlerWithLimiter(cfg, nil, limiter, recorder, m, traces, logger)
 	if err != nil {
 		return err
 	}
@@ -166,6 +173,7 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 		slog.Int("breaker_failures", cfg.Breaker.Failures),
 		slog.Duration("breaker_cooldown", cfg.Breaker.Cooldown),
 		slog.Bool("tracing", cfg.Tracing),
+		slog.String("rate_limits", rateLimitMode(cfg)),
 	)
 	if (cfg.OpenAI != nil && cfg.OpenAI.FallbackTo != "") || (cfg.Anthropic != nil && cfg.Anthropic.FallbackTo != "") {
 		attrs = append(attrs, slog.Duration("provider_timeout", cfg.ProviderTimeout))
@@ -196,6 +204,15 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	}
 	logger.Info("HTTP servers stopped")
 	return err
+}
+
+// rateLimitMode names where rate limits are kept, for the startup log:
+// "shared" through Redis, or "local" to the instance.
+func rateLimitMode(cfg config) string {
+	if cfg.Redis != nil {
+		return "shared"
+	}
+	return "local"
 }
 
 // configuredModels returns the configured model names, the only model
@@ -238,13 +255,18 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 	}
 }
 
-// newHandler builds the provider clients, router, client authentication,
-// rate limiter, and HTTP handler for cfg. Each provider client is wrapped
+// newHandler is newHandlerWithLimiter with the in-process rate limiter.
+func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecorder, m *metrics.Metrics, tp trace.TracerProvider, logger *slog.Logger) (http.Handler, error) {
+	return newHandlerWithLimiter(cfg, httpClient, nil, recorder, m, tp, logger)
+}
+
+// newHandlerWithLimiter builds the provider clients, router, client
+// authentication, and HTTP handler for cfg. Each provider client is wrapped
 // with retries and, above them, a circuit breaker; the router's fallback
 // sits above both. A nil httpClient uses a client built by
-// newUpstreamClient, a nil m records no metrics, and a nil tp creates no
-// spans.
-func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecorder, m *metrics.Metrics, tp trace.TracerProvider, logger *slog.Logger) (http.Handler, error) {
+// newUpstreamClient, a nil limiter the in-process limits of cfg, a nil m
+// records no metrics, and a nil tp creates no spans.
+func newHandlerWithLimiter(cfg config, httpClient *http.Client, limiter httpapi.Limiter, recorder httpapi.UsageRecorder, m *metrics.Metrics, tp trace.TracerProvider, logger *slog.Logger) (http.Handler, error) {
 	if httpClient == nil {
 		httpClient = newUpstreamClient(cfg)
 	}
@@ -302,9 +324,10 @@ func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecor
 	if err != nil {
 		return nil, err
 	}
-	limiter, err := ratelimit.New(cfg.RateLimits)
-	if err != nil {
-		return nil, err
+	if limiter == nil {
+		if limiter, err = ratelimit.New(cfg.RateLimits); err != nil {
+			return nil, err
+		}
 	}
 	models := make(map[string]string, len(providers))
 	for name, e := range providers {
