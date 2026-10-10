@@ -41,7 +41,7 @@ func newTestLimiter(t *testing.T, limits map[string]Limits) (*Limiter, *clock) {
 // only the request rate is exercised.
 func mustAcquire(t *testing.T, l *Limiter, id string) {
 	t.Helper()
-	release, err := l.Acquire(id)
+	release, err := l.Acquire(t.Context(), id)
 	if err != nil {
 		t.Fatalf("Acquire(%s): %v", id, err)
 	}
@@ -50,7 +50,7 @@ func mustAcquire(t *testing.T, l *Limiter, id string) {
 
 func wantRejected(t *testing.T, l *Limiter, id string, limit Limit, retryAfter time.Duration) {
 	t.Helper()
-	release, err := l.Acquire(id)
+	release, err := l.Acquire(t.Context(), id)
 	if err == nil {
 		release()
 		t.Fatalf("Acquire(%s) succeeded, want %s rejection", id, limit)
@@ -102,7 +102,7 @@ func TestSustainedRate(t *testing.T) {
 	admitted := 0
 	// Try every 100ms for one minute: only one request per 500ms passes.
 	for range 600 {
-		if release, err := l.Acquire("a"); err == nil {
+		if release, err := l.Acquire(t.Context(), "a"); err == nil {
 			release()
 			admitted++
 		}
@@ -125,18 +125,18 @@ func TestRejectedRequestConsumesNothing(t *testing.T) {
 
 func TestConcurrencyLimit(t *testing.T) {
 	l, _ := newTestLimiter(t, map[string]Limits{"a": {RequestsPerMinute: 600, Burst: 10, MaxConcurrent: 2}})
-	r1, err := l.Acquire("a")
+	r1, err := l.Acquire(t.Context(), "a")
 	if err != nil {
 		t.Fatalf("Acquire 1: %v", err)
 	}
-	r2, err := l.Acquire("a")
+	r2, err := l.Acquire(t.Context(), "a")
 	if err != nil {
 		t.Fatalf("Acquire 2: %v", err)
 	}
 	wantRejected(t, l, "a", ConcurrentRequests, 0)
 
 	r1()
-	r3, err := l.Acquire("a")
+	r3, err := l.Acquire(t.Context(), "a")
 	if err != nil {
 		t.Fatalf("Acquire after release: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestConcurrencyLimit(t *testing.T) {
 
 func TestConcurrencyRejectionConsumesNoRate(t *testing.T) {
 	l, _ := newTestLimiter(t, map[string]Limits{"a": {RequestsPerMinute: 60, Burst: 2, MaxConcurrent: 1}})
-	release, err := l.Acquire("a")
+	release, err := l.Acquire(t.Context(), "a")
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -160,13 +160,13 @@ func TestConcurrencyRejectionConsumesNoRate(t *testing.T) {
 
 func TestReleaseIsIdempotent(t *testing.T) {
 	l, _ := newTestLimiter(t, map[string]Limits{"a": {RequestsPerMinute: 600, Burst: 10, MaxConcurrent: 1}})
-	r1, err := l.Acquire("a")
+	r1, err := l.Acquire(t.Context(), "a")
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
 	r1()
 	r1()
-	r2, err := l.Acquire("a")
+	r2, err := l.Acquire(t.Context(), "a")
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestClientsAreIndependent(t *testing.T) {
 		"a": {RequestsPerMinute: 60, Burst: 1, MaxConcurrent: 1},
 		"b": {RequestsPerMinute: 60, Burst: 2, MaxConcurrent: 2},
 	})
-	release, err := l.Acquire("a")
+	release, err := l.Acquire(t.Context(), "a")
 	if err != nil {
 		t.Fatalf("Acquire(a): %v", err)
 	}
@@ -190,11 +190,11 @@ func TestClientsAreIndependent(t *testing.T) {
 	wantRejected(t, l, "a", RequestRate, time.Second)
 
 	// a's exhausted limits do not affect b, which has its own.
-	rb1, err := l.Acquire("b")
+	rb1, err := l.Acquire(t.Context(), "b")
 	if err != nil {
 		t.Fatalf("Acquire(b): %v", err)
 	}
-	rb2, err := l.Acquire("b")
+	rb2, err := l.Acquire(t.Context(), "b")
 	if err != nil {
 		t.Fatalf("Acquire(b): %v", err)
 	}
@@ -206,7 +206,7 @@ func TestClientsAreIndependent(t *testing.T) {
 
 func TestUnknownClient(t *testing.T) {
 	l, _ := newTestLimiter(t, map[string]Limits{"a": {RequestsPerMinute: 60, Burst: 1, MaxConcurrent: 1}})
-	release, err := l.Acquire("nobody")
+	release, err := l.Acquire(t.Context(), "nobody")
 	if !errors.Is(err, ErrUnknownClient) {
 		t.Fatalf("err = %v, want ErrUnknownClient", err)
 	}
@@ -280,7 +280,7 @@ func TestConcurrentAcquire(t *testing.T) {
 	for range goroutines {
 		wg.Go(func() {
 			<-start
-			release, err := l.Acquire("a")
+			release, err := l.Acquire(t.Context(), "a")
 			if err != nil {
 				if !errors.Is(err, ErrLimitExceeded) {
 					t.Errorf("Acquire: %v", err)
@@ -311,7 +311,7 @@ func TestConcurrentSlotsNeverExceeded(t *testing.T) {
 	)
 	for range 100 {
 		wg.Go(func() {
-			release, err := l.Acquire("a")
+			release, err := l.Acquire(t.Context(), "a")
 			if err != nil {
 				return
 			}

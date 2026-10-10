@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -271,6 +273,63 @@ func TestClientWithoutLimitsIsAnInternalError(t *testing.T) {
 	rec := post(t, h, validBody)
 
 	assertError(t, rec, http.StatusInternalServerError, typeServer, codeInternalError)
+	if p.calls != 0 {
+		t.Errorf("provider called %d times, want 0", p.calls)
+	}
+}
+
+// limiterFunc adapts a function to Limiter.
+type limiterFunc func(ctx context.Context, clientID string) (func(), error)
+
+func (f limiterFunc) Acquire(ctx context.Context, clientID string) (func(), error) {
+	return f(ctx, clientID)
+}
+
+func TestLimiterReceivesRequestContext(t *testing.T) {
+	var (
+		gotClient   string
+		gotIdentity auth.Identity
+		gotID       string
+		released    int
+	)
+	limiter := limiterFunc(func(ctx context.Context, clientID string) (func(), error) {
+		gotClient = clientID
+		gotIdentity, _ = auth.FromContext(ctx)
+		gotID, _ = ctx.Value(requestIDKey{}).(string)
+		return func() { released++ }, nil
+	})
+	h, err := New(okProvider, testAuthenticator(t), limiter, testTimeout, testAccounting(), nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	rec := serve(t, h, requestWithAuth("Bearer "+keyB))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+	if gotClient != "team-b" || gotIdentity.ClientID != "team-b" {
+		t.Errorf("Acquire got client %q and context identity %+v, want team-b", gotClient, gotIdentity)
+	}
+	if want := rec.Header().Get(RequestIDHeader); gotID == "" || gotID != want {
+		t.Errorf("Acquire context request ID = %q, want %q", gotID, want)
+	}
+	if released != 1 {
+		t.Errorf("release called %d times, want 1", released)
+	}
+}
+
+func TestLimiterErrorIsAnInternalError(t *testing.T) {
+	p := &recordingProvider{}
+	limiter := limiterFunc(func(context.Context, string) (func(), error) {
+		return nil, errors.New("limiter unavailable")
+	})
+	h, err := New(p, testAuthenticator(t), limiter, testTimeout, testAccounting(), nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	assertError(t, post(t, h, validBody), http.StatusInternalServerError, typeServer, codeInternalError)
 	if p.calls != 0 {
 		t.Errorf("provider called %d times, want 0", p.calls)
 	}
