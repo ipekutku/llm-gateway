@@ -28,7 +28,7 @@ const (
 // and a key prefix of the test's own. The test's keys are deleted when it
 // ends; nothing else in Redis is touched. Without the variable the test is
 // skipped, except in CI, where a missing Redis must not pass silently.
-func testRedis(t *testing.T) (*redis.Client, string) {
+func testRedis(t testing.TB) (*redis.Client, string) {
 	t.Helper()
 	url := os.Getenv(testRedisURLVar)
 	if url == "" {

@@ -734,6 +734,8 @@ The implemented responsibilities, failure behavior, and the decisions behind wha
 
 **Target version:** `v0.8.0`
 
+**Status:** In progress. Request-path component benchmarks and their [baseline measurements](performance.md) are implemented. End-to-end load scenarios, profiles, and connection-management measurements remain; the milestone exit criterion is not yet met.
+
 ## Objective
 
 Measure gateway overhead and identify scaling limits.
