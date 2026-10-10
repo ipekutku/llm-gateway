@@ -40,11 +40,22 @@ var bodyReadTimeout = 30 * time.Second
 type handler struct {
 	provider        llm.Provider
 	auth            *auth.Authenticator
-	limiter         *ratelimit.Limiter
+	limiter         Limiter
 	upstreamTimeout time.Duration
 	log             *slog.Logger
 	accounting      Accounting
 	metrics         Metrics
+}
+
+// Limiter admits requests under each client's limits. ratelimit.Limiter
+// implements it.
+type Limiter interface {
+	// Acquire admits one request for clientID, or rejects it. ctx is the
+	// request's context, carrying its ID and the client's auth.Identity.
+	// A rejection is a *ratelimit.Error; any other error is answered as an
+	// internal error. On success the caller calls release exactly once
+	// when the request has finished.
+	Acquire(ctx context.Context, clientID string) (release func(), err error)
 }
 
 // UsageRecorder accepts records without waiting for persistent storage.
@@ -115,7 +126,7 @@ type Accounting struct {
 //
 // If the request context carries a trace span, such as the server span of
 // tracing.Handler, the request ID, client ID, and outcome are added to it.
-func New(provider llm.Provider, authenticator *auth.Authenticator, limiter *ratelimit.Limiter, upstreamTimeout time.Duration, accounting Accounting, metrics Metrics, log *slog.Logger) (http.Handler, error) {
+func New(provider llm.Provider, authenticator *auth.Authenticator, limiter Limiter, upstreamTimeout time.Duration, accounting Accounting, metrics Metrics, log *slog.Logger) (http.Handler, error) {
 	switch {
 	case provider == nil:
 		return nil, errors.New("httpapi: nil provider")
@@ -244,7 +255,7 @@ func bearerToken(header http.Header) (string, error) {
 // caller must call release when the request has finished. On failure it
 // writes a 429, or a 500 for a client without limits, and returns false.
 func (h *handler) acquire(w http.ResponseWriter, r *http.Request, id auth.Identity) (release func(), ok bool) {
-	release, err := h.limiter.Acquire(id.ClientID)
+	release, err := h.limiter.Acquire(r.Context(), id.ClientID)
 	if err == nil {
 		return release, true
 	}

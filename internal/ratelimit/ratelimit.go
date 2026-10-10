@@ -10,6 +10,7 @@
 package ratelimit
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -125,7 +126,11 @@ func New(limits map[string]Limits) (*Limiter, error) {
 // On success the caller must call release exactly once when the request
 // has finished, to free its concurrency slot. Further calls do nothing.
 // An unconfigured client returns an error wrapping ErrUnknownClient.
-func (l *Limiter) Acquire(clientID string) (release func(), err error) {
+//
+// The context is unused: the limiter keeps its state in memory and never
+// waits. It is accepted so the limiter satisfies interfaces whose
+// implementations may do I/O.
+func (l *Limiter) Acquire(_ context.Context, clientID string) (release func(), err error) {
 	c, ok := l.clients[clientID]
 	if !ok {
 		return nil, fmt.Errorf("ratelimit: client %s: %w", clientID, ErrUnknownClient)
