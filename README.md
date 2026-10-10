@@ -260,6 +260,8 @@ Redis only holds rate-limit state, and the gateway does not depend on it to serv
 * If Redis does not answer at startup, the gateway logs a warning and starts with per-instance limits instead of failing.
 * A request holds its concurrency slot in Redis for at most the body-read time, the upstream timeout, and 30 seconds more, so slots held by an instance that crashed free themselves.
 
+Keep Redis reachable only by the gateways: anyone who can write to it can reset or use up any client's limits. Protect it with a password, and use `rediss://` for any Redis not on the local host, since `redis://` sends the password unencrypted. Keys are not separated per deployment, so gateways that must not share limits, such as staging and production, need different Redis servers or databases (the `/<db>` at the end of the URL).
+
 Redis Cluster and Sentinel are not supported; use one Redis endpoint, such as a managed primary. URL options that change retries are overridden: the gateway turns off go-redis's command retries, because a retried rate-limit check could count a request twice.
 
 ### Clients

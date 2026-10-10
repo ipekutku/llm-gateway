@@ -691,3 +691,49 @@ func TestSharedReportsFailures(t *testing.T) {
 		t.Errorf("calls = %q, want %q", got, want)
 	}
 }
+
+// replyStore is a redis.Scripter whose scripts all return reply.
+type replyStore struct {
+	redis.Scripter // nil: only EvalSha is used
+	reply          any
+}
+
+func (s replyStore) EvalSha(context.Context, string, []string, ...any) *redis.Cmd {
+	return redis.NewCmdResult(s.reply, nil)
+}
+
+func TestSharedRejectsImpossibleReplies(t *testing.T) {
+	// One request a minute with a burst of 2: no wait can exceed two
+	// minutes.
+	limits := map[string]Limits{"a": {RequestsPerMinute: 1, Burst: 2, MaxConcurrent: 1}}
+	for name, reply := range map[string][]any{
+		"negative wait":     {int64(1), int64(-5)},
+		"zero wait":         {int64(1), int64(0)},
+		"wait too long":     {int64(1), int64(2*60_000_000 + 1)},
+		"unknown status":    {int64(7), int64(0)},
+		"admitted and wait": {int64(0), int64(3)},
+		"three values":      {int64(0), int64(0), int64(0)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var calls callRecorder
+			s := newSharedWith(t, replyStore{reply: reply}, limits, SharedOptions{Timeout: testTimeout, Lease: testLease, OnCall: calls.record})
+			release, err := s.Acquire(t.Context(), "a")
+			if err == nil {
+				release()
+				t.Fatal("Acquire accepted an impossible reply")
+			}
+			if _, ok := errors.AsType[*Error](err); ok {
+				t.Errorf("err = %v is a rejection, want a store failure", err)
+			}
+			if got := calls.got(); got != "acquire error" {
+				t.Errorf("calls = %q, want acquire error", got)
+			}
+		})
+	}
+
+	// The longest possible wait is still a rejection.
+	s := newSharedWith(t, replyStore{reply: []any{int64(1), int64(2 * 60_000_000)}}, limits, SharedOptions{Timeout: testTimeout, Lease: testLease})
+	if got := sharedRejected(t, s, "a"); got != 2*time.Minute {
+		t.Errorf("RetryAfter = %v, want 2m", got)
+	}
+}

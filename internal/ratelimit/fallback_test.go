@@ -460,3 +460,25 @@ func TestFallbackStartLocal(t *testing.T) {
 		t.Errorf("want only the recovery logged:\n%s", logs.String())
 	}
 }
+
+func TestFallbackUnknownClientDoesNotEndAnOutage(t *testing.T) {
+	ft := newFallbackTest(t, downRedis(t), "", map[string]Limits{"a": generousLimits}, testTimeout)
+	fallbackAcquire(t, ft.Fallback, "a")
+	ft.wantMode(t, LocalMode)
+
+	// The probe falls to a request for a client without limits, which is
+	// rejected before any Redis call: Redis is not shown to work.
+	ft.clock.Advance(testRetryInterval)
+	before := ft.store.runs()
+	if _, err := ft.Acquire(t.Context(), "nobody"); !errors.Is(err, ErrUnknownClient) {
+		t.Fatalf("err = %v, want ErrUnknownClient", err)
+	}
+	ft.wantMode(t, LocalMode)
+	ft.wantLogs(t, msgRecovered, 0)
+
+	// The next request probes instead.
+	fallbackAcquire(t, ft.Fallback, "a")
+	if n := ft.store.runs(); n != before+1 {
+		t.Errorf("%d Redis calls, want %d", n, before+1)
+	}
+}

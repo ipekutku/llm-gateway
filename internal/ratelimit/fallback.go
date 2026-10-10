@@ -106,11 +106,13 @@ func (f *Fallback) Acquire(ctx context.Context, clientID string) (release func()
 		return f.local.Acquire(ctx, clientID)
 	}
 	release, err = f.shared.Acquire(ctx, clientID)
-	if _, rejected := errors.AsType[*Error](err); err == nil || rejected || errors.Is(err, ErrUnknownClient) {
+	if _, rejected := errors.AsType[*Error](err); err == nil || rejected {
 		f.succeeded(ctx)
 		return release, err
 	}
-	if ctx.Err() != nil {
+	// An unknown client is rejected before any Redis call, and an ended
+	// request may have cut the call short: neither says Redis works.
+	if errors.Is(err, ErrUnknownClient) || ctx.Err() != nil {
 		f.inconclusive()
 		return nil, err
 	}
@@ -164,8 +166,8 @@ func (f *Fallback) failed(ctx context.Context, err error) {
 	}
 }
 
-// inconclusive records a Redis call that ended because its request did. A
-// probe that tells nothing lets the next request probe.
+// inconclusive records a call that says nothing about Redis. A probe that
+// tells nothing lets the next request probe.
 func (f *Fallback) inconclusive() {
 	f.mu.Lock()
 	defer f.mu.Unlock()

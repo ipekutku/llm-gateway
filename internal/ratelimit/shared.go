@@ -191,8 +191,8 @@ func (s *Shared) Acquire(ctx context.Context, clientID string) (release func(), 
 	start := time.Now()
 	res, err := acquireScript.Run(callCtx, s.store, []string{c.rateKey, c.activeKey},
 		c.interval, c.tolerance, c.maxConcurrent, s.lease, token).Int64Slice()
-	if err == nil && len(res) != 2 {
-		err = fmt.Errorf("unexpected reply of %d values", len(res))
+	if err == nil {
+		err = c.checkReply(res)
 	}
 	if err == nil || ctx.Err() == nil {
 		s.onCall(OpAcquire, time.Since(start), err)
@@ -201,13 +201,10 @@ func (s *Shared) Acquire(ctx context.Context, clientID string) (release func(), 
 		return nil, fmt.Errorf("ratelimit: client %s: shared limits: %w", clientID, contextCause(callCtx, err))
 	}
 	switch res[0] {
-	case admitted:
 	case rejectedConcurrent:
 		return nil, &Error{ClientID: clientID, Limit: ConcurrentRequests}
 	case rejectedRate:
 		return nil, &Error{ClientID: clientID, Limit: RequestRate, RetryAfter: time.Duration(res[1]) * time.Microsecond}
-	default:
-		return nil, fmt.Errorf("ratelimit: client %s: shared limits: unexpected reply %d", clientID, res[0])
 	}
 
 	// The request may have been canceled by the time it is released, but
@@ -223,6 +220,22 @@ func (s *Shared) Acquire(ctx context.Context, clientID string) (release func(), 
 			s.onCall(OpRelease, time.Since(start), err)
 		})
 	}, nil
+}
+
+// checkReply reports an acquireScript reply that the script cannot have
+// produced, so that a misbehaving store is treated as a failure rather
+// than, for example, turned into a meaningless Retry-After. The wait can
+// never exceed the burst's tolerance plus one interval.
+func (c sharedClient) checkReply(res []int64) error {
+	switch {
+	case len(res) != 2:
+		return fmt.Errorf("unexpected reply of %d values", len(res))
+	case res[0] == admitted && res[1] == 0, res[0] == rejectedConcurrent && res[1] == 0:
+		return nil
+	case res[0] == rejectedRate && 0 < res[1] && res[1] <= c.tolerance+c.interval:
+		return nil
+	}
+	return fmt.Errorf("unexpected reply %v", res)
 }
 
 // contextCause adds ctx's error to err if ctx has ended and err does not
