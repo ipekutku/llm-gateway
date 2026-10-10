@@ -222,6 +222,7 @@ The `model` field must match a configured model exactly; the request is routed t
 | `ANTHROPIC_BASE_URL` | Optional provider origin with an optional path prefix, without `/v1/messages`. Default `https://api.anthropic.com`. See [Provider destinations](#provider-destinations). |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
 | `GATEWAY_METRICS_ADDR` | Listen address of the unauthenticated Prometheus endpoint, `/metrics`. Default `127.0.0.1:9464`. Must differ from `GATEWAY_ADDR`. See [Logs, metrics, and traces](#logs-metrics-and-traces). |
+| `GATEWAY_PPROF` | Optional `true` or `false` (default). Enables `/debug/pprof/` on the metrics listener only. Unset or blank disables it; other values fail startup. See [Profiling](#profiling). |
 | `GATEWAY_LOG_FORMAT` | `text` (default) or `json`, written to standard error. See [Logs, metrics, and traces](#logs-metrics-and-traces). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables tracing: base URL of an OpenTelemetry collector accepting OTLP over HTTP, such as `http://127.0.0.1:4318`. Unset means no tracing. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (the full URL) also enables it, and the other standard `OTEL_*` exporter, sampler, and resource variables apply. See [Traces](#traces). |
 | `GATEWAY_UPSTREAM_TIMEOUT` | Time limit for all upstream work on one request, as a Go duration such as `90s` or `2m`. Default `120s`. If it expires, the client gets `504 upstream_timeout`. |
@@ -401,6 +402,29 @@ scrape_configs:
       - targets: ["127.0.0.1:9464"]
 ```
 
+#### Profiling
+
+For local performance work, enable Go's profiling handlers before starting the gateway:
+
+```bash
+export GATEWAY_PPROF=true
+go run ./cmd/gateway
+```
+
+In another terminal, collect a CPU profile while sending traffic (use the [local fake provider](docs/performance.md#local-fake-provider) to avoid paid calls), or inspect heap allocations and goroutines:
+
+```bash
+go tool pprof 'http://127.0.0.1:9464/debug/pprof/profile?seconds=10'
+go tool pprof 'http://127.0.0.1:9464/debug/pprof/heap'
+curl -s 'http://127.0.0.1:9464/debug/pprof/goroutine?debug=1'
+```
+
+Use `top` in the pprof prompt, or add `-top` to print a report without entering it. Replace the port if `GATEWAY_METRICS_ADDR` differs. `GET /debug/pprof/` lists the available profiles; when disabled, these paths return `404`. They are never mounted on the API listener. `GATEWAY_PPROF=false` (or unsetting it) disables them after a restart.
+
+These endpoints have **no authentication**. Keep the metrics listener on loopback when profiling; do not expose it publicly or assume that a network suitable for Prometheus is suitable for profiling. CPU and heap profiles describe code locations and allocation sites rather than dump prompt/completion bodies, but diagnostics also expose stack traces, file paths, symbols, and process arguments (`cmdline`). Treat captured profiles as sensitive. Anyone with access can start profiling or trigger GC, affecting the process's performance. Profiling is opt-in diagnostics, not part of the content-exclusion guarantee for normal logs, metrics, and exported spans.
+
+No block or mutex sampling is enabled automatically; those profiles can be empty. Timed profile handlers extend their response write deadlines without changing `/metrics` timeouts, and the existing bounded shutdown still applies. See [profiling notes](docs/performance.md#profiling-the-gateway) for measurement limits.
+
 #### Traces
 
 Setting `OTEL_EXPORTER_OTLP_ENDPOINT` makes the gateway export OpenTelemetry traces over OTLP/HTTP (protobuf), for example to a local collector or Jaeger:
@@ -466,6 +490,7 @@ Requests with an unknown model or a wrong gateway key fill the request panels wi
 * Without `GATEWAY_REDIS_URL`, and while Redis is unavailable, rate limits and concurrency counts are kept per gateway process: N instances allow a client up to N times its limits. Each rate-limit check with Redis adds one Redis round trip to a request, and releasing its slot another.
 * Clients are read from a file at startup; changing them requires a restart. Each client has one key, so rotating a key briefly means replacing it.
 * `/metrics` has no authentication; it reveals request counts per configured model and status and provider health, never keys, clients, or content. Keep `GATEWAY_METRICS_ADDR` on loopback or a network only Prometheus can reach.
+* With `GATEWAY_PPROF=true`, the same metrics listener exposes unauthenticated profiling and process diagnostics. Keep it on loopback for profiling; these outputs reveal internal details and are not covered by normal telemetry's content-exclusion guarantee.
 * With tracing enabled, every request, including rejected ones, produces spans, and a client's `traceparent` decides whether its requests are sampled. Clients cannot see trace data, but anyone who can reach the gateway can add to the collector's load.
 * Every rejected key logs one warning, and there is no per-IP limit on unauthenticated requests; anyone who can reach the port can fill the logs. Another reason to keep the gateway behind a proxy.
 * A request body must arrive within 30 seconds (otherwise `408`), and idle keep-alive connections close after 2 minutes. Both are fixed.

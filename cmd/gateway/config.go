@@ -73,6 +73,8 @@ type config struct {
 	Addr string
 	// MetricsAddr is the separate listen address serving /metrics.
 	MetricsAddr string
+	// Pprof enables unauthenticated profiling on the metrics listener only.
+	Pprof       bool
 	DatabaseURL string
 	Pricing     *usage.Pricing
 	// UpstreamTimeout bounds all upstream work for one request.
@@ -129,6 +131,13 @@ func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error
 
 	var errs []error
 	var err error
+	switch strings.TrimSpace(getenv("GATEWAY_PPROF")) {
+	case "", "false":
+	case "true":
+		cfg.Pprof = true
+	default:
+		errs = append(errs, errors.New("GATEWAY_PPROF must be true or false"))
+	}
 	if cfg.DatabaseURL, err = loadDatabaseURL(getenv); err != nil {
 		errs = append(errs, err)
 	}

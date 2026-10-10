@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -193,7 +194,7 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	defer stopServers()
 	metricsDone := make(chan error, 1)
 	go func() {
-		err := serve(ctx, newMetricsServer(m.Handler(logger), logger), metricsLn, shutdownTimeout)
+		err := serve(ctx, newMetricsServer(m.Handler(logger), cfg.Pprof, logger), metricsLn, shutdownTimeout)
 		stopServers()
 		metricsDone <- err
 	}()
@@ -228,11 +229,18 @@ func configuredModels(cfg config) []string {
 }
 
 // newMetricsServer returns the server for the metrics listener. It serves
-// GET /metrics without authentication, so its address must be reachable
-// only by the metrics scraper.
-func newMetricsServer(metricsHandler http.Handler, logger *slog.Logger) *http.Server {
+// GET /metrics and optional profiling without authentication. Never use
+// DefaultServeMux: importing pprof registers routes there even when disabled.
+func newMetricsServer(metricsHandler http.Handler, enablePprof bool, logger *slog.Logger) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", metricsHandler)
+	if enablePprof {
+		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+	}
 	return &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: readHeaderTimeout,
