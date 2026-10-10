@@ -629,3 +629,65 @@ func TestSharedConcurrentSlotsNeverExceeded(t *testing.T) {
 		t.Errorf("%d leases held after every release, want 0", n)
 	}
 }
+
+// callRecorder collects the calls reported to SharedOptions.OnCall.
+type callRecorder struct {
+	mu    sync.Mutex
+	calls []string // "op ok" or "op error"
+}
+
+func (r *callRecorder) record(op string, d time.Duration, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	if d <= 0 {
+		result += " without duration"
+	}
+	r.calls = append(r.calls, op+" "+result)
+}
+
+func (r *callRecorder) got() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.calls, ", ")
+}
+
+func TestSharedReportsCalls(t *testing.T) {
+	client, prefix := testRedis(t)
+	var calls callRecorder
+	s := newSharedWith(t, client, map[string]Limits{"a": {RequestsPerMinute: 1, Burst: 1, MaxConcurrent: 5}},
+		SharedOptions{KeyPrefix: prefix, Timeout: testTimeout, Lease: testLease, OnCall: calls.record})
+
+	sharedAcquire(t, s, "a")
+	sharedRejected(t, s, "a")
+
+	// A rejection is an answer from Redis, not a failure.
+	if got, want := calls.got(), "acquire ok, release ok, acquire ok"; got != want {
+		t.Errorf("calls = %q, want %q", got, want)
+	}
+}
+
+func TestSharedReportsFailures(t *testing.T) {
+	var calls callRecorder
+	down := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", MaxRetries: -1, DialerRetries: 1, ContextTimeoutEnabled: true})
+	t.Cleanup(func() { down.Close() })
+	s := newSharedWith(t, down, map[string]Limits{"a": generousLimits},
+		SharedOptions{Timeout: testTimeout, Lease: testLease, OnCall: calls.record})
+
+	if _, err := s.Acquire(t.Context(), "a"); err == nil {
+		t.Fatal("Acquire succeeded against a Redis that is down")
+	}
+	// A request that ended by itself says nothing about Redis.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := s.Acquire(ctx, "a"); err == nil {
+		t.Fatal("Acquire succeeded with a canceled context")
+	}
+
+	if got, want := calls.got(), "acquire error"; got != want {
+		t.Errorf("calls = %q, want %q", got, want)
+	}
+}

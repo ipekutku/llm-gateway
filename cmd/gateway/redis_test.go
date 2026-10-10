@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ipekutku/llm-gateway/internal/metrics"
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/redis/go-redis/v9"
 )
@@ -114,7 +115,7 @@ func TestRedisClientOptionsOverrideTheURL(t *testing.T) {
 }
 
 func TestNewLimiterWithoutRedisIsLocal(t *testing.T) {
-	limiter, closeLimiter, err := newLimiter(t.Context(), config{RateLimits: testRateLimits, UpstreamTimeout: defaultUpstreamTimeout}, slog.New(slog.DiscardHandler))
+	limiter, closeLimiter, err := newLimiter(t.Context(), config{RateLimits: testRateLimits, UpstreamTimeout: defaultUpstreamTimeout}, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,8 +130,12 @@ func TestNewLimiterStartsLocalWhenRedisIsUnreachable(t *testing.T) {
 	cfg := config{RateLimits: testRateLimits, UpstreamTimeout: defaultUpstreamTimeout, Redis: &redis.Options{Addr: "127.0.0.1:1", Password: redisPassword}}
 	var logs syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	m, err := metrics.New([]string{"gpt-4o"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	limiter, closeLimiter, err := newLimiter(t.Context(), cfg, logger)
+	limiter, closeLimiter, err := newLimiter(t.Context(), cfg, m, logger)
 	if err != nil {
 		t.Fatalf("newLimiter: %v", err)
 	}
@@ -142,12 +147,16 @@ func TestNewLimiterStartsLocalWhenRedisIsUnreachable(t *testing.T) {
 	if f.Mode() != ratelimit.LocalMode {
 		t.Errorf("mode = %s, want local", f.Mode())
 	}
-	// Requests are still limited, locally.
+	assertMetrics(t, m, "gateway_ratelimit_store_up 0", `gateway_ratelimit_store_errors_total{operation="acquire"} 0`)
+
+	// Requests are still limited, locally, after the first one probed
+	// Redis and failed.
 	release, err := limiter.Acquire(t.Context(), "team-a")
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
 	release()
+	assertMetrics(t, m, "gateway_ratelimit_store_up 0", `gateway_ratelimit_store_errors_total{operation="acquire"} 1`)
 
 	if !strings.Contains(logs.String(), "level=WARN msg=\"rate limit store unreachable at startup, using local limits\"") {
 		t.Errorf("no startup warning:\n%s", logs.String())
@@ -169,7 +178,11 @@ func TestRequestPathSharedRateLimits(t *testing.T) {
 	cfg.Redis, cfg.RedisKeyPrefix = opts, prefix
 	cfg.RateLimits = map[string]ratelimit.Limits{"team-a": {RequestsPerMinute: 1, Burst: 1, MaxConcurrent: 5}}
 
-	limiter, closeLimiter, err := newLimiter(t.Context(), cfg, slog.New(slog.DiscardHandler))
+	m, err := metrics.New(configuredModels(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	limiter, closeLimiter, err := newLimiter(t.Context(), cfg, m, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newLimiter: %v", err)
 	}
@@ -177,7 +190,7 @@ func TestRequestPathSharedRateLimits(t *testing.T) {
 	if f, ok := limiter.(*ratelimit.Fallback); !ok || f.Mode() != ratelimit.SharedMode {
 		t.Fatalf("limiter = %T, want a Fallback in shared mode", limiter)
 	}
-	h, err := newHandlerWithLimiter(cfg, nil, limiter, discardRecorder{}, nil, nil, slog.New(slog.DiscardHandler))
+	h, err := newHandlerWithLimiter(cfg, nil, limiter, discardRecorder{}, m, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandlerWithLimiter: %v", err)
 	}
@@ -206,6 +219,14 @@ func TestRequestPathSharedRateLimits(t *testing.T) {
 	if n, err := client.Exists(t.Context(), prefix+"{team-a}:active").Result(); err != nil || n != 0 {
 		t.Errorf("lease set exists = %d, %v; want 0 after release", n, err)
 	}
+	// Two checks in Redis, one release, and no failures.
+	assertMetrics(t, m,
+		"gateway_ratelimit_store_up 1",
+		`gateway_ratelimit_store_call_duration_seconds_count{operation="acquire"} 2`,
+		`gateway_ratelimit_store_call_duration_seconds_count{operation="release"} 1`,
+		`gateway_ratelimit_store_errors_total{operation="acquire"} 0`,
+		`gateway_ratelimit_store_errors_total{operation="release"} 0`,
+	)
 }
 
 func TestRunWithUnreachableRedis(t *testing.T) {

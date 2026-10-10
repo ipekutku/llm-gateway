@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/httpapi"
+	"github.com/ipekutku/llm-gateway/internal/metrics"
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/redis/go-redis/v9"
 )
@@ -56,7 +57,9 @@ func loadRedis(getenv func(string) string) (*redis.Options, error) {
 // answers, and the in-process limits while it does not. A Redis that does
 // not answer at startup is logged and does not stop the gateway; the
 // Fallback starts with local limits and probes Redis on the first request.
-func newLimiter(ctx context.Context, cfg config, logger *slog.Logger) (httpapi.Limiter, func() error, error) {
+//
+// m receives the Redis calls and mode changes; nil records nothing.
+func newLimiter(ctx context.Context, cfg config, m *metrics.Metrics, logger *slog.Logger) (httpapi.Limiter, func() error, error) {
 	local, err := ratelimit.New(cfg.RateLimits)
 	if err != nil {
 		return nil, nil, err
@@ -70,6 +73,7 @@ func newLimiter(ctx context.Context, cfg config, logger *slog.Logger) (httpapi.L
 		KeyPrefix: cfg.RedisKeyPrefix,
 		Timeout:   redisCallTimeout,
 		Lease:     httpapi.BodyReadTimeout + cfg.UpstreamTimeout + leaseMargin,
+		OnCall:    m.ObserveRateLimitStoreCall,
 	})
 	if err != nil {
 		client.Close()
@@ -85,11 +89,13 @@ func newLimiter(ctx context.Context, cfg config, logger *slog.Logger) (httpapi.L
 	f, err := ratelimit.NewFallback(shared, local, ratelimit.FallbackSettings{
 		RetryInterval: redisRetryInterval,
 		StartLocal:    pingErr != nil,
+		OnModeChange:  m.SetRateLimitMode,
 	}, logger)
 	if err != nil {
 		client.Close()
 		return nil, nil, err
 	}
+	m.AddRateLimitStore(f.Mode())
 	return f, client.Close, nil
 }
 

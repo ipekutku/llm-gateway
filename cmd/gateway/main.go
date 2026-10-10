@@ -108,7 +108,11 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	if err != nil {
 		return fmt.Errorf("database schema: %w", err)
 	}
-	limiter, closeLimiter, err := newLimiter(ctx, cfg, logger)
+	m, err := metrics.New(configuredModels(cfg))
+	if err != nil {
+		return err
+	}
+	limiter, closeLimiter, err := newLimiter(ctx, cfg, m, logger)
 	if err != nil {
 		return err
 	}
@@ -132,10 +136,6 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 			logger.Info("usage recorder stopped")
 		}
 	}()
-	m, err := metrics.New(configuredModels(cfg))
-	if err != nil {
-		return err
-	}
 	handler, err := newHandlerWithLimiter(cfg, nil, limiter, recorder, m, traces, logger)
 	if err != nil {
 		return err
