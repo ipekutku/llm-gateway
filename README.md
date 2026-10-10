@@ -131,6 +131,12 @@ This project prioritizes:
 * production-oriented error handling
 * measurable reliability and performance as the project evolves
 
+## Performance
+
+Local synthetic measurements on an Apple M1 (Go 1.26.9) reached **947 successful requests/sec with 500 workers** over a 10-second run against a 500 ms fake provider, with an **18.6 ms p95 gateway-minus-baseline difference** and **89.5 MiB sampled peak RSS**. These are single-run loopback comparisons, not capacity or isolated-overhead guarantees. The default 30-second high-concurrency runs saturated with many errors and accounting drops; those results are documented too, not hidden.
+
+`make loadtest` reproduces direct-fake/gateway comparisons, a fixed-arrival check, metrics, and CPU/heap profiles without paid calls. It needs a migrated disposable PostgreSQL database and is not run in CI. See [performance measurements](docs/performance.md#running-local-load-scenarios) for setup, raw results, caveats, and component benchmarks.
+
 ## Running Locally
 
 Requires Go 1.26.9 or later and PostgreSQL. For a disposable local database, use Docker:
@@ -514,7 +520,7 @@ The Makefile defines the verification commands used locally and in GitHub Action
 
 The v0.6 release checks include `TestObservabilityExcludesSensitiveData`: the real handler, router, resilience layers, and adapters call fake upstreams while text/JSON logs, Prometheus output, and exported spans are checked together. It covers both providers, retries, fallback, admission errors, malformed upstream responses, and unexpected protocol field values. Separate tests cover provider redirect isolation, collector error responses, and database errors containing rejected values. No paid calls are needed. Database diagnostics retain operation context and SQLSTATE while omitting server messages and connection details.
 
-Before tagging, run `make check` with the disposable database and Redis enabled as below and require green CI on the merged commit. This verifies behavior and known Go vulnerabilities, not throughput or latency overhead; load tests remain v0.8 work. The local stack was exercised with fake traffic during PR 8 (see [verification](docs/architecture.md#local-observability-stack)); the Linux Docker path and container-image vulnerability scanning are not covered by `make check`. The optional live `make smoke` passed for both providers on 2026-10-10 during the v0.6 closeout. That harness does not enable metrics or tracing or persist usage.
+Before tagging, run `make check` with the disposable database and Redis enabled as below and require green CI on the merged commit. This verifies behavior and known Go vulnerabilities, not throughput or latency overhead; `make loadtest` is a separate opt-in measurement target. The local stack was exercised with fake traffic during PR 8 (see [verification](docs/architecture.md#local-observability-stack)); the Linux Docker path and container-image vulnerability scanning are not covered by `make check`. The optional live `make smoke` passed for both providers on 2026-10-10 during the v0.6 closeout. That harness does not enable metrics or tracing or persist usage.
 
 ### PostgreSQL integration tests
 

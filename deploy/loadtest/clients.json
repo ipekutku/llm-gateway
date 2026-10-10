@@ -1,0 +1,11 @@
+{
+  "clients": [
+    {
+      "id": "loadtest",
+      "key_sha256": "10247e4ff8eab2b64ddfb0242e50a98de926d86bc0fbfb89e904e75cc3747329",
+      "requests_per_minute": 1000000,
+      "burst": 1000000,
+      "max_concurrent": 10000
+    }
+  ]
+}

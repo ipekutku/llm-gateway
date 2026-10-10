@@ -1,0 +1,3 @@
+POST http://127.0.0.1:FAKE_PORT/v1/chat/completions
+Content-Type: application/json
+@deploy/loadtest/openai.json
