@@ -47,7 +47,11 @@ const (
 )
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	logger, err := newLogger(os.Stderr, os.Getenv)
+	if err != nil {
+		slog.New(slog.NewTextHandler(os.Stderr, nil)).Error("gateway failed", slog.Any("error", fmt.Errorf("configuration: %w", err)))
+		os.Exit(1)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
