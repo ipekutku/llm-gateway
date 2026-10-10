@@ -43,6 +43,26 @@ This fixture is not a provider emulator: only `model` and `stream` affect handli
 
 The current fake uses loopback HTTP/1.1, not production HTTPS/HTTP/2. The fake and load generator can themselves become bottlenecks, especially when they share the gateway's machine. This PR supplies the fixture only; reproducible load scenarios, profiles, and end-to-end baseline results are still pending.
 
+## Profiling the gateway
+
+Set `GATEWAY_PPROF=true` before starting the gateway. The default is off, and profiles are exposed only on the metrics listener, never the API port. Keep that listener on loopback: these endpoints are unauthenticated, expose internal process details, and allow callers to trigger profiling and GC. See the [README security warning](../README.md#profiling).
+
+With synthetic traffic running against the [local fake provider](#local-fake-provider), collect a CPU report or heap-allocation report from another terminal:
+
+```bash
+go tool pprof -top 'http://127.0.0.1:9464/debug/pprof/profile?seconds=10'
+go tool pprof -top 'http://127.0.0.1:9464/debug/pprof/heap'
+curl -s 'http://127.0.0.1:9464/debug/pprof/goroutine?debug=1'
+```
+
+Without `-top`, `go tool pprof` opens an interactive prompt. CPU capture is process-global, so run one capture at a time. The profile describes this gateway process, not the fake server, load generator, or database. Heap profiles sample allocation sites and live allocated bytes, not total RSS; use the existing process and Go metrics for memory under load. Stack and symbol data are internal details, and the `cmdline` endpoint exposes process arguments: treat profile artifacts as sensitive even though CPU/heap profiles do not dump raw heap objects or prompt/completion bodies.
+
+Profiling changes the workload and can add overhead. Block and mutex sampling are not enabled automatically, so those profiles can be empty. Timed captures extend their response write deadline; they do not relax normal `/metrics` timeouts or the bounded shutdown. A capture longer than the shutdown budget can be cut short. Disable the setting and restart when finished.
+
+These commands provide collection access only. Reproducible concurrent load scenarios, measured CPU hotspots, and end-to-end baseline results remain later PRs; collecting an idle profile is not a performance measurement.
+
+Local CLI verification on 2026-10-11 used the real gateway process, synthetic provider settings, and a task-owned temporary PostgreSQL database. `go tool pprof -top` fetched and parsed a 10-second CPU capture and a heap profile on the metrics listener; the API listener returned 404 for profiling, and restarting with `GATEWAY_PPROF=false` returned 404 on the metrics profile route while `/metrics` remained 200. No provider calls or load traffic were sent. This verifies collection and isolation only, not performance under load; the temporary database and artifacts were removed afterwards.
+
 ## Running benchmarks
 
 ```bash

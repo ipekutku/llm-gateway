@@ -80,6 +80,44 @@ func load(vars map[string]string) (config, error) {
 	return loadConfig(env(vars), files(map[string]string{clientsPath: testClientsFile, pricingPath: `{"prices":[]}`}))
 }
 
+func TestLoadConfigPprof(t *testing.T) {
+	for _, tt := range []struct {
+		value string
+		want  bool
+		bad   bool
+	}{
+		{value: ""},
+		{value: " \t"},
+		{value: "false"},
+		{value: " false "},
+		{value: "true", want: true},
+		{value: " true ", want: true},
+		{value: "TRUE", bad: true},
+		{value: "1", bad: true},
+		{value: "0", bad: true},
+		{value: "yes", bad: true},
+		{value: "synthetic-secret-marker", bad: true},
+	} {
+		t.Run(tt.value, func(t *testing.T) {
+			cfg, err := load(map[string]string{
+				"OPENAI_MODEL": "local", "OPENAI_API_KEY": openaiKey, "GATEWAY_PPROF": tt.value,
+			})
+			if tt.bad {
+				if err == nil || err.Error() != "GATEWAY_PPROF must be true or false" {
+					t.Fatalf("loadConfig() error = %v, want fixed pprof configuration error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Pprof != tt.want {
+				t.Errorf("Pprof = %v, want %v", cfg.Pprof, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoadProviderBaseURLs(t *testing.T) {
 	for _, provider := range []struct {
 		prefix     string
