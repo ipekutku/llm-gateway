@@ -3,15 +3,19 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/httpapi"
+	"github.com/ipekutku/llm-gateway/internal/metrics"
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/usage"
 )
@@ -19,6 +23,7 @@ import (
 type usageCapture struct {
 	records chan usage.Record
 	accept  bool
+	metrics *metrics.Metrics
 }
 
 func (c *usageCapture) Record(r usage.Record) bool { c.records <- r; return c.accept }
@@ -49,8 +54,12 @@ func usageGateway(t *testing.T, oa, an *upstream, edit func(*config)) (*httptest
 	}
 	cfg.Pricing = prices
 	edit(&cfg)
-	capture := &usageCapture{records: make(chan usage.Record, 100), accept: true}
-	h, err := newHandler(cfg, nil, capture, nil, slog.New(slog.DiscardHandler))
+	m, err := metrics.New(configuredModels(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &usageCapture{records: make(chan usage.Record, 100), accept: true, metrics: m}
+	h, err := newHandler(cfg, nil, capture, m, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,8 +105,49 @@ func TestUsageRecordsSuccessAndFallback(t *testing.T) {
 			if len(c.records) != 0 {
 				t.Error("request produced more than one record")
 			}
+			assertUsageMetrics(t, c.metrics, r)
 		})
 	}
+}
+
+// assertUsageMetrics checks that the token and cost metrics equal the
+// usage and cost of r, the only record with usage, under the configured
+// model of its provider.
+func assertUsageMetrics(t *testing.T, m *metrics.Metrics, r usage.Record) {
+	t.Helper()
+	text := scrapeMetrics(t, m.Handler(slog.New(slog.DiscardHandler)))
+	model := map[string]string{"openai": "gpt-4o", "anthropic": "claude-opus-5-5"}[r.Provider]
+	u := r.Usage
+	for typ, want := range map[string]int{
+		"input":       u.InputTokens - u.CacheReadInputTokens - u.CacheWriteInputTokens,
+		"cache_read":  u.CacheReadInputTokens,
+		"cache_write": u.CacheWriteInputTokens,
+		"output":      u.OutputTokens,
+	} {
+		series := fmt.Sprintf(`gateway_tokens_total{model=%q,provider=%q,type=%q}`, model, r.Provider, typ)
+		if got, ok := metricValue(text, series); float64(want) != got || (want > 0) != ok {
+			t.Errorf("%s = %v (present %v), want %d", series, got, ok, want)
+		}
+	}
+	series := fmt.Sprintf(`gateway_estimated_cost_dollars_total{model=%q,provider=%q}`, model, r.Provider)
+	got, ok := metricValue(text, series)
+	switch {
+	case r.Cost == nil && ok:
+		t.Errorf("%s = %v for an unknown cost, want no series", series, got)
+	case r.Cost != nil && (!ok || math.Abs(got-float64(*r.Cost)/1e12) > 1e-15):
+		t.Errorf("%s = %v, want %s", series, got, r.Cost)
+	}
+}
+
+// metricValue returns the value of one series in the metrics text.
+func metricValue(text, series string) (float64, bool) {
+	for line := range strings.Lines(text) {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), series+" "); ok {
+			f, err := strconv.ParseFloat(v, 64)
+			return f, err == nil
+		}
+	}
+	return 0, false
 }
 
 func TestUsageRecordsFailures(t *testing.T) {
@@ -131,6 +181,10 @@ func TestUsageRecordsFailures(t *testing.T) {
 			}
 			if len(c.records) != 0 {
 				t.Error("failed attempts produced extra records")
+			}
+			text := scrapeMetrics(t, c.metrics.Handler(slog.New(slog.DiscardHandler)))
+			if strings.Contains(text, "gateway_tokens_total{") || strings.Contains(text, "gateway_estimated_cost_dollars_total{") {
+				t.Errorf("a failed request without usage produced token or cost series:\n%s", text)
 			}
 		})
 	}
@@ -206,6 +260,8 @@ func TestUsageUnknownCostAndDroppedRecordDoNotFailRequest(t *testing.T) {
 	if r.Usage == nil || r.Cost != nil {
 		t.Errorf("unpriced record = %+v", r)
 	}
+	// Tokens are counted; the unknown cost is not counted as zero.
+	assertUsageMetrics(t, c.metrics, r)
 }
 
 type usageBatchStore struct {

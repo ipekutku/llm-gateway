@@ -50,18 +50,25 @@ type UsageRecorder interface {
 	Record(usage.Record) bool
 }
 
-// Metrics receives one observation per request to the chat completions
-// endpoint, including rejected and abandoned ones. model is the requested
-// model, or empty if the request was rejected before it was known. code is
-// the error code, or empty on success. Implementations bound the label
-// values themselves.
+// Metrics observes requests to the chat completions endpoint.
+// Implementations bound the label values themselves.
 type Metrics interface {
+	// ObserveRequest is called once per request, including rejected and
+	// abandoned ones. model is the requested model, or empty if the
+	// request was rejected before it was known. code is the error code, or
+	// empty on success.
 	ObserveRequest(model string, status int, code string, d time.Duration)
+	// ObserveUsage is called once per request whose usage the provider
+	// reported, with the same values as its usage record. model is the
+	// provider's configured model, the name prices use. cost is nil if
+	// unknown.
+	ObserveUsage(provider, model string, u llm.Usage, cost *usage.Cost)
 }
 
 type noMetrics struct{}
 
-func (noMetrics) ObserveRequest(string, int, string, time.Duration) {}
+func (noMetrics) ObserveRequest(string, int, string, time.Duration)   {}
+func (noMetrics) ObserveUsage(string, string, llm.Usage, *usage.Cost) {}
 
 // Accounting provides the recorder, prices, and each provider's configured
 // model name. Pricing uses configured names rather than response snapshots.
@@ -267,6 +274,11 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 		record.Duration = time.Since(received)
 		h.logOutcome(r.Context(), record, chatErr, stats)
 		h.metrics.ObserveRequest(record.RequestedModel, record.Status, record.ErrorCode, record.Duration)
+		// The recorder drops invalid records, such as inconsistent token
+		// counts; metrics skip them too, so both agree.
+		if record.Usage != nil && record.Validate() == nil {
+			h.metrics.ObserveUsage(record.Provider, h.accounting.Models[record.Provider], *record.Usage, record.Cost)
+		}
 		h.accounting.Recorder.Record(record)
 	}()
 	ctx, cancel := context.WithTimeout(ctx, h.upstreamTimeout)

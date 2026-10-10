@@ -56,8 +56,9 @@ Implemented so far (see [Logs and metrics](#logs-and-metrics)):
 * one outcome line per validated request with status, provider, latency, retry count, and whether a fallback ran
 * Prometheus metrics on a separate, unauthenticated listener: request counts by model, status, and error code, and request latency by model, with model labels limited to the configured models
 * provider metrics: every upstream attempt by outcome, its latency, errors by upstream status, retries, fallbacks, and each circuit breaker's state
+* token and estimated cost metrics per provider and model, matching the usage records
 
-Still to come: token and estimated cost metrics; OpenTelemetry tracing; a local Prometheus, Grafana, and tracing stack with dashboards.
+Still to come: OpenTelemetry tracing; a local Prometheus, Grafana, and tracing stack with dashboards.
 
 ### v0.5 — Usage and Cost Accounting ✅
 
@@ -323,8 +324,10 @@ curl -s http://127.0.0.1:9464/metrics | grep '^gateway_'
 | `gateway_provider_retries_total` | `provider` | Repeated attempts. |
 | `gateway_provider_fallbacks_total` | `from_provider`, `to_provider` | Requests sent to the fallback provider. |
 | `gateway_provider_circuit_state` | `provider` | Circuit breaker state: `0` closed, `1` half-open, `2` open. |
+| `gateway_tokens_total` | `provider`, `model`, `type` | Provider-reported tokens; `type` is `input` (uncached), `cache_read`, `cache_write`, or `output`. |
+| `gateway_estimated_cost_dollars_total` | `provider`, `model` | Estimated cost from the pricing file, in US dollars. |
 
-`model` is one of the configured models or `unknown`, so model names sent by clients cannot create new series; requests rejected before their body was read are also `unknown`. Client IDs are never labels; per-client usage is in PostgreSQL. Go runtime (`go_*`) and process (`process_*`) metrics are included. A minimal Prometheus scrape configuration:
+`model` is one of the configured models or `unknown`, so model names sent by clients cannot create new series; requests rejected before their body was read are also `unknown`. Token and cost metrics use the configured model of the provider that answered, the name in the pricing file, and match the usage records: a request with unknown cost adds tokens but no cost. The metric cost is a floating-point estimate that resets on restart; the exact picodollar values are in PostgreSQL. Client IDs are never labels; per-client usage is in PostgreSQL. Go runtime (`go_*`) and process (`process_*`) metrics are included. A minimal Prometheus scrape configuration:
 
 ```yaml
 scrape_configs:

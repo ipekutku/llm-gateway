@@ -662,6 +662,8 @@ token consumption
 cost
 ```
 
+The implemented log fields, metric names, and the decisions behind deviations from the names above are in [architecture.md](architecture.md#metrics) and its [observability decisions](architecture.md#observability-decisions).
+
 ## Exit Criteria
 
 * logs are structured

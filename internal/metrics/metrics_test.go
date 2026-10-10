@@ -14,6 +14,7 @@ import (
 
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"github.com/ipekutku/llm-gateway/internal/usage"
 )
 
 func newTestMetrics(t *testing.T) *Metrics {
@@ -209,5 +210,39 @@ func TestNilMetricsDoNothing(t *testing.T) {
 	m.Handler(slog.New(slog.DiscardHandler)).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("nil Metrics handler status = %d, want 404", rec.Code)
+	}
+}
+
+func TestObserveUsage(t *testing.T) {
+	m := newTestMetrics(t)
+	cost := usage.Cost(12_345_000_000) // $0.012345
+	m.ObserveUsage("anthropic", "claude-opus-5-5", llm.Usage{InputTokens: 1000, CacheReadInputTokens: 600, CacheWriteInputTokens: 100, OutputTokens: 50}, &cost)
+	m.ObserveUsage("anthropic", "claude-opus-5-5", llm.Usage{InputTokens: 10, OutputTokens: 5}, &cost)
+	// Unknown cost: tokens are counted, cost is not.
+	m.ObserveUsage("openai", "gpt-4o", llm.Usage{InputTokens: 20, OutputTokens: 2}, nil)
+	// A model name that is not configured is labeled unknown.
+	m.ObserveUsage("openai", "gpt-4o-2024-08-06", llm.Usage{OutputTokens: 1}, nil)
+
+	text := scrape(t, m)
+	for _, want := range []string{
+		`gateway_tokens_total{model="claude-opus-5-5",provider="anthropic",type="input"} 310`,
+		`gateway_tokens_total{model="claude-opus-5-5",provider="anthropic",type="cache_read"} 600`,
+		`gateway_tokens_total{model="claude-opus-5-5",provider="anthropic",type="cache_write"} 100`,
+		`gateway_tokens_total{model="claude-opus-5-5",provider="anthropic",type="output"} 55`,
+		`gateway_estimated_cost_dollars_total{model="claude-opus-5-5",provider="anthropic"} 0.02469`,
+		`gateway_tokens_total{model="gpt-4o",provider="openai",type="input"} 20`,
+		`gateway_tokens_total{model="unknown",provider="openai",type="output"} 1`,
+	} {
+		if !strings.Contains(text, want+"\n") {
+			t.Errorf("metrics do not contain %s", want)
+		}
+	}
+	for _, absent := range []string{
+		`gateway_estimated_cost_dollars_total{model="gpt-4o"`,
+		`gateway_tokens_total{model="gpt-4o",provider="openai",type="cache_read"}`,
+	} {
+		if strings.Contains(text, absent) {
+			t.Errorf("metrics contain %s", absent)
+		}
 	}
 }
