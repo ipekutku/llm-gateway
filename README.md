@@ -248,7 +248,13 @@ A request for `gpt-4o` that OpenAI cannot serve is then answered by `claude-opus
 
 Provider base URLs are operator-controlled settings, read once at startup, never chosen by a request. Unset or whitespace-only values keep the production defaults. Overrides require the corresponding model and API key. Use HTTPS for any remote destination; plain HTTP is accepted only for `localhost` (case-insensitive) or a literal loopback IP address, including `127.0.0.1` and `::1`. DNS aliases that happen to resolve to loopback are not accepted for HTTP. URLs must have a host and, if present, a port from 1–65535, with no credentials, query (even an empty `?`), or fragment (even an empty `#`). An optional path prefix is supported; the adapter appends its endpoint path.
 
-For a local fake server implementing the OpenAI response format, for example:
+For free local traffic, start the bundled [fake provider](docs/performance.md#local-fake-provider) in a separate terminal:
+
+```bash
+go run ./cmd/fakeprovider -delay=50ms
+```
+
+Then point the gateway at it:
 
 ```bash
 export OPENAI_MODEL=local-model
@@ -257,7 +263,7 @@ export OPENAI_BASE_URL=http://127.0.0.1:9000
 go run ./cmd/gateway
 ```
 
-The fake server must already be running and serve `POST /v1/chat/completions`; the gateway still needs its clients and pricing files and a migrated PostgreSQL database. Anthropic works the same way with `ANTHROPIC_BASE_URL` and `POST /v1/messages`. Use synthetic provider keys for fakes. An override receives the configured provider key and prompts, so trust the destination before pointing real credentials at it. Redirects remain disabled, and URLs are never included in configuration errors or startup logs.
+The fake serves both provider formats with fixed text and synthetic usage, never making real API calls. The gateway still needs its clients and pricing files and a migrated PostgreSQL database. Anthropic works the same way with `ANTHROPIC_BASE_URL` and `POST /v1/messages`. Use synthetic provider keys for fakes. An override receives the configured provider key and prompts, so trust the destination before pointing real credentials at it. Redirects remain disabled, and URLs are never included in configuration errors or startup logs.
 
 ### Shared rate limits with Redis
 

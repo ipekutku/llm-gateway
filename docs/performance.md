@@ -2,6 +2,47 @@
 
 Milestone 8 starts with component benchmarks. These numbers describe in-process work per operation; HTTP load results, latency percentiles, memory under load, profiles, and connection-management measurements remain future work in this milestone. No production behavior has been optimized from these results.
 
+## Local fake provider
+
+`cmd/fakeprovider` is a standalone, standard-library-only development server for free, repeatable HTTP measurements. It never calls a real provider and needs no keys, PostgreSQL, Redis, or configuration files:
+
+```bash
+go run ./cmd/fakeprovider -delay=50ms
+```
+
+It listens on `127.0.0.1:9000` by default. `-addr` changes the listen address (`127.0.0.1:0` selects a free port, printed at startup); `-delay` is a non-negative Go duration and defaults to zero. There is no authentication or TLS: keep it on loopback and use synthetic keys, never real credentials or sensitive prompts.
+
+| Endpoint | Fixed response |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI shape: one assistant choice, `stop`, 12 prompt and 3 completion tokens, 15 total, zero cache reads. |
+| `POST /v1/messages` | Anthropic shape: one assistant text block, `end_turn`, 12 input and 3 output tokens, zero cache reads or writes. |
+
+Both return `synthetic completion` and echo the requested model. IDs and other metadata are fixed, so identical model requests produce identical response bytes. The delay starts after the body is decoded and is canceled when the request disconnects or the process stops. It is a minimum simulated wait, not a guarantee of end-to-end latency: JSON work, socket I/O, and scheduling add time.
+
+With the fake running, configure the gateway in another terminal (keep the required gateway clients/pricing files and migrated PostgreSQL settings from the [README](../README.md#running-locally)):
+
+```bash
+export OPENAI_MODEL=local-openai OPENAI_API_KEY=synthetic-openai-key
+export ANTHROPIC_MODEL=local-anthropic ANTHROPIC_API_KEY=synthetic-anthropic-key
+export OPENAI_BASE_URL=http://127.0.0.1:9000
+export ANTHROPIC_BASE_URL=http://127.0.0.1:9000
+go run ./cmd/gateway
+```
+
+The gateway still authenticates and rate-limits its clients and records validated requests. Use `{"prices":[]}` for unknown costs, or explicitly synthetic prices for cost-path measurements; fixture token counts and estimated costs do not represent real usage or charges. Request the exact configured model name through the gateway. To check the fake directly, without the gateway:
+
+```bash
+curl -s http://127.0.0.1:9000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"local-openai","messages":[{"role":"user","content":"synthetic prompt"}],"max_completion_tokens":32}'
+```
+
+Stop with `Ctrl+C` or `SIGTERM`. Pending delays are canceled, shutdown is bounded to five seconds, and the final line reports `connections=N`: cumulative accepted TCP connections, not requests or active connections. Keep-alive requests share a connection. Restart the fake for a separate connection-count comparison; there are no per-request logs, and output contains no keys, prompts, or completions.
+
+This fixture is not a provider emulator: only `model` and `stream` affect handling. It requires one JSON object with a non-blank string model, rejects `stream: true`, malformed/trailing JSON and bodies above 1 MiB, and ignores other request fields. It does not tokenize messages, enforce generation limits, simulate cache behavior, refusals, rate limits, retries, streaming, or real provider authentication. Tests call it through both real adapters to check response translation and usage, including cancellation through actual HTTP connections. Delay boundaries are tested with Go's virtual-time `testing/synctest`, not wall-clock sleeps. Connection tests check reuse and new connections, and lifecycle tests verify the shutdown count and content exclusion.
+
+The current fake uses loopback HTTP/1.1, not production HTTPS/HTTP/2. The fake and load generator can themselves become bottlenecks, especially when they share the gateway's machine. This PR supplies the fixture only; reproducible load scenarios, profiles, and end-to-end baseline results are still pending.
+
 ## Running benchmarks
 
 ```bash
