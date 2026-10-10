@@ -366,3 +366,26 @@ func waitFor(t *testing.T, ch <-chan struct{}, what string) {
 		t.Fatalf("timed out waiting for %s", what)
 	}
 }
+
+func TestFallbackRecordedInStats(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		primaryErr error
+		want       bool
+	}{
+		{"primary succeeds", nil, false},
+		{"primary fails", statusErr("openai", http.StatusServiceUnavailable), true},
+		{"primary rejects the request", statusErr("openai", http.StatusBadRequest), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _ := newFallbackRouter(t, &recorder{model: "model-a", err: tt.primaryErr}, &recorder{model: "model-b"}, time.Minute)
+			ctx, stats := llm.WithStats(context.Background())
+
+			_, _ = r.Chat(ctx, fallbackRequest)
+
+			if stats.Fallback() != tt.want {
+				t.Errorf("Fallback() = %v, want %v", stats.Fallback(), tt.want)
+			}
+		})
+	}
+}

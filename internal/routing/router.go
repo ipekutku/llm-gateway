@@ -92,7 +92,8 @@ func New(routes map[string]Route, log *slog.Logger) (*Router, error) {
 // the remaining time of ctx. The primary is never retried here, so there is
 // no retry or fallback loop. If the fallback also fails, its error is
 // returned, annotated with the primary failure's message; only the fallback
-// error is wrapped, so the response reflects the last provider tried.
+// error is wrapped, so the response reflects the last provider tried. A
+// fallback is recorded in the llm.Stats carried by ctx, if any.
 func (r *Router) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatResponse, error) {
 	route, ok := r.routes[req.Model]
 	if !ok {
@@ -118,6 +119,7 @@ func (r *Router) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespons
 		)...,
 	)
 
+	llm.StatsFrom(ctx).SetFallback()
 	fallbackReq := req
 	fallbackReq.Model = f.Model
 	resp, err := f.Provider.Chat(ctx, fallbackReq)

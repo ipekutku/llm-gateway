@@ -651,8 +651,8 @@ func TestChatCompletionsErrorMapping(t *testing.T) {
 			rec := post(t, h, validBody)
 
 			assertError(t, rec, tt.status, tt.typ, tt.code)
-			if n := strings.Count(logs.String(), "chat completion failed"); n != 1 {
-				t.Errorf("logged failure %d times, want 1:\n%s", n, logs)
+			if n := strings.Count(logs.String(), "request completed"); n != 1 {
+				t.Errorf("logged the outcome %d times, want 1:\n%s", n, logs)
 			}
 			if !strings.Contains(logs.String(), "code="+tt.code) {
 				t.Errorf("log does not contain code=%s:\n%s", tt.code, logs)
@@ -725,7 +725,7 @@ func TestChatCompletionsBoundsProviderCallWithUpstreamTimeout(t *testing.T) {
 	if remaining <= 0 || remaining > timeout {
 		t.Errorf("provider deadline in %v, want within (0, %v]", remaining, timeout)
 	}
-	if strings.Contains(logs.String(), "client canceled request") {
+	if strings.Contains(logs.String(), "code=client_closed") {
 		t.Errorf("upstream timeout logged as a client cancellation:\n%s", logs)
 	}
 }
@@ -755,7 +755,7 @@ func TestChatCompletionsSkipsResponseWhenClientCanceled(t *testing.T) {
 			if rec.Body.Len() != 0 || len(header) != 0 {
 				t.Errorf("wrote response %d %v %s, want nothing", rec.Code, rec.Header(), rec.Body)
 			}
-			if !strings.Contains(logs.String(), "client canceled request") {
+			if !strings.Contains(logs.String(), "status=499 code=client_closed") {
 				t.Errorf("log does not record the cancellation:\n%s", logs)
 			}
 		})
