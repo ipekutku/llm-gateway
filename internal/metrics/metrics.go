@@ -20,6 +20,7 @@ import (
 
 	"github.com/ipekutku/llm-gateway/internal/breaker"
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"github.com/ipekutku/llm-gateway/internal/usage"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -37,6 +38,19 @@ const (
 	OutcomeTimeout  = "timeout"
 	OutcomeCanceled = "canceled"
 )
+
+// Token types, the type label of gateway_tokens_total. Input is the
+// uncached part of the prompt, so input, cache_read, and cache_write add up
+// to the whole prompt without counting cache tokens twice.
+const (
+	TokensInput      = "input"
+	TokensCacheRead  = "cache_read"
+	TokensCacheWrite = "cache_write"
+	TokensOutput     = "output"
+)
+
+// picodollarsPerDollar converts usage.Cost to dollars.
+const picodollarsPerDollar = 1e12
 
 // requestBuckets are the request and attempt duration histogram buckets, in
 // seconds. They span quick rejections to the default 120s upstream budget.
@@ -56,6 +70,9 @@ type Metrics struct {
 	retries          *prometheus.CounterVec
 	fallbacks        *prometheus.CounterVec
 	circuitState     *prometheus.GaugeVec
+
+	tokens *prometheus.CounterVec
+	cost   *prometheus.CounterVec
 }
 
 // New returns Metrics whose model labels are limited to models, the
@@ -98,6 +115,14 @@ func New(models []string) (*Metrics, error) {
 			Name: "gateway_provider_circuit_state",
 			Help: "Circuit breaker state by provider: 0 closed, 1 half-open, 2 open.",
 		}, []string{"provider"}),
+		tokens: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_tokens_total",
+			Help: "Provider-reported tokens by provider, configured model, and type. input excludes cache_read and cache_write, so the three add up to the prompt.",
+		}, []string{"provider", "model", "type"}),
+		cost: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_estimated_cost_dollars_total",
+			Help: "Estimated cost in US dollars from the configured prices, as a float; PostgreSQL usage records hold the exact values. Requests with unknown cost are not counted.",
+		}, []string{"provider", "model"}),
 	}
 	for _, model := range models {
 		if strings.TrimSpace(model) == "" || model == UnknownModel {
@@ -116,6 +141,8 @@ func New(models []string) (*Metrics, error) {
 		m.retries,
 		m.fallbacks,
 		m.circuitState,
+		m.tokens,
+		m.cost,
 	)
 	return m, nil
 }
@@ -144,6 +171,29 @@ func (m *Metrics) Instrument(provider string, p llm.Provider) llm.Provider {
 	m.retries.WithLabelValues(provider)
 	m.circuitState.WithLabelValues(provider).Set(circuitValue(breaker.Closed))
 	return instrumented{provider: provider, next: p, m: m}
+}
+
+// ObserveUsage records the tokens and, if known, the estimated cost of one
+// request answered by provider with its configured model.
+func (m *Metrics) ObserveUsage(provider, model string, u llm.Usage, cost *usage.Cost) {
+	if m == nil {
+		return
+	}
+	model = m.modelLabel(model)
+	uncached := u.InputTokens - u.CacheReadInputTokens - u.CacheWriteInputTokens
+	for typ, n := range map[string]int{
+		TokensInput:      uncached,
+		TokensCacheRead:  u.CacheReadInputTokens,
+		TokensCacheWrite: u.CacheWriteInputTokens,
+		TokensOutput:     u.OutputTokens,
+	} {
+		if n > 0 {
+			m.tokens.WithLabelValues(provider, model, typ).Add(float64(n))
+		}
+	}
+	if cost != nil {
+		m.cost.WithLabelValues(provider, model).Add(float64(*cost) / picodollarsPerDollar)
+	}
 }
 
 // ObserveRetry records a repeated attempt to provider.
