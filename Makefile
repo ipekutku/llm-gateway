@@ -25,7 +25,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check build vuln smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest build vuln smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -57,6 +57,11 @@ bench:
 ## bench-check: run each benchmark once for correctness, without timing gates.
 bench-check:
 	go test -run '^$$' -bench . -benchtime=1x ./...
+
+## loadtest: synthetic local HTTP measurements; needs a migrated disposable
+## GATEWAY_DATABASE_URL. Not a CI check; see docs/performance.md.
+loadtest:
+	bash deploy/loadtest/run.sh
 
 ## build: build both commands without leaving binaries behind
 build:

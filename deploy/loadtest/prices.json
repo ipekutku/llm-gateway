@@ -1,0 +1,6 @@
+{
+  "prices": [
+    {"provider": "openai", "model": "local-openai", "input": "1", "cache_read": "0.1", "cache_write": "0", "output": "2"},
+    {"provider": "anthropic", "model": "local-anthropic", "input": "1", "cache_read": "0.1", "cache_write": "1.25", "output": "2"}
+  ]
+}
