@@ -58,9 +58,10 @@ bench:
 bench-check:
 	go test -run '^$$' -bench . -benchtime=1x ./...
 
-## build: build the gateway without leaving a binary behind
+## build: build both commands without leaving binaries behind
 build:
 	go build -o /dev/null ./cmd/gateway
+	go build -o /dev/null ./cmd/fakeprovider
 
 ## vuln: known vulnerabilities reachable from the code (needs network)
 vuln:
