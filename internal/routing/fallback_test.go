@@ -389,3 +389,32 @@ func TestFallbackRecordedInStats(t *testing.T) {
 		})
 	}
 }
+
+func TestOnFallbackCalledOnlyWhenFallingBack(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		primaryErr error
+		want       int
+	}{
+		{"primary succeeds", nil, 0},
+		{"primary fails", statusErr("openai", http.StatusServiceUnavailable), 1},
+		{"primary rejects the request", statusErr("openai", http.StatusBadRequest), 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			r, err := New(map[string]Route{"model-a": {
+				Provider: &recorder{model: "model-a", err: tt.primaryErr},
+				Fallback: &Fallback{Model: "model-b", Provider: &recorder{model: "model-b"}, PrimaryTimeout: time.Minute, OnFallback: func() { calls++ }},
+			}}, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			_, _ = r.Chat(context.Background(), fallbackRequest)
+
+			if calls != tt.want {
+				t.Errorf("OnFallback called %d times, want %d", calls, tt.want)
+			}
+		})
+	}
+}

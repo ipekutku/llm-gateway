@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -152,4 +153,92 @@ func TestRunServesMetricsOnSeparateListener(t *testing.T) {
 	if _, err := http.Get(metricsURL + "/metrics"); err == nil {
 		t.Error("metrics listener still accepts connections after shutdown")
 	}
+}
+
+// metricsGateway is gatewayWith, recording metrics in the returned Metrics.
+func metricsGateway(t *testing.T, oa, an *upstream, edit func(*config)) (*httptest.Server, *metrics.Metrics) {
+	t.Helper()
+	cfg := gatewayConfig(oa, an)
+	edit(&cfg)
+	m, err := metrics.New(configuredModels(cfg))
+	if err != nil {
+		t.Fatalf("metrics.New() error = %v", err)
+	}
+	h, err := newHandler(cfg, nil, discardRecorder{}, m, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("newHandler() error = %v", err)
+	}
+	gw := httptest.NewServer(h)
+	t.Cleanup(gw.Close)
+	return gw, m
+}
+
+func assertMetrics(t *testing.T, m *metrics.Metrics, want ...string) {
+	t.Helper()
+	text := scrapeMetrics(t, m.Handler(slog.New(slog.DiscardHandler)))
+	for _, w := range want {
+		if !strings.Contains(text, w+"\n") {
+			t.Errorf("metrics do not contain %s", w)
+		}
+	}
+	if t.Failed() {
+		t.Logf("metrics:\n%s", text)
+	}
+}
+
+func TestRequestPathProviderMetrics(t *testing.T) {
+	t.Run("retries then success", func(t *testing.T) {
+		oa := newUpstream(t, "/v1/chat/completions", sequence(openaiReply, "", 503, 503, 200))
+		an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+		gw, m := metricsGateway(t, oa, an, func(*config) {})
+
+		postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+
+		assertMetrics(t, m,
+			`gateway_provider_requests_total{outcome="error",provider="openai"} 2`,
+			`gateway_provider_requests_total{outcome="success",provider="openai"} 1`,
+			`gateway_provider_errors_total{provider="openai",upstream_status="503"} 2`,
+			`gateway_provider_request_duration_seconds_count{provider="openai"} 3`,
+			`gateway_provider_retries_total{provider="openai"} 2`,
+			`gateway_provider_requests_total{outcome="success",provider="anthropic"} 0`,
+			`gateway_requests_total{code="",model="gpt-4o",status="200"} 1`,
+		)
+	})
+
+	t.Run("retry exhaustion then fallback", func(t *testing.T) {
+		oa := newUpstream(t, "/v1/chat/completions", reply(http.StatusServiceUnavailable, openaiReply))
+		an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+		gw, m := metricsGateway(t, oa, an, func(c *config) { c.OpenAI.FallbackTo = "anthropic" })
+
+		postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+
+		attempts := fastRetry.MaxAttempts
+		assertMetrics(t, m,
+			fmt.Sprintf(`gateway_provider_requests_total{outcome="error",provider="openai"} %d`, attempts),
+			fmt.Sprintf(`gateway_provider_errors_total{provider="openai",upstream_status="503"} %d`, attempts),
+			fmt.Sprintf(`gateway_provider_retries_total{provider="openai"} %d`, attempts-1),
+			`gateway_provider_fallbacks_total{from_provider="openai",to_provider="anthropic"} 1`,
+			`gateway_provider_requests_total{outcome="success",provider="anthropic"} 1`,
+			`gateway_provider_retries_total{provider="anthropic"} 0`,
+			`gateway_requests_total{code="",model="gpt-4o",status="200"} 1`,
+		)
+	})
+
+	t.Run("circuit opens", func(t *testing.T) {
+		oa := newUpstream(t, "/v1/chat/completions", reply(http.StatusInternalServerError, openaiReply))
+		an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+		gw, m := metricsGateway(t, oa, an, func(c *config) { c.Breaker.Failures = 1 })
+
+		// A 500 is not retried and opens the circuit at once; the next
+		// request is rejected without an attempt.
+		postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+		postChat(t, context.Background(), gw.URL, chatBody("gpt-4o"))
+		assertMetrics(t, m,
+			`gateway_provider_circuit_state{provider="openai"} 2`,
+			`gateway_provider_requests_total{outcome="error",provider="openai"} 1`,
+			`gateway_provider_errors_total{provider="openai",upstream_status="500"} 1`,
+			`gateway_requests_total{code="provider_unavailable",model="gpt-4o",status="503"} 1`,
+			`gateway_provider_circuit_state{provider="anthropic"} 0`,
+		)
+	})
 }

@@ -1,6 +1,9 @@
 package metrics
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -8,6 +11,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ipekutku/llm-gateway/internal/breaker"
+	"github.com/ipekutku/llm-gateway/internal/llm"
 )
 
 func newTestMetrics(t *testing.T) *Metrics {
@@ -94,5 +100,114 @@ func TestModelLabelsAreBounded(t *testing.T) {
 	}
 	if n := len(seriesLines(text, "gateway_request_duration_seconds_count")); n != 1 {
 		t.Errorf("got %d duration series, want 1", n)
+	}
+}
+
+type providerFunc func(ctx context.Context, req llm.ChatRequest) (llm.ChatResponse, error)
+
+func (f providerFunc) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatResponse, error) {
+	return f(ctx, req)
+}
+
+func returning(err error) llm.Provider {
+	return providerFunc(func(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+		return llm.ChatResponse{}, err
+	})
+}
+
+func TestInstrumentCountsEachAttempt(t *testing.T) {
+	m := newTestMetrics(t)
+	for _, err := range []error{
+		nil,
+		nil,
+		&llm.ProviderError{Provider: "openai", StatusCode: http.StatusServiceUnavailable},
+		fmt.Errorf("after 2 attempts: %w", &llm.ProviderError{Provider: "openai", StatusCode: http.StatusServiceUnavailable}),
+		&llm.ProviderError{Provider: "openai", Err: errors.New("connection refused")},
+		&llm.ProviderError{Provider: "openai", Err: context.DeadlineExceeded},
+		&llm.ProviderError{Provider: "openai", Err: context.Canceled},
+	} {
+		_, _ = m.Instrument("openai", returning(err)).Chat(context.Background(), llm.ChatRequest{})
+	}
+
+	text := scrape(t, m)
+	for _, want := range []string{
+		`gateway_provider_requests_total{outcome="success",provider="openai"} 2`,
+		`gateway_provider_requests_total{outcome="error",provider="openai"} 3`,
+		`gateway_provider_requests_total{outcome="timeout",provider="openai"} 1`,
+		`gateway_provider_requests_total{outcome="canceled",provider="openai"} 1`,
+		`gateway_provider_errors_total{provider="openai",upstream_status="503"} 2`,
+		`gateway_provider_errors_total{provider="openai",upstream_status="0"} 1`,
+		`gateway_provider_request_duration_seconds_count{provider="openai"} 7`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics do not contain %s", want)
+		}
+	}
+}
+
+func TestInstrumentStartsProviderSeriesAtZero(t *testing.T) {
+	m := newTestMetrics(t)
+	m.Instrument("anthropic", returning(nil))
+	m.AddFallbackRoute("openai", "anthropic")
+
+	text := scrape(t, m)
+	for _, want := range []string{
+		`gateway_provider_requests_total{outcome="success",provider="anthropic"} 0`,
+		`gateway_provider_requests_total{outcome="error",provider="anthropic"} 0`,
+		`gateway_provider_retries_total{provider="anthropic"} 0`,
+		`gateway_provider_circuit_state{provider="anthropic"} 0`,
+		`gateway_provider_fallbacks_total{from_provider="openai",to_provider="anthropic"} 0`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics do not contain %s", want)
+		}
+	}
+}
+
+func TestRetryFallbackAndCircuitMetrics(t *testing.T) {
+	m := newTestMetrics(t)
+	m.ObserveRetry("openai")
+	m.ObserveRetry("openai")
+	m.ObserveFallback("openai", "anthropic")
+
+	for _, tt := range []struct {
+		state breaker.State
+		want  string
+	}{
+		{breaker.Open, "2"},
+		{breaker.HalfOpen, "1"},
+		{breaker.Closed, "0"},
+	} {
+		m.SetCircuitState("openai", tt.state)
+		if want := `gateway_provider_circuit_state{provider="openai"} ` + tt.want; !strings.Contains(scrape(t, m), want) {
+			t.Errorf("after %v, metrics do not contain %s", tt.state, want)
+		}
+	}
+	text := scrape(t, m)
+	for _, want := range []string{
+		`gateway_provider_retries_total{provider="openai"} 2`,
+		`gateway_provider_fallbacks_total{from_provider="openai",to_provider="anthropic"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics do not contain %s", want)
+		}
+	}
+}
+
+func TestNilMetricsDoNothing(t *testing.T) {
+	var m *Metrics
+	p := returning(nil)
+	if m.Instrument("openai", p) == nil {
+		t.Fatal("Instrument() on nil Metrics returned nil")
+	}
+	m.ObserveRequest("gpt-4o", http.StatusOK, "", time.Second)
+	m.ObserveRetry("openai")
+	m.ObserveFallback("openai", "anthropic")
+	m.AddFallbackRoute("openai", "anthropic")
+	m.SetCircuitState("openai", breaker.Open)
+	rec := httptest.NewRecorder()
+	m.Handler(slog.New(slog.DiscardHandler)).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("nil Metrics handler status = %d, want 404", rec.Code)
 	}
 }

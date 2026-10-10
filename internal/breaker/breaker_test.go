@@ -541,3 +541,24 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+func TestOnStateChangeReportsEveryTransition(t *testing.T) {
+	var states []State
+	settings := testSettings
+	settings.OnStateChange = func(s State) { states = append(states, s) }
+	next := &stub{}
+	b, clk, _ := newTestBreaker(t, next, settings)
+
+	trip(t, b, next) // closed → open
+	clk.Advance(testSettings.Cooldown)
+	_ = call(b) // open → half-open, probe fails: → open
+	clk.Advance(testSettings.Cooldown)
+	next.set(nil)
+	_ = call(b) // open → half-open, probe succeeds: → closed
+	_ = call(b) // no change
+
+	want := []State{Open, HalfOpen, Open, HalfOpen, Closed}
+	if fmt.Sprint(states) != fmt.Sprint(want) {
+		t.Errorf("state changes = %v, want %v", states, want)
+	}
+}

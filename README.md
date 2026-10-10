@@ -55,8 +55,9 @@ Implemented so far (see [Logs and metrics](#logs-and-metrics)):
 * structured logs as text or JSON; every line logged while handling a request carries its request ID and, once authenticated, its client ID, including retry, fallback, and circuit breaker lines
 * one outcome line per validated request with status, provider, latency, retry count, and whether a fallback ran
 * Prometheus metrics on a separate, unauthenticated listener: request counts by model, status, and error code, and request latency by model, with model labels limited to the configured models
+* provider metrics: every upstream attempt by outcome, its latency, errors by upstream status, retries, fallbacks, and each circuit breaker's state
 
-Still to come: provider, retry, fallback, and circuit breaker metrics; token and estimated cost metrics; OpenTelemetry tracing; a local Prometheus, Grafana, and tracing stack with dashboards.
+Still to come: token and estimated cost metrics; OpenTelemetry tracing; a local Prometheus, Grafana, and tracing stack with dashboards.
 
 ### v0.5 — Usage and Cost Accounting ✅
 
@@ -316,6 +317,12 @@ curl -s http://127.0.0.1:9464/metrics | grep '^gateway_'
 |---|---|---|
 | `gateway_requests_total` | `model`, `status`, `code` | Chat completion requests, including authentication, rate-limit, and validation rejections. `code` is empty on success. |
 | `gateway_request_duration_seconds` | `model` | Histogram of request latency, from 10 ms to 120 s. |
+| `gateway_provider_requests_total` | `provider`, `outcome` | Upstream attempts, retries and fallbacks included; `outcome` is `success`, `error`, `timeout`, or `canceled`. |
+| `gateway_provider_request_duration_seconds` | `provider` | Histogram of upstream attempt latency. |
+| `gateway_provider_errors_total` | `provider`, `upstream_status` | Failed attempts by provider status; `0` means no usable response. |
+| `gateway_provider_retries_total` | `provider` | Repeated attempts. |
+| `gateway_provider_fallbacks_total` | `from_provider`, `to_provider` | Requests sent to the fallback provider. |
+| `gateway_provider_circuit_state` | `provider` | Circuit breaker state: `0` closed, `1` half-open, `2` open. |
 
 `model` is one of the configured models or `unknown`, so model names sent by clients cannot create new series; requests rejected before their body was read are also `unknown`. Client IDs are never labels; per-client usage is in PostgreSQL. Go runtime (`go_*`) and process (`process_*`) metrics are included. A minimal Prometheus scrape configuration:
 
@@ -339,7 +346,7 @@ scrape_configs:
 * The gateway serves plain HTTP and listens on loopback by default. Gateway keys would cross the network unencrypted, so expose it beyond the host only behind a proxy that terminates TLS.
 * Rate limits and concurrency counts are kept per gateway process; several instances do not share them (planned for v0.7).
 * Clients are read from a file at startup; changing them requires a restart. Each client has one key, so rotating a key briefly means replacing it.
-* `/metrics` has no authentication; it reveals request counts per configured model and status, never keys, clients, or content. Keep `GATEWAY_METRICS_ADDR` on loopback or a network only Prometheus can reach.
+* `/metrics` has no authentication; it reveals request counts per configured model and status and provider health, never keys, clients, or content. Keep `GATEWAY_METRICS_ADDR` on loopback or a network only Prometheus can reach.
 * Every rejected key logs one warning, and there is no per-IP limit on unauthenticated requests; anyone who can reach the port can fill the logs. Another reason to keep the gateway behind a proxy.
 * A request body must arrive within 30 seconds (otherwise `408`), and idle keep-alive connections close after 2 minutes. Both are fixed.
 * Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
