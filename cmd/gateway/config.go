@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -155,10 +156,10 @@ func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error
 	if cfg.ProviderTimeout, err = loadDuration(getenv, "GATEWAY_PROVIDER_TIMEOUT", cfg.UpstreamTimeout/2); err != nil {
 		errs = append(errs, err)
 	}
-	if cfg.OpenAI, err = loadProvider(getenv, "OPENAI_MODEL", "OPENAI_API_KEY", openai.DefaultBaseURL); err != nil {
+	if cfg.OpenAI, err = loadProvider(getenv, "OPENAI", openai.DefaultBaseURL); err != nil {
 		errs = append(errs, err)
 	}
-	if cfg.Anthropic, err = loadProvider(getenv, "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY", anthropic.DefaultBaseURL); err != nil {
+	if cfg.Anthropic, err = loadProvider(getenv, "ANTHROPIC", anthropic.DefaultBaseURL); err != nil {
 		errs = append(errs, err)
 	}
 	if cfg.Clients, cfg.RateLimits, err = loadClients(getenv, readFile); err != nil {
@@ -195,20 +196,59 @@ func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error
 	return cfg, nil
 }
 
-// loadProvider returns nil if both variables are absent, and an error if
-// only one is set.
-func loadProvider(getenv func(string) string, modelVar, keyVar, baseURL string) (*providerConfig, error) {
+// loadProvider requires a model and key together. An optional base URL
+// overrides the production origin only for an enabled provider.
+func loadProvider(getenv func(string) string, prefix, defaultBaseURL string) (*providerConfig, error) {
+	modelVar, keyVar, baseURLVar := prefix+"_MODEL", prefix+"_API_KEY", prefix+"_BASE_URL"
 	model, key := getenv(modelVar), getenv(keyVar)
+	baseURL := getenv(baseURLVar)
 	hasModel, hasKey := strings.TrimSpace(model) != "", strings.TrimSpace(key) != ""
 	switch {
 	case !hasModel && !hasKey:
+		if strings.TrimSpace(baseURL) != "" {
+			return nil, fmt.Errorf("%s is set but %s and %s are missing", baseURLVar, modelVar, keyVar)
+		}
 		return nil, nil
 	case !hasModel:
 		return nil, fmt.Errorf("%s is set but %s is missing", keyVar, modelVar)
 	case !hasKey:
 		return nil, fmt.Errorf("%s is set but %s is missing", modelVar, keyVar)
 	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = defaultBaseURL
+	}
+	if !validProviderBaseURL(baseURL) {
+		// Parse errors may contain URL credentials or other secret values.
+		return nil, fmt.Errorf("%s must be an absolute HTTPS URL, or HTTP on a loopback host, without credentials, a query, or a fragment", baseURLVar)
+	}
 	return &providerConfig{Model: model, APIKey: key, BaseURL: baseURL}, nil
+}
+
+func validProviderBaseURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || strings.Contains(raw, "#") {
+		return false
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return false
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return false
+		}
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	if u.Scheme != "http" {
+		return false
+	}
+	if strings.EqualFold(u.Hostname(), "localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(u.Hostname())
+	return err == nil && addr.Unmap().IsLoopback()
 }
 
 // loadFallback reads <prefix>_FALLBACK for provider p, whose only possible

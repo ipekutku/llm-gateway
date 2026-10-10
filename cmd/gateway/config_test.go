@@ -80,6 +80,93 @@ func load(vars map[string]string) (config, error) {
 	return loadConfig(env(vars), files(map[string]string{clientsPath: testClientsFile, pricingPath: `{"prices":[]}`}))
 }
 
+func TestLoadProviderBaseURLs(t *testing.T) {
+	for _, provider := range []struct {
+		prefix     string
+		defaultURL string
+	}{
+		{"OPENAI", openai.DefaultBaseURL},
+		{"ANTHROPIC", anthropic.DefaultBaseURL},
+	} {
+		t.Run(provider.prefix, func(t *testing.T) {
+			for _, tt := range []struct {
+				name string
+				url  string
+				bad  bool
+			}{
+				{name: "unset"},
+				{name: "blank", url: " \t"},
+				{name: "production", url: provider.defaultURL},
+				{name: "https custom origin", url: "https://upstream.example:8443"},
+				{name: "path prefix", url: "https://upstream.example/proxy/"},
+				{name: "ipv4 loopback", url: "http://127.0.0.1:9000"},
+				{name: "ipv4 loopback range", url: "http://127.0.0.2:9000/proxy"},
+				{name: "ipv6 loopback", url: "http://[::1]:9000/proxy/"},
+				{name: "mapped loopback", url: "http://[::ffff:127.0.0.1]:9000"},
+				{name: "localhost", url: "http://localhost:9000"},
+				{name: "localhost case", url: "http://LOCALHOST:9000"},
+				{name: "remote http", url: "http://upstream.example", bad: true},
+				{name: "private http", url: "http://192.168.1.1:9000", bad: true},
+				{name: "wildcard host", url: "http://0.0.0.0:9000", bad: true},
+				{name: "ipv6 remote", url: "http://[::2]:9000", bad: true},
+				{name: "localhost subdomain", url: "http://localhost.example:9000", bad: true},
+				{name: "loopback dns alias", url: "http://127.0.0.1.nip.io:9000", bad: true},
+				{name: "missing scheme", url: "upstream.example/proxy", bad: true},
+				{name: "missing host", url: "https:///proxy", bad: true},
+				{name: "unsupported scheme", url: "ftp://upstream.example", bad: true},
+				{name: "credentials", url: "https://synthetic-user:synthetic-password@upstream.example", bad: true},
+				{name: "empty credentials", url: "https://@upstream.example", bad: true},
+				{name: "query", url: "https://upstream.example?secret=synthetic-token", bad: true},
+				{name: "empty query", url: "https://upstream.example?", bad: true},
+				{name: "fragment", url: "https://upstream.example#synthetic-token", bad: true},
+				{name: "empty fragment", url: "https://upstream.example#", bad: true},
+				{name: "bad escape", url: "https://upstream.example/%synthetic-token", bad: true},
+				{name: "bad port", url: "https://upstream.example:synthetic-token", bad: true},
+				{name: "out of range port", url: "https://upstream.example:65536", bad: true},
+				{name: "zero port", url: "https://upstream.example:0", bad: true},
+				{name: "empty port", url: "https://upstream.example:", bad: true},
+				{name: "leading whitespace", url: " https://upstream.example", bad: true},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					vars := map[string]string{
+						provider.prefix + "_MODEL": "test-model", provider.prefix + "_API_KEY": "synthetic-key",
+						provider.prefix + "_BASE_URL": tt.url,
+					}
+					cfg, err := load(vars)
+					if tt.bad {
+						if err == nil || !strings.Contains(err.Error(), provider.prefix+"_BASE_URL") {
+							t.Fatalf("loadConfig() error = %v, want base URL validation error", err)
+						}
+						if strings.Contains(err.Error(), tt.url) || strings.Contains(err.Error(), "synthetic-") {
+							t.Fatalf("URL value leaked in error: %v", err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					p := cfg.OpenAI
+					if provider.prefix == "ANTHROPIC" {
+						p = cfg.Anthropic
+					}
+					want := tt.url
+					if strings.TrimSpace(want) == "" {
+						want = provider.defaultURL
+					}
+					if p.BaseURL != want {
+						t.Errorf("BaseURL = %q, want %q", p.BaseURL, want)
+					}
+				})
+			}
+			_, err := load(map[string]string{provider.prefix + "_BASE_URL": "http://localhost:9000"})
+			want := provider.prefix + "_BASE_URL is set but " + provider.prefix + "_MODEL and " + provider.prefix + "_API_KEY are missing"
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("disabled provider with override: error = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	openaiCfg := &providerConfig{Model: "gpt-4o", APIKey: openaiKey, BaseURL: openai.DefaultBaseURL}
 	anthropicCfg := &providerConfig{Model: "claude-opus-5-5", APIKey: anthropicKey, BaseURL: anthropic.DefaultBaseURL}
