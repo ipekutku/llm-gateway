@@ -10,6 +10,13 @@ DB_IMAGE := postgres:18
 DB_PORT ?= 55432
 DB_URL := postgres://gateway:gateway@127.0.0.1:$(DB_PORT)/gateway?sslmode=disable
 
+# Local Redis for the integration tests, without persistence. CI uses the
+# same image as a service. The port avoids a Redis already on 6379.
+REDIS_CONTAINER := llm-gateway-redis
+REDIS_IMAGE := redis:8
+REDIS_PORT ?= 56379
+REDIS_URL := redis://127.0.0.1:$(REDIS_PORT)/0
+
 # Local Prometheus, Grafana, and Jaeger for a gateway running on the host,
 # and the loopback ports they are published on.
 OBSERVABILITY := docker compose -f deploy/observability/compose.yaml
@@ -18,7 +25,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test build vuln smoke db db-stop observability observability-stop
+.PHONY: check fmt vet test build vuln smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test build vuln
@@ -37,7 +44,8 @@ vet:
 	go vet -tags smoke ./cmd/gateway
 
 ## test: unit and end-to-end tests against fake providers. The PostgreSQL
-## integration tests run only when GATEWAY_TEST_DATABASE_URL is set (see db).
+## integration tests run only when GATEWAY_TEST_DATABASE_URL is set (see db),
+## and the Redis ones only when GATEWAY_TEST_REDIS_URL is set (see redis).
 test:
 	go test -race -timeout 2m ./...
 
@@ -67,6 +75,19 @@ db:
 ## db-stop: stop the local PostgreSQL and delete its data
 db-stop:
 	docker stop $(DB_CONTAINER)
+
+## redis: start a disposable local Redis in Docker, without persistence.
+## Prints the variable that enables the Redis integration tests.
+redis:
+	docker run -d --rm --name $(REDIS_CONTAINER) \
+		-p 127.0.0.1:$(REDIS_PORT):6379 $(REDIS_IMAGE) \
+		redis-server --save '' --appendonly no
+	@until docker exec $(REDIS_CONTAINER) redis-cli ping >/dev/null 2>&1; do sleep 1; done
+	@echo "export GATEWAY_TEST_REDIS_URL='$(REDIS_URL)'"
+
+## redis-stop: stop the local Redis and delete its data
+redis-stop:
+	docker stop $(REDIS_CONTAINER)
 
 ## observability: start Prometheus, Grafana, and Jaeger in Docker for a
 ## gateway running on the host (see the README). Not needed by CI.

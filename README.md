@@ -425,7 +425,7 @@ The Makefile defines the verification commands used locally and in GitHub Action
 
 The v0.6 release checks include `TestObservabilityExcludesSensitiveData`: the real handler, router, resilience layers, and adapters call fake upstreams while text/JSON logs, Prometheus output, and exported spans are checked together. It covers both providers, retries, fallback, admission errors, malformed upstream responses, and unexpected protocol field values. Separate tests cover provider redirect isolation, collector error responses, and database errors containing rejected values. No paid calls are needed. Database diagnostics retain operation context and SQLSTATE while omitting server messages and connection details.
 
-Before tagging, run `make check` with the disposable database enabled as below and require green CI on the merged commit. This verifies behavior and known Go vulnerabilities, not throughput or latency overhead; benchmarks and load tests remain v0.8 work. The local stack was exercised with fake traffic during PR 8 (see [verification](docs/architecture.md#local-observability-stack)); the Linux Docker path and container-image vulnerability scanning are not covered by `make check`. The optional live `make smoke` passed for both providers on 2026-10-10 during the v0.6 closeout. That harness does not enable metrics or tracing or persist usage.
+Before tagging, run `make check` with the disposable database and Redis enabled as below and require green CI on the merged commit. This verifies behavior and known Go vulnerabilities, not throughput or latency overhead; benchmarks and load tests remain v0.8 work. The local stack was exercised with fake traffic during PR 8 (see [verification](docs/architecture.md#local-observability-stack)); the Linux Docker path and container-image vulnerability scanning are not covered by `make check`. The optional live `make smoke` passed for both providers on 2026-10-10 during the v0.6 closeout. That harness does not enable metrics or tracing or persist usage.
 
 ### PostgreSQL integration tests
 
@@ -449,6 +449,25 @@ unset GATEWAY_TEST_DATABASE_URL
 ```
 
 Stopping the container deletes its data. Tests use fake provider servers and the recorder tests use a fake store; they require no provider API keys or paid API calls. Initial setup may download Go dependencies and the Docker image, and `make vuln` needs access to the Go vulnerability database.
+
+### Redis integration tests
+
+The shared rate-limit tests need Redis. Start a disposable Redis 8 container without persistence:
+
+```bash
+make redis
+export GATEWAY_TEST_REDIS_URL='redis://127.0.0.1:56379/0'
+make check
+```
+
+`make redis` prints the setting above. Its port defaults to `56379`; use `make redis REDIS_PORT=<port>` and the printed URL if that port is occupied. Like `GATEWAY_TEST_DATABASE_URL`, it is a test setting only; the gateway does not use Redis yet. Each test writes only keys under a random prefix of its own and deletes them when it ends, so it never clears other data. Without the variable, the Redis tests skip locally; CI supplies a Redis service and fails if it is missing.
+
+When finished:
+
+```bash
+make redis-stop
+unset GATEWAY_TEST_REDIS_URL
+```
 
 ### Smoke test against the real APIs
 
