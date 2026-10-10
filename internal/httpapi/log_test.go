@@ -100,3 +100,96 @@ func TestLogHandlerRespectsLevel(t *testing.T) {
 		t.Errorf("a record below the level was logged:\n%s", logs.String())
 	}
 }
+
+// newJSONHandler returns a handler for p that logs JSON to the returned
+// buffer.
+func newJSONHandler(t *testing.T, p llm.Provider) (http.Handler, *bytes.Buffer) {
+	t.Helper()
+	var logs bytes.Buffer
+	limiter := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
+	h, err := New(p, testAuthenticator(t), limiter, testTimeout, testAccounting(), slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return h, &logs
+}
+
+func TestOutcomeLogReportsUpstreamActivity(t *testing.T) {
+	const prompt, completion = "private prompt marker", "private completion marker"
+	// The provider reports activity as the retry and routing layers do.
+	h, logs := newJSONHandler(t, providerFunc(func(ctx context.Context, req llm.ChatRequest) (llm.ChatResponse, error) {
+		llm.StatsFrom(ctx).AddRetry()
+		llm.StatsFrom(ctx).AddRetry()
+		llm.StatsFrom(ctx).SetFallback()
+		return llm.ChatResponse{
+			Provider:     "anthropic",
+			Model:        "model-b",
+			Message:      llm.Message{Role: llm.RoleAssistant, Content: completion},
+			FinishReason: llm.FinishReasonStop,
+		}, nil
+	}))
+
+	rec := post(t, h, `{"model":"model-a","messages":[{"role":"user","content":"`+prompt+`"}]}`)
+
+	lines := jsonLines(t, logs)
+	if len(lines) != 1 {
+		t.Fatalf("got %d log lines, want 1:\n%s", len(lines), logs)
+	}
+	got := lines[0]
+	for key, want := range map[string]any{
+		"level":       "INFO",
+		"msg":         "request completed",
+		"request_id":  rec.Header().Get(RequestIDHeader),
+		"client_id":   "team-a",
+		"model":       "model-a",
+		"provider":    "anthropic",
+		"status":      float64(http.StatusOK),
+		"retry_count": float64(2),
+		"fallback":    true,
+	} {
+		if got[key] != want {
+			t.Errorf("%s = %v, want %v", key, got[key], want)
+		}
+	}
+	if latency, ok := got["latency"].(float64); !ok || latency <= 0 {
+		t.Errorf("latency = %v, want a positive duration", got["latency"])
+	}
+	for _, key := range []string{"code", "error", "upstream_status"} {
+		if _, ok := got[key]; ok {
+			t.Errorf("successful request logged %s = %v", key, got[key])
+		}
+	}
+	if strings.Contains(logs.String(), prompt) || strings.Contains(logs.String(), completion) {
+		t.Errorf("log contains prompt or completion content:\n%s", logs)
+	}
+}
+
+func TestOutcomeLogLevels(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		err   error
+		level string
+	}{
+		{"upstream rejected", &llm.ProviderError{Provider: "openai", StatusCode: http.StatusBadRequest}, "WARN"},
+		{"upstream failed", &llm.ProviderError{Provider: "openai", StatusCode: http.StatusServiceUnavailable}, "ERROR"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, logs := newJSONHandler(t, failingProvider(tt.err))
+			post(t, h, validBody)
+
+			lines := jsonLines(t, logs)
+			if len(lines) != 1 || lines[0]["msg"] != "request completed" || lines[0]["level"] != tt.level {
+				t.Errorf("logs = %v, want one request completed line at %s", lines, tt.level)
+			}
+		})
+	}
+}
+
+func TestOutcomeLogNotWrittenForRejectedRequests(t *testing.T) {
+	h, logs := newHandler(t, okProvider)
+	post(t, h, `{"model":"model-a","messages":[]}`)
+
+	if strings.Contains(logs.String(), "request completed") || !strings.Contains(logs.String(), "chat completion failed") {
+		t.Errorf("a validation failure must log only its rejection:\n%s", logs)
+	}
+}

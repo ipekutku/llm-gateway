@@ -238,33 +238,33 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 	received, _ := r.Context().Value(receivedAtKey{}).(time.Time)
 	identity, _ := auth.FromContext(r.Context())
 	record := usage.Record{RequestID: requestID(r), Time: received, ClientID: identity.ClientID, RequestedModel: req.Model}
+	ctx, stats := llm.WithStats(r.Context())
+	var chatErr error
 	defer func() {
 		if r.Context().Err() != nil {
 			record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
 		}
 		record.Duration = time.Since(received)
+		h.logOutcome(r.Context(), record, chatErr, stats)
 		h.accounting.Recorder.Record(record)
 	}()
-	ctx, cancel := context.WithTimeout(r.Context(), h.upstreamTimeout)
+	ctx, cancel := context.WithTimeout(ctx, h.upstreamTimeout)
 	defer cancel()
 
 	resp, err := h.provider.Chat(ctx, req)
 	if err != nil {
+		chatErr = err
 		if pe, ok := errors.AsType[*llm.ProviderError](err); ok {
 			record.Provider = pe.Provider
 		}
 		if r.Context().Err() != nil {
-			record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
 			// The client is gone; there is nobody to write a response to.
-			h.log.LogAttrs(r.Context(), slog.LevelInfo, "client canceled request",
-				slog.String("model", req.Model),
-				slog.Any("error", err),
-			)
+			// The deferred function records the cancellation.
 			return
 		}
 		failure := classifyChatError(err)
 		record.Status, record.ErrorCode = failure.status, failure.code
-		if writeErr := h.fail(w, r, failure, err, slog.String("model", req.Model)); writeErr != nil {
+		if writeErr := writeError(w, failure); writeErr != nil {
 			record.Status, record.ErrorCode = usage.StatusClientClosed, "client_closed"
 		}
 		return
@@ -306,31 +306,70 @@ func (h *handler) complete(w http.ResponseWriter, r *http.Request, req llm.ChatR
 	}
 }
 
-// fail logs a failed request once and writes the error envelope. Logs
-// contain no credentials, prompt or completion content, or raw upstream
-// bodies; err must follow the same rule, as llm.ProviderError does. The
-// request and client IDs come from the context through logHandler.
-func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err error, attrs ...slog.Attr) error {
+// fail logs a request rejected before it reached a provider, and writes
+// the error envelope. Logs contain no credentials, prompt or completion
+// content, or raw upstream bodies; err must follow the same rule, as
+// llm.ProviderError does. The request and client IDs come from the context
+// through logHandler.
+func (h *handler) fail(w http.ResponseWriter, r *http.Request, e apiError, err error, attrs ...slog.Attr) {
 	attrs = append(attrs,
 		slog.Int("status", e.status),
 		slog.String("code", e.code),
 	)
-	if pe, ok := errors.AsType[*llm.ProviderError](err); ok {
-		attrs = append(attrs,
-			slog.String("provider", pe.Provider),
-			slog.Int("upstream_status", pe.StatusCode),
-		)
-	}
 	if err != nil {
 		attrs = append(attrs, slog.Any("error", err))
 	}
+	h.log.LogAttrs(r.Context(), statusLevel(e.status), "chat completion failed", attrs...)
+	_ = writeError(w, e)
+}
 
-	level := slog.LevelWarn
-	if e.status >= http.StatusInternalServerError {
-		level = slog.LevelError
+// logOutcome logs the one line describing a validated request's outcome,
+// with the same status, error code, and provider as its usage record. err
+// is the provider error, if any; the rules of fail apply to it.
+func (h *handler) logOutcome(ctx context.Context, record usage.Record, err error, stats *llm.Stats) {
+	attrs := []slog.Attr{
+		slog.String("model", record.RequestedModel),
+		slog.Int("status", record.Status),
 	}
-	h.log.LogAttrs(r.Context(), level, "chat completion failed", attrs...)
+	if record.ErrorCode != "" {
+		attrs = append(attrs, slog.String("code", record.ErrorCode))
+	}
+	if record.Provider != "" {
+		attrs = append(attrs, slog.String("provider", record.Provider))
+	}
+	if pe, ok := errors.AsType[*llm.ProviderError](err); ok {
+		attrs = append(attrs, slog.Int("upstream_status", pe.StatusCode))
+	}
+	attrs = append(attrs,
+		slog.Duration("latency", record.Duration),
+		slog.Int("retry_count", stats.Retries()),
+		slog.Bool("fallback", stats.Fallback()),
+	)
+	if err != nil {
+		attrs = append(attrs, slog.Any("error", err))
+	}
+	level := statusLevel(record.Status)
+	if record.Status == usage.StatusClientClosed {
+		level = slog.LevelInfo
+	}
+	h.log.LogAttrs(ctx, level, "request completed", attrs...)
+}
 
+// statusLevel is the log level for a response status: error for 5xx, warn
+// for 4xx, and info otherwise.
+func statusLevel(status int) slog.Level {
+	switch {
+	case status >= http.StatusInternalServerError:
+		return slog.LevelError
+	case status >= http.StatusBadRequest:
+		return slog.LevelWarn
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// writeError writes the error envelope for e.
+func writeError(w http.ResponseWriter, e apiError) error {
 	return writeJSON(w, e.status, errorResponse{Error: errorBody{
 		Message: e.message,
 		Type:    e.typ,

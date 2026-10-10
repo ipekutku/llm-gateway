@@ -82,6 +82,7 @@ func New(next llm.Provider, policy Policy, log *slog.Logger) (*Provider, error) 
 //
 // After more than one attempt, the error reports the attempt count and
 // still wraps the last failure, so its type and status remain inspectable.
+// Each repeated attempt is counted in the llm.Stats carried by ctx, if any.
 func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatResponse, error) {
 	for attempt := 1; ; attempt++ {
 		resp, err := p.next.Chat(ctx, req)
@@ -103,6 +104,7 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespo
 		if ctxErr := p.sleep(ctx, delay); ctxErr != nil {
 			return llm.ChatResponse{}, fmt.Errorf("%w while waiting to retry: %w", ctxErr, attempts(attempt, err))
 		}
+		llm.StatsFrom(ctx).AddRetry()
 	}
 }
 

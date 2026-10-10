@@ -453,3 +453,39 @@ func TestSleep(t *testing.T) {
 		t.Errorf("sleep(canceled) error = %v, want context.Canceled", err)
 	}
 }
+
+func TestChatCountsRetriesInStats(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		results []error
+		want    int
+	}{
+		{"first attempt succeeds", []error{nil}, 0},
+		{"second attempt succeeds", []error{statusErr(http.StatusServiceUnavailable), nil}, 1},
+		{"attempts exhausted", []error{statusErr(http.StatusServiceUnavailable)}, testPolicy.MaxAttempts - 1},
+		{"not retryable", []error{statusErr(http.StatusBadRequest)}, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p, _ := newTestProvider(t, &scripted{results: tt.results}, testPolicy)
+			ctx, stats := llm.WithStats(context.Background())
+
+			_, _ = p.Chat(ctx, testRequest)
+
+			if stats.Retries() != tt.want {
+				t.Errorf("Retries() = %d, want %d", stats.Retries(), tt.want)
+			}
+		})
+	}
+}
+
+func TestChatDoesNotCountRetryCanceledDuringWait(t *testing.T) {
+	p, _ := newTestProvider(t, &scripted{results: []error{statusErr(http.StatusServiceUnavailable), nil}}, testPolicy)
+	p.sleep = func(context.Context, time.Duration) error { return context.Canceled }
+	ctx, stats := llm.WithStats(context.Background())
+
+	_, _ = p.Chat(ctx, testRequest)
+
+	if stats.Retries() != 0 {
+		t.Errorf("Retries() = %d, want 0: no second attempt was made", stats.Retries())
+	}
+}
