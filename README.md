@@ -33,7 +33,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Project Status
 
-v0.1 through v0.6 are feature-complete; v0.7 distributed platform behavior is next. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+v0.1 through v0.7 are feature-complete; v0.8 performance engineering is next. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
 
 ```text
 v0.1  Provider abstraction + routing          ✅
@@ -42,11 +42,22 @@ v0.3  Provider fallback + circuit breakers    ✅
 v0.4  Authentication + rate limiting          ✅
 v0.5  Usage + cost tracking + PostgreSQL      ✅
 v0.6  Prometheus + OpenTelemetry              ✅
-v0.7  Redis + multi-instance behavior
+v0.7  Redis + multi-instance behavior        ✅
 v0.8  Load testing + performance work
 v0.9  Docker + Kubernetes + Helm
 v1.0  AWS deployment with Terraform
 ```
+
+### v0.7 — Redis and Distributed Rate Limits ✅
+
+Implemented (see [Shared rate limits with Redis](#shared-rate-limits-with-redis)):
+
+* optional Redis (`GATEWAY_REDIS_URL`) so that gateway instances share each client's request rate and concurrent requests, with the same limits and `429` responses as before
+* atomic checks in Redis using Redis time, so instances with different clocks agree, and concurrency slots that expire, so a crashed instance cannot hold them for good
+* when Redis fails or is slow, each instance falls back to its own limits with one warning, probes Redis once a second, and resumes shared limits when it answers; startup does not require Redis
+* metrics and dashboard panels for the rate-limit mode, Redis call latency, and Redis errors
+* circuit breakers stay per instance, and Redis is used for nothing else; the reasons are in the [architecture](docs/architecture.md#shared-limits-in-redis)
+* tests with two complete gateway instances against one Redis, including an outage and recovery through a proxy that cuts the connection
 
 ### v0.6 — Observability ✅
 

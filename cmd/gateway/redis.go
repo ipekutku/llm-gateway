@@ -20,10 +20,6 @@ const (
 	// waits at most this long before the local limits decide it.
 	redisCallTimeout = 250 * time.Millisecond
 
-	// redisRetryInterval is how long local limits are used after a Redis
-	// failure before Redis is tried again.
-	redisRetryInterval = time.Second
-
 	// redisStartupTimeout bounds the startup check that Redis answers.
 	redisStartupTimeout = 2 * time.Second
 
@@ -32,6 +28,17 @@ const (
 	// response and finish the handler.
 	leaseMargin = 30 * time.Second
 )
+
+// redisRetryInterval is how long local limits are used after a Redis
+// failure before Redis is tried again. Replaced in tests.
+var redisRetryInterval = time.Second
+
+// redisLease is how long an admitted request holds its concurrency slot in
+// Redis if it is never released: the longest it can spend reading its body
+// and waiting upstream, plus leaseMargin. Replaced in tests.
+var redisLease = func(upstreamTimeout time.Duration) time.Duration {
+	return httpapi.BodyReadTimeout + upstreamTimeout + leaseMargin
+}
 
 // loadRedis reads GATEWAY_REDIS_URL. It returns nil if the variable is
 // absent. Errors never include the URL, which may contain a password.
@@ -72,7 +79,7 @@ func newLimiter(ctx context.Context, cfg config, m *metrics.Metrics, logger *slo
 	shared, err := ratelimit.NewShared(client, cfg.RateLimits, ratelimit.SharedOptions{
 		KeyPrefix: cfg.RedisKeyPrefix,
 		Timeout:   redisCallTimeout,
-		Lease:     httpapi.BodyReadTimeout + cfg.UpstreamTimeout + leaseMargin,
+		Lease:     redisLease(cfg.UpstreamTimeout),
 		OnCall:    m.ObserveRateLimitStoreCall,
 	})
 	if err != nil {
