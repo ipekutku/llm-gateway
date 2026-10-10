@@ -5,17 +5,19 @@ import (
 	"log/slog"
 
 	"github.com/ipekutku/llm-gateway/internal/auth"
+	"go.opentelemetry.io/otel/trace"
 )
 
-// logHandler adds the request ID and authenticated client ID carried in a
-// record's context to the record.
+// logHandler adds the request ID, authenticated client ID, and trace ID
+// carried in a record's context to the record.
 type logHandler struct {
 	next slog.Handler
 }
 
 // NewLogHandler returns a handler that adds request_id and client_id to
 // every record logged with the context of a request this package handles,
-// then passes it to next. Records logged with another context are passed on
+// and trace_id to every record logged with the context of a trace, then
+// passes it to next. Records logged with another context are passed on
 // unchanged. Below a group set by WithGroup, the attributes are in that
 // group.
 //
@@ -37,6 +39,9 @@ func (h logHandler) Handle(ctx context.Context, r slog.Record) error {
 		}
 		if id, ok := auth.FromContext(ctx); ok {
 			r.AddAttrs(slog.String("client_id", id.ClientID))
+		}
+		if sc := trace.SpanContextFromContext(ctx); sc.HasTraceID() {
+			r.AddAttrs(slog.String("trace_id", sc.TraceID().String()))
 		}
 	}
 	return h.next.Handle(ctx, r)

@@ -50,15 +50,16 @@ v1.0  AWS deployment with Terraform
 
 ### v0.6 — Observability (in progress)
 
-Implemented so far (see [Logs and metrics](#logs-and-metrics)):
+Implemented so far (see [Logs, metrics, and traces](#logs-metrics-and-traces)):
 
 * structured logs as text or JSON; every line logged while handling a request carries its request ID and, once authenticated, its client ID, including retry, fallback, and circuit breaker lines
 * one outcome line per validated request with status, provider, latency, retry count, and whether a fallback ran
 * Prometheus metrics on a separate, unauthenticated listener: request counts by model, status, and error code, and request latency by model, with model labels limited to the configured models
 * provider metrics: every upstream attempt by outcome, its latency, errors by upstream status, retries, fallbacks, and each circuit breaker's state
 * token and estimated cost metrics per provider and model, matching the usage records
+* OpenTelemetry traces exported over OTLP/HTTP when an endpoint is configured: one span per request, routing step, provider, and upstream attempt, with retries and fallbacks as events, and the trace ID in every log line
 
-Still to come: OpenTelemetry tracing; a local Prometheus, Grafana, and tracing stack with dashboards.
+Still to come: traces of usage database writes; a local Prometheus, Grafana, and tracing stack with dashboards.
 
 ### v0.5 — Usage and Cost Accounting ✅
 
@@ -206,8 +207,9 @@ The `model` field must match a configured model exactly; the request is routed t
 | `OPENAI_MODEL`, `OPENAI_API_KEY` | Enable OpenAI for one model. Set both or neither. |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Enable Anthropic for one model. Set both or neither. |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
-| `GATEWAY_METRICS_ADDR` | Listen address of the unauthenticated Prometheus endpoint, `/metrics`. Default `127.0.0.1:9464`. Must differ from `GATEWAY_ADDR`. See [Logs and metrics](#logs-and-metrics). |
-| `GATEWAY_LOG_FORMAT` | `text` (default) or `json`, written to standard error. See [Logs and metrics](#logs-and-metrics). |
+| `GATEWAY_METRICS_ADDR` | Listen address of the unauthenticated Prometheus endpoint, `/metrics`. Default `127.0.0.1:9464`. Must differ from `GATEWAY_ADDR`. See [Logs, metrics, and traces](#logs-metrics-and-traces). |
+| `GATEWAY_LOG_FORMAT` | `text` (default) or `json`, written to standard error. See [Logs, metrics, and traces](#logs-metrics-and-traces). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables tracing: base URL of an OpenTelemetry collector accepting OTLP over HTTP, such as `http://127.0.0.1:4318`. Unset means no tracing. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (the full URL) also enables it, and the other standard `OTEL_*` exporter, sampler, and resource variables apply. See [Traces](#traces). |
 | `GATEWAY_UPSTREAM_TIMEOUT` | Time limit for all upstream work on one request, as a Go duration such as `90s` or `2m`. Default `120s`. If it expires, the client gets `504 upstream_timeout`. |
 | `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Time limit for connecting to a provider (TCP dial and TLS handshake). Default `10s`. |
 | `GATEWAY_RETRY_MAX_ATTEMPTS` | Total attempts per request, including the first, from `1` to `10`. Default `3`. Set `1` to disable retries. |
@@ -252,7 +254,7 @@ The clients file lists every client allowed to use the gateway, with the SHA-256
 
 Generate keys with a secure random source, as above; the hash protects only random keys, not memorable passwords. A request over its client's rate gets `429 rate_limit_exceeded` with `Retry-After`; over its concurrency limit, `429 concurrency_limit_exceeded`. The file is read once at startup; restart the gateway to add, change, or disable clients.
 
-Startup fails if the clients file is missing, malformed, has unknown fields, or enables no client, if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, if a timeout or delay is not a positive duration, if the attempt count is outside 1–10, if the maximum retry delay is less than the base delay, if the provider timeout is not less than the upstream timeout, or if a fallback names a provider that is not configured. Error messages name the variables and clients but never print keys, hashes, or other values.
+Startup fails if the clients file is missing, malformed, has unknown fields, or enables no client, if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, if a timeout or delay is not a positive duration, if the attempt count is outside 1–10, if the maximum retry delay is less than the base delay, if the provider timeout is not less than the upstream timeout, if a fallback names a provider that is not configured, or if an OTLP endpoint or protocol is invalid. Error messages name the variables and clients but never print keys, hashes, or other values.
 
 Startup also fails if either accounting setting is absent, the pricing file is invalid, the database cannot be reached, or its migration history is behind, newer, or inconsistent with this binary. Database connectivity and schema checks share a 10-second startup budget. Migrations have a 1-minute budget and run transactionally under an advisory lock.
 
@@ -288,9 +290,9 @@ Live runs have not covered refusals (`content_filter`), Anthropic prompt-cache r
 
 The response contains exactly one choice with `finish_reason` `stop`, `length`, or `content_filter`, plus token usage. Every response, including errors, carries an `X-Request-ID` header; quote it when reporting a problem. A successful response's `id` is `chatcmpl-` followed by the same ID. An `X-Request-ID` sent by the client is ignored. Errors use the envelope `{"error": {"message", "type", "code"}}`; see [docs/architecture.md](docs/architecture.md#error-mapping) for the full status mapping.
 
-### Logs and metrics
+### Logs, metrics, and traces
 
-Logs go to standard error, as text by default or as one JSON object per line with `GATEWAY_LOG_FORMAT=json`. Every line logged while handling a request carries its `request_id`, the same ID returned in `X-Request-ID`, and, once the client is authenticated, its `client_id`. That includes the intermediate lines for retries, fallbacks, and circuit breaker changes, so all lines of one request can be found by its ID.
+Logs go to standard error, as text by default or as one JSON object per line with `GATEWAY_LOG_FORMAT=json`. Every line logged while handling a request carries its `request_id`, the same ID returned in `X-Request-ID`, once the client is authenticated, its `client_id`, and, with tracing enabled, its `trace_id`. That includes the intermediate lines for retries, fallbacks, and circuit breaker changes, so all lines of one request can be found by its ID.
 
 Each request that passes validation ends with exactly one `request completed` line:
 
@@ -336,6 +338,30 @@ scrape_configs:
       - targets: ["127.0.0.1:9464"]
 ```
 
+#### Traces
+
+Setting `OTEL_EXPORTER_OTLP_ENDPOINT` makes the gateway export OpenTelemetry traces over OTLP/HTTP (protobuf), for example to a local collector or Jaeger:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+```
+
+Each request is one trace with service name `llm-gateway` (override with `OTEL_SERVICE_NAME`):
+
+```text
+POST /v1/chat/completions          request ID, client ID, status, retry count, fallback
+└─ route                           requested model; "fallback" event
+   ├─ provider openai              circuit breaker and retries; one "retry" event per retry
+   │  ├─ chat gpt-4o               one upstream attempt: status, response model, token counts
+   │  └─ chat gpt-4o
+   └─ provider anthropic           only after a fallback
+      └─ chat claude-opus-5-5
+```
+
+Failed spans have an error status and an `error.type`. A request rejected before routing (`401`, `429`, invalid body) has only the first span. Spans never contain prompts, completions, keys, or upstream response bodies.
+
+A client may send a W3C `traceparent` header; the gateway's spans then join the client's trace, and the client's sampling decision applies. The gateway never sends trace headers to OpenAI or Anthropic. Spans are exported in batches in the background; failed exports are logged as `tracing error` warnings and never affect requests. Shutdown flushes pending spans within its budget. Only OTLP over HTTP is supported: an endpoint that is not an `http` or `https` URL, or `OTEL_EXPORTER_OTLP_PROTOCOL` other than `http/protobuf`, fails startup. Use `https` for a collector on another host, and put collector credentials in `OTEL_EXPORTER_OTLP_HEADERS`, not in the URL, which can appear in export error logs.
+
 ### Limitations
 
 * One model per provider, matched by exact name; no aliases or wildcards.
@@ -350,6 +376,7 @@ scrape_configs:
 * Rate limits and concurrency counts are kept per gateway process; several instances do not share them (planned for v0.7).
 * Clients are read from a file at startup; changing them requires a restart. Each client has one key, so rotating a key briefly means replacing it.
 * `/metrics` has no authentication; it reveals request counts per configured model and status and provider health, never keys, clients, or content. Keep `GATEWAY_METRICS_ADDR` on loopback or a network only Prometheus can reach.
+* With tracing enabled, every request, including rejected ones, produces spans, and a client's `traceparent` decides whether its requests are sampled. Clients cannot see trace data, but anyone who can reach the gateway can add to the collector's load.
 * Every rejected key logs one warning, and there is no per-IP limit on unauthenticated requests; anyone who can reach the port can fill the logs. Another reason to keep the gateway behind a proxy.
 * A request body must arrive within 30 seconds (otherwise `408`), and idle keep-alive connections close after 2 minutes. Both are fixed.
 * Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.

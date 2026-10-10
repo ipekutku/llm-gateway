@@ -26,7 +26,10 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 	"github.com/ipekutku/llm-gateway/internal/retry"
 	"github.com/ipekutku/llm-gateway/internal/routing"
+	"github.com/ipekutku/llm-gateway/internal/tracing"
 	"github.com/ipekutku/llm-gateway/internal/usage"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -104,6 +107,7 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 		return err
 	}
 	var active *activeHandlers
+	var tp *sdktrace.TracerProvider
 	defer func() {
 		drainCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
@@ -115,12 +119,25 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 		if closeErr == nil {
 			logger.Info("usage recorder stopped")
 		}
+		// Last, so the spans of finished handlers are flushed.
+		if tp != nil {
+			if err := tp.Shutdown(drainCtx); err != nil {
+				result = errors.Join(result, fmt.Errorf("tracing shutdown: %w", err))
+			}
+		}
 	}()
 	m, err := metrics.New(configuredModels(cfg))
 	if err != nil {
 		return err
 	}
-	handler, err := newHandler(cfg, nil, recorder, m, logger)
+	var traces trace.TracerProvider
+	if cfg.Tracing {
+		if tp, err = newTracerProvider(ctx, logger); err != nil {
+			return err
+		}
+		traces = tp
+	}
+	handler, err := newHandler(cfg, nil, recorder, m, traces, logger)
 	if err != nil {
 		return err
 	}
@@ -156,6 +173,7 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 		slog.Duration("retry_max_delay", cfg.Retry.MaxDelay),
 		slog.Int("breaker_failures", cfg.Breaker.Failures),
 		slog.Duration("breaker_cooldown", cfg.Breaker.Cooldown),
+		slog.Bool("tracing", cfg.Tracing),
 	)
 	if (cfg.OpenAI != nil && cfg.OpenAI.FallbackTo != "") || (cfg.Anthropic != nil && cfg.Anthropic.FallbackTo != "") {
 		attrs = append(attrs, slog.Duration("provider_timeout", cfg.ProviderTimeout))
@@ -232,11 +250,13 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 // rate limiter, and HTTP handler for cfg. Each provider client is wrapped
 // with retries and, above them, a circuit breaker; the router's fallback
 // sits above both. A nil httpClient uses a client built by
-// newUpstreamClient, and a nil m records no metrics.
-func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecorder, m *metrics.Metrics, logger *slog.Logger) (http.Handler, error) {
+// newUpstreamClient, a nil m records no metrics, and a nil tp creates no
+// spans.
+func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecorder, m *metrics.Metrics, tp trace.TracerProvider, logger *slog.Logger) (http.Handler, error) {
 	if httpClient == nil {
 		httpClient = newUpstreamClient(cfg)
 	}
+	t := tracing.New(tp)
 
 	type enabled struct {
 		cfg      *providerConfig
@@ -248,7 +268,7 @@ func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecor
 		if err != nil {
 			return nil, err
 		}
-		wrapped, err := resilient(openai.ProviderName, c, cfg, m, logger)
+		wrapped, err := resilient(openai.ProviderName, c, cfg, m, t, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -259,7 +279,7 @@ func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecor
 		if err != nil {
 			return nil, err
 		}
-		wrapped, err := resilient(anthropic.ProviderName, c, cfg, m, logger)
+		wrapped, err := resilient(anthropic.ProviderName, c, cfg, m, t, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -298,22 +318,31 @@ func newHandler(cfg config, httpClient *http.Client, recorder httpapi.UsageRecor
 	for name, e := range providers {
 		models[name] = e.cfg.Model
 	}
-	return httpapi.New(router, authenticator, limiter, cfg.UpstreamTimeout, httpapi.Accounting{Recorder: recorder, Pricing: cfg.Pricing, Models: models}, m, logger)
+	h, err := httpapi.New(t.Route(router), authenticator, limiter, cfg.UpstreamTimeout, httpapi.Accounting{Recorder: recorder, Pricing: cfg.Pricing, Models: models}, m, logger)
+	if err != nil {
+		return nil, err
+	}
+	return t.Handler(h), nil
 }
 
 // resilient wraps a provider client with the retry policy and, above it,
 // a circuit breaker, so the breaker sees one outcome per request. The client
-// itself is instrumented, so m counts every attempt.
-func resilient(name string, p llm.Provider, cfg config, m *metrics.Metrics, logger *slog.Logger) (llm.Provider, error) {
+// itself is instrumented, so m counts every attempt and t traces each one;
+// t's provider span covers the breaker and all attempts.
+func resilient(name string, p llm.Provider, cfg config, m *metrics.Metrics, t *tracing.Tracer, logger *slog.Logger) (llm.Provider, error) {
 	policy := cfg.Retry
 	policy.OnRetry = func() { m.ObserveRetry(name) }
-	r, err := retry.New(m.Instrument(name, p), policy, logger)
+	r, err := retry.New(m.Instrument(name, t.Attempt(name, p)), policy, logger)
 	if err != nil {
 		return nil, err
 	}
 	settings := cfg.Breaker
 	settings.OnStateChange = func(s breaker.State) { m.SetCircuitState(name, s) }
-	return breaker.New(name, r, settings, logger)
+	b, err := breaker.New(name, r, settings, logger)
+	if err != nil {
+		return nil, err
+	}
+	return t.Provider(name, b), nil
 }
 
 // newUpstreamClient returns the HTTP client shared by all provider

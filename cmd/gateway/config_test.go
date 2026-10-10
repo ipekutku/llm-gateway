@@ -509,3 +509,52 @@ func TestLoadConfigReportsClientErrorsWithOthers(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadTracing(t *testing.T) {
+	const secretURL = "https://user:otlp-secret@collector.example:4318"
+	tests := []struct {
+		name    string
+		vars    map[string]string
+		enabled bool
+		errs    []string
+	}{
+		{"disabled by default", nil, false, nil},
+		{"blank endpoint", map[string]string{otlpEndpointVar: " "}, false, nil},
+		{"endpoint", map[string]string{otlpEndpointVar: "http://127.0.0.1:4318"}, true, nil},
+		{"traces endpoint", map[string]string{otlpTracesEndpointVar: "https://collector.example/v1/traces"}, true, nil},
+		{"http/protobuf", map[string]string{otlpEndpointVar: "http://127.0.0.1:4318", otlpProtocolVar: "http/protobuf"}, true, nil},
+		{"endpoint without scheme", map[string]string{otlpEndpointVar: "127.0.0.1:4318"}, false, []string{otlpEndpointVar + " must be an http or https URL"}},
+		{"grpc scheme", map[string]string{otlpTracesEndpointVar: "grpc://collector:4317"}, false, []string{otlpTracesEndpointVar + " must be an http or https URL"}},
+		{"unparsable endpoint", map[string]string{otlpEndpointVar: secretURL + "/%zz"}, false, []string{otlpEndpointVar + " must be"}},
+		{"grpc protocol", map[string]string{otlpEndpointVar: secretURL, otlpProtocolVar: "grpc", otlpTracesProtocolVar: "http/json"}, false, []string{
+			otlpProtocolVar + " must be http/protobuf", otlpTracesProtocolVar + " must be http/protobuf",
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey}
+			maps.Copy(vars, tt.vars)
+			cfg, err := load(vars)
+			if len(tt.errs) == 0 {
+				if err != nil {
+					t.Fatalf("loadConfig() error = %v", err)
+				}
+				if cfg.Tracing != tt.enabled {
+					t.Errorf("Tracing = %v, want %v", cfg.Tracing, tt.enabled)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("loadConfig() error = nil, want error")
+			}
+			for _, want := range tt.errs {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+			if strings.Contains(err.Error(), "otlp-secret") {
+				t.Errorf("error exposes the endpoint: %q", err)
+			}
+		})
+	}
+}

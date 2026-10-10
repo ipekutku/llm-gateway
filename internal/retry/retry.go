@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // statusOverloaded is Anthropic's non-standard "overloaded" status.
@@ -85,7 +87,8 @@ func New(next llm.Provider, policy Policy, log *slog.Logger) (*Provider, error) 
 //
 // After more than one attempt, the error reports the attempt count and
 // still wraps the last failure, so its type and status remain inspectable.
-// Each repeated attempt is counted in the llm.Stats carried by ctx, if any.
+// Each repeated attempt is counted in the llm.Stats carried by ctx, if any,
+// and each wait is a "retry" event on the trace span in ctx, if any.
 func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatResponse, error) {
 	for attempt := 1; ; attempt++ {
 		resp, err := p.next.Chat(ctx, req)
@@ -104,6 +107,10 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespo
 			return llm.ChatResponse{}, attempts(attempt, err)
 		}
 		p.logRetry(ctx, req.Model, attempt, delay, err)
+		trace.SpanFromContext(ctx).AddEvent("retry", trace.WithAttributes(append(upstreamAttrs(err),
+			attribute.Int("gateway.retry.failed_attempt", attempt),
+			attribute.Int64("gateway.retry.delay_ms", delay.Milliseconds()),
+		)...))
 		if ctxErr := p.sleep(ctx, delay); ctxErr != nil {
 			return llm.ChatResponse{}, fmt.Errorf("%w while waiting to retry: %w", ctxErr, attempts(attempt, err))
 		}
@@ -162,6 +169,15 @@ func (p *Provider) logRetry(ctx context.Context, model string, attempt int, dela
 	}
 	attrs = append(attrs, slog.Any("error", err))
 	p.log.LogAttrs(ctx, slog.LevelWarn, "upstream attempt failed, retrying", attrs...)
+}
+
+// upstreamAttrs describes a failed attempt for a trace event.
+func upstreamAttrs(err error) []attribute.KeyValue {
+	pe, ok := errors.AsType[*llm.ProviderError](err)
+	if !ok || pe.StatusCode == 0 {
+		return nil
+	}
+	return []attribute.KeyValue{attribute.Int("http.response.status_code", pe.StatusCode)}
 }
 
 // delay returns how long to wait after the given failed attempt:

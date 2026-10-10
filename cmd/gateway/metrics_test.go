@@ -34,7 +34,7 @@ func TestRequestPathMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("metrics.New() error = %v", err)
 	}
-	h, err := newHandler(cfg, nil, discardRecorder{}, m, slog.New(slog.DiscardHandler))
+	h, err := newHandler(cfg, nil, discardRecorder{}, m, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
@@ -164,7 +164,7 @@ func metricsGateway(t *testing.T, oa, an *upstream, edit func(*config)) (*httpte
 	if err != nil {
 		t.Fatalf("metrics.New() error = %v", err)
 	}
-	h, err := newHandler(cfg, nil, discardRecorder{}, m, slog.New(slog.DiscardHandler))
+	h, err := newHandler(cfg, nil, discardRecorder{}, m, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newHandler() error = %v", err)
 	}
