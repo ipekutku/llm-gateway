@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/llm"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // StatusClientClosed is the Status of a request whose client disconnected
@@ -40,6 +41,10 @@ type Record struct {
 	Usage *llm.Usage
 	// Cost is the estimated cost of Usage, or nil if unknown.
 	Cost *Cost
+	// Span identifies the request's trace span, so the span of the write
+	// that stores the record can link to it. It is invalid without tracing
+	// and is not stored.
+	Span trace.SpanContext
 }
 
 // maxDuration bounds Record.Duration far above any request's time budget,

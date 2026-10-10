@@ -74,7 +74,7 @@ func newDatabase(t *testing.T) string {
 
 func newStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(testContext(t), newDatabase(t))
+	s, err := Open(testContext(t), newDatabase(t), nil)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -146,7 +146,7 @@ func TestOpenDoesNotRevealURL(t *testing.T) {
 	}
 	for name, u := range tests {
 		t.Run(name, func(t *testing.T) {
-			s, err := Open(testContext(t), u)
+			s, err := Open(testContext(t), u, nil)
 			if err == nil {
 				s.Close()
 				t.Fatal("Open() error = nil, want error")

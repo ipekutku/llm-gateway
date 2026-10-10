@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 //go:embed migrations/*.sql
@@ -68,7 +70,21 @@ func loadMigrations(fsys fs.FS) ([]migration, error) {
 //
 // It fails without changes if the database has a migration this gateway
 // does not know, which means a newer gateway migrated it.
+//
+// The run is a "migrate" span with one child span per migration applied.
 func (s *Store) Migrate(ctx context.Context) (int, error) {
+	ctx, span := s.tracer.Start(ctx, "migrate", trace.WithAttributes(attribute.String("db.system.name", "postgresql")))
+	defer span.End()
+	n, err := s.migrate(ctx)
+	if err != nil {
+		setError(span, err)
+		return 0, err
+	}
+	span.SetAttributes(attribute.Int("gateway.migrations.applied", n))
+	return n, nil
+}
+
+func (s *Store) migrate(ctx context.Context) (int, error) {
 	migrations, err := loadMigrations(migrationFiles)
 	if err != nil {
 		return 0, err
@@ -107,11 +123,8 @@ func (s *Store) Migrate(ctx context.Context) (int, error) {
 		if m.version <= len(applied) {
 			continue
 		}
-		if _, err := tx.Exec(ctx, m.sql); err != nil {
-			return 0, fmt.Errorf("migrate: %s: %w", m.name, err)
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version, name) VALUES ($1, $2)", m.version, m.name); err != nil {
-			return 0, fmt.Errorf("migrate: record %s: %w", m.name, err)
+		if err := s.apply(ctx, tx, m); err != nil {
+			return 0, err
 		}
 		n++
 	}
@@ -119,6 +132,27 @@ func (s *Store) Migrate(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("migrate: commit: %w", err)
 	}
 	return n, nil
+}
+
+// apply runs migration m in tx and records it, in a span of its own. The
+// span succeeds even if the transaction is later rolled back; the migrate
+// span then fails.
+func (s *Store) apply(ctx context.Context, tx pgx.Tx, m migration) error {
+	ctx, span := s.tracer.Start(ctx, "migration "+m.name, trace.WithAttributes(
+		attribute.String("db.system.name", "postgresql"),
+		attribute.Int("gateway.migration.version", m.version),
+	))
+	defer span.End()
+	var err error
+	if _, execErr := tx.Exec(ctx, m.sql); execErr != nil {
+		err = fmt.Errorf("migrate: %s: %w", m.name, execErr)
+	} else if _, execErr := tx.Exec(ctx, "INSERT INTO schema_migrations (version, name) VALUES ($1, $2)", m.version, m.name); execErr != nil {
+		err = fmt.Errorf("migrate: record %s: %w", m.name, execErr)
+	}
+	if err != nil {
+		setError(span, err)
+	}
+	return err
 }
 
 // CheckSchema reports an error unless the database has applied exactly the

@@ -58,8 +58,9 @@ Implemented so far (see [Logs, metrics, and traces](#logs-metrics-and-traces)):
 * provider metrics: every upstream attempt by outcome, its latency, errors by upstream status, retries, fallbacks, and each circuit breaker's state
 * token and estimated cost metrics per provider and model, matching the usage records
 * OpenTelemetry traces exported over OTLP/HTTP when an endpoint is configured: one span per request, routing step, provider, and upstream attempt, with retries and fallbacks as events, and the trace ID in every log line
+* traces of usage database writes, linked to the requests they record, and of migrations
 
-Still to come: traces of usage database writes; a local Prometheus, Grafana, and tracing stack with dashboards.
+Still to come: a local Prometheus, Grafana, and tracing stack with dashboards.
 
 ### v0.5 — Usage and Cost Accounting ✅
 
@@ -360,7 +361,9 @@ POST /v1/chat/completions          request ID, client ID, status, retry count, f
 
 Failed spans have an error status and an `error.type`. A request rejected before routing (`401`, `429`, invalid body) has only the first span. Spans never contain prompts, completions, keys, or upstream response bodies.
 
-A client may send a W3C `traceparent` header; the gateway's spans then join the client's trace, and the client's sampling decision applies. The gateway never sends trace headers to OpenAI or Anthropic. Spans are exported in batches in the background; failed exports are logged as `tracing error` warnings and never affect requests. Shutdown flushes pending spans within its budget. Only OTLP over HTTP is supported: an endpoint that is not an `http` or `https` URL, or `OTEL_EXPORTER_OTLP_PROTOCOL` other than `http/protobuf`, fails startup. Use `https` for a collector on another host, and put collector credentials in `OTEL_EXPORTER_OTLP_HEADERS`, not in the URL, which can appear in export error logs.
+Usage records are written in the background, so each batch insert is a trace of its own, `INSERT usage_records`, with the number of records and of rows inserted. It links to the request spans of the records it stores, so a tracing UI can navigate from a write to its requests. `go run ./cmd/gateway migrate` reads the same `OTEL_*` variables and exports a `migrate` span with one child per migration applied. Database spans never contain record values, SQL parameters, or the database URL.
+
+A client may send a W3C `traceparent` header; the gateway's spans then join the client's trace, and the client's sampling decision applies. The gateway never sends trace headers to OpenAI or Anthropic. Spans are exported in batches in the background; failed exports are logged as `tracing error` warnings and never affect requests. Shutdown flushes pending spans last, after the usage records are written, within a 5-second budget of its own. Only OTLP over HTTP is supported: an endpoint that is not an `http` or `https` URL, or `OTEL_EXPORTER_OTLP_PROTOCOL` other than `http/protobuf`, fails startup. Use `https` for a collector on another host, and put collector credentials in `OTEL_EXPORTER_OTLP_HEADERS`, not in the URL, which can appear in export error logs.
 
 ### Limitations
 

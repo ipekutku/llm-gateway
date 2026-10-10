@@ -28,7 +28,6 @@ import (
 	"github.com/ipekutku/llm-gateway/internal/routing"
 	"github.com/ipekutku/llm-gateway/internal/tracing"
 	"github.com/ipekutku/llm-gateway/internal/usage"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -72,8 +71,8 @@ func main() {
 // run loads the configuration, starts the server, and serves until ctx is
 // canceled.
 func run(ctx context.Context, getenv func(string) string, logger *slog.Logger) error {
-	return runWith(ctx, getenv, os.ReadFile, func(ctx context.Context, url string) (accountingStore, error) {
-		return postgres.Open(ctx, url)
+	return runWith(ctx, getenv, os.ReadFile, func(ctx context.Context, url string, tp trace.TracerProvider) (accountingStore, error) {
+		return postgres.Open(ctx, url, tp)
 	}, logger)
 }
 
@@ -84,14 +83,21 @@ type accountingStore interface {
 }
 
 // runWith injects filesystem and database access for startup/lifecycle tests.
-func runWith(ctx context.Context, getenv func(string) string, readFile func(string) ([]byte, error), openStore func(context.Context, string) (accountingStore, error), logger *slog.Logger) (result error) {
+func runWith(ctx context.Context, getenv func(string) string, readFile func(string) ([]byte, error), openStore func(context.Context, string, trace.TracerProvider) (accountingStore, error), logger *slog.Logger) (result error) {
 	cfg, err := loadConfig(getenv, readFile)
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}
 	warnPricingGaps(cfg, logger)
+	// Deferred first, so it runs last: after the database pool closes, the
+	// spans of the final usage writes are flushed.
+	traces, stopTracing, err := startTracing(ctx, cfg.Tracing, logger)
+	if err != nil {
+		return err
+	}
+	defer func() { result = errors.Join(result, stopTracing()) }()
 	startupCtx, cancel := context.WithTimeout(ctx, databaseStartupTimeout)
-	store, err := openStore(startupCtx, cfg.DatabaseURL)
+	store, err := openStore(startupCtx, cfg.DatabaseURL, traces)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("database: %w", err)
@@ -107,7 +113,6 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 		return err
 	}
 	var active *activeHandlers
-	var tp *sdktrace.TracerProvider
 	defer func() {
 		drainCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
@@ -119,23 +124,10 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 		if closeErr == nil {
 			logger.Info("usage recorder stopped")
 		}
-		// Last, so the spans of finished handlers are flushed.
-		if tp != nil {
-			if err := tp.Shutdown(drainCtx); err != nil {
-				result = errors.Join(result, fmt.Errorf("tracing shutdown: %w", err))
-			}
-		}
 	}()
 	m, err := metrics.New(configuredModels(cfg))
 	if err != nil {
 		return err
-	}
-	var traces trace.TracerProvider
-	if cfg.Tracing {
-		if tp, err = newTracerProvider(ctx, logger); err != nil {
-			return err
-		}
-		traces = tp
 	}
 	handler, err := newHandler(cfg, nil, recorder, m, traces, logger)
 	if err != nil {
