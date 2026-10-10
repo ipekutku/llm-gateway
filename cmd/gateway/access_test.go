@@ -3,12 +3,42 @@ package main
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ipekutku/llm-gateway/internal/auth"
 	"github.com/ipekutku/llm-gateway/internal/ratelimit"
 )
+
+func TestRequestPathDoesNotFollowProviderRedirects(t *testing.T) {
+	var redirected atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirected.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(target.Close)
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			redirect := func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL, status)
+			}
+			oa := newUpstream(t, "/v1/chat/completions", redirect)
+			an := newUpstream(t, "/v1/messages", redirect)
+			gw := gateway(t, oa, an)
+			for _, model := range []string{"gpt-4o", "claude-opus-5-5"} {
+				resp, _, err := postChat(t, t.Context(), gw.URL, chatBody(model))
+				if err != nil || resp.StatusCode != http.StatusBadGateway {
+					t.Fatalf("redirect response = %v, %v; want 502", resp, err)
+				}
+			}
+		})
+	}
+	if got := redirected.Load(); got != 0 {
+		t.Errorf("redirect destination received %d requests; provider credentials and prompts must stay at the configured origin", got)
+	}
+}
 
 // withClients configures two enabled clients, team-a (clientKey) and
 // team-b, and a disabled one, all with the given limits.

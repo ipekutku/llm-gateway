@@ -345,7 +345,13 @@ func newUpstreamClient(cfg config) *http.Client {
 	t.DialContext = (&net.Dialer{Timeout: cfg.ConnectTimeout, KeepAlive: 30 * time.Second}).DialContext
 	t.TLSHandshakeTimeout = cfg.ConnectTimeout
 	t.IdleConnTimeout = idleConnTimeout
-	return &http.Client{Transport: t}
+	return &http.Client{
+		Transport: t,
+		// Provider destinations are fixed. Following a redirect could send
+		// API keys (including Anthropic's X-Api-Key) and prompts elsewhere.
+		// Return the 3xx to the adapter as an upstream failure instead.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // serve runs srv on ln until ctx is canceled, then shuts down gracefully.

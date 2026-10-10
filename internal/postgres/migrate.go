@@ -92,7 +92,7 @@ func (s *Store) migrate(ctx context.Context) (int, error) {
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("migrate: %w", err)
+		return 0, fmt.Errorf("migrate: %w", driverError{err})
 	}
 	defer func() {
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -101,14 +101,14 @@ func (s *Store) migrate(ctx context.Context) (int, error) {
 	}()
 
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", int64(migrationLockID)); err != nil {
-		return 0, fmt.Errorf("migrate: lock: %w", err)
+		return 0, fmt.Errorf("migrate: lock: %w", driverError{err})
 	}
 	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    integer PRIMARY KEY,
 		name       text NOT NULL,
 		applied_at timestamptz NOT NULL DEFAULT now()
 	)`); err != nil {
-		return 0, fmt.Errorf("migrate: create schema_migrations: %w", err)
+		return 0, fmt.Errorf("migrate: create schema_migrations: %w", driverError{err})
 	}
 	applied, err := appliedVersions(ctx, tx)
 	if err != nil {
@@ -129,7 +129,7 @@ func (s *Store) migrate(ctx context.Context) (int, error) {
 		n++
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("migrate: commit: %w", err)
+		return 0, fmt.Errorf("migrate: commit: %w", driverError{err})
 	}
 	return n, nil
 }
@@ -145,9 +145,9 @@ func (s *Store) apply(ctx context.Context, tx pgx.Tx, m migration) error {
 	defer span.End()
 	var err error
 	if _, execErr := tx.Exec(ctx, m.sql); execErr != nil {
-		err = fmt.Errorf("migrate: %s: %w", m.name, execErr)
+		err = fmt.Errorf("migrate: %s: %w", m.name, driverError{execErr})
 	} else if _, execErr := tx.Exec(ctx, "INSERT INTO schema_migrations (version, name) VALUES ($1, $2)", m.version, m.name); execErr != nil {
-		err = fmt.Errorf("migrate: record %s: %w", m.name, execErr)
+		err = fmt.Errorf("migrate: record %s: %w", m.name, driverError{execErr})
 	}
 	if err != nil {
 		setError(span, err)
@@ -165,7 +165,7 @@ func (s *Store) CheckSchema(ctx context.Context) error {
 	}
 	var exists bool
 	if err := s.pool.QueryRow(ctx, "SELECT to_regclass('schema_migrations') IS NOT NULL").Scan(&exists); err != nil {
-		return fmt.Errorf("check schema: %w", err)
+		return fmt.Errorf("check schema: %w", driverError{err})
 	}
 	if !exists {
 		return fmt.Errorf("database is not migrated; run the migrations first")
@@ -196,11 +196,11 @@ type appliedMigration struct {
 func appliedVersions(ctx context.Context, q querier) ([]appliedMigration, error) {
 	rows, err := q.Query(ctx, "SELECT version, name FROM schema_migrations ORDER BY version")
 	if err != nil {
-		return nil, fmt.Errorf("read schema_migrations: %w", err)
+		return nil, fmt.Errorf("read schema_migrations: %w", driverError{err})
 	}
 	versions, err := pgx.CollectRows(rows, pgx.RowToStructByPos[appliedMigration])
 	if err != nil {
-		return nil, fmt.Errorf("read schema_migrations: %w", err)
+		return nil, fmt.Errorf("read schema_migrations: %w", driverError{err})
 	}
 	return versions, nil
 }

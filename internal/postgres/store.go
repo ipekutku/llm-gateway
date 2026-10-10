@@ -54,11 +54,11 @@ func Open(ctx context.Context, url string, tp trace.TracerProvider) (*Store, err
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: %w", err)
+		return nil, fmt.Errorf("postgres: %w", driverError{err})
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("postgres: %w", err)
+		return nil, fmt.Errorf("postgres: %w", driverError{err})
 	}
 	return &Store{pool: pool, tracer: tp.Tracer(scopeName)}, nil
 }
@@ -145,30 +145,47 @@ func (s *Store) insert(ctx context.Context, records []usage.Record) (int64, erro
 		tag, err := results.Exec()
 		if err != nil {
 			_ = results.Close()
-			return 0, fmt.Errorf("postgres: insert usage records: %w", err)
+			return 0, fmt.Errorf("postgres: insert usage records: %w", driverError{err})
 		}
 		inserted += tag.RowsAffected()
 	}
 	if err := results.Close(); err != nil {
-		return 0, fmt.Errorf("postgres: insert usage records: %w", err)
+		return 0, fmt.Errorf("postgres: insert usage records: %w", driverError{err})
 	}
 	return inserted, nil
 }
 
-// setError marks span as failed with err's message, which never contains
-// the connection string or SQL parameters, and an error.type: the SQLSTATE
-// code for an error PostgreSQL reported, timeout, canceled, or _OTHER.
-func setError(span trace.Span, err error) {
-	typ := "_OTHER"
-	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
-		typ = pgErr.Code
-	} else if errors.Is(err, context.DeadlineExceeded) {
-		typ = "timeout"
-	} else if errors.Is(err, context.Canceled) {
-		typ = "canceled"
+// driverError keeps the driver cause inspectable without copying server
+// messages (which may quote parameter values) or connection details into
+// logs or spans. Gateway-authored operation context is added by callers.
+type driverError struct{ cause error }
+
+func (e driverError) Error() string {
+	return "database operation failed (" + databaseErrorType(e.cause) + ")"
+}
+
+func (e driverError) Unwrap() error { return e.cause }
+
+func databaseErrorType(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
 	}
-	span.SetAttributes(attribute.String("error.type", typ))
-	span.SetStatus(codes.Error, err.Error())
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+		// SQLSTATE is five uppercase ASCII letters/digits. Do not accept
+		// arbitrary text from a server as a diagnostic category.
+		if len(pgErr.Code) == 5 && strings.Trim(pgErr.Code, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") == "" {
+			return pgErr.Code
+		}
+	}
+	return "_OTHER"
+}
+
+func setError(span trace.Span, err error) {
+	span.SetAttributes(attribute.String("error.type", databaseErrorType(err)))
+	span.SetStatus(codes.Error, driverError{err}.Error())
 }
 
 func nullIfEmpty(s string) *string {

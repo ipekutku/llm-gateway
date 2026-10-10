@@ -15,10 +15,42 @@ import (
 	"time"
 
 	"github.com/ipekutku/llm-gateway/internal/httpapi"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 )
+
+func TestTracingDiagnosticsExcludeCollectorResponse(t *testing.T) {
+	const secret = "COLLECTOR-RESPONSE-MARKER-248cbd"
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, secret)
+	}))
+	t.Cleanup(collector.Close)
+	t.Setenv(otlpEndpointVar, collector.URL)
+	t.Setenv(otlpTracesEndpointVar, "")
+	previous := otel.GetErrorHandler()
+	t.Cleanup(func() { otel.SetErrorHandler(previous) })
+	var logs syncBuffer
+	tp, err := newTracerProvider(t.Context(), slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, span := tp.Tracer("test").Start(t.Context(), "test export")
+	span.End()
+	// Shutdown flushes the batch. The SDK reports export failures through
+	// the error handler; shutdown itself need not return an error.
+	ctx, cancel := context.WithTimeout(context.Background(), guard)
+	defer cancel()
+	err = tp.Shutdown(ctx)
+	if strings.Contains(fmt.Sprint(err, logs.String()), secret) {
+		t.Error("tracing diagnostic contains the collector response")
+	}
+	if !strings.Contains(logs.String(), "tracing error") {
+		t.Fatal("failed export did not produce a warning")
+	}
+}
 
 // spanCollector keeps every ended span and signals each ended server span,
 // so a test can wait until a request's trace is complete.

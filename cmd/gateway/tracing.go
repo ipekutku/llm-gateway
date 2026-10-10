@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -24,7 +25,7 @@ const serviceName = "llm-gateway"
 func newTracerProvider(ctx context.Context, logger *slog.Logger) (*sdktrace.TracerProvider, error) {
 	exporter, err := otlptracehttp.New(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("tracing: %w", err)
+		return nil, fmt.Errorf("tracing exporter: %w", tracingError{err})
 	}
 	res, err := resource.New(ctx,
 		resource.WithAttributes(attribute.String("service.name", serviceName)),
@@ -32,14 +33,15 @@ func newTracerProvider(ctx context.Context, logger *slog.Logger) (*sdktrace.Trac
 		resource.WithTelemetrySDK(),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("tracing: %w", err)
+		_ = exporter.Shutdown(ctx)
+		return nil, fmt.Errorf("tracing resource: %w", tracingError{err})
 	}
 	// Export runs in the background, so its errors reach only OTel's
 	// global error handler, which otherwise writes unstructured lines. They
-	// can include the endpoint URL and the collector's response, never the
-	// exported spans.
+	// can include the endpoint URL and the collector's response, so only
+	// the error category is logged.
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
-		logger.Warn("tracing error", slog.Any("error", err))
+		logger.Warn("tracing error", slog.Any("error", tracingError{err}))
 	}))
 	return sdktrace.NewTracerProvider(sdktrace.WithBatcher(exporter), sdktrace.WithResource(res)), nil
 }
@@ -59,8 +61,25 @@ func startTracing(ctx context.Context, enabled bool, logger *slog.Logger) (trace
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := tp.Shutdown(ctx); err != nil {
-			return fmt.Errorf("tracing shutdown: %w", err)
+			return fmt.Errorf("tracing shutdown: %w", tracingError{err})
 		}
 		return nil
 	}, nil
 }
+
+// Preserve causes for callers while keeping exporter responses, URLs,
+// and environment values out of diagnostics.
+type tracingError struct{ cause error }
+
+func (e tracingError) Error() string {
+	switch {
+	case errors.Is(e.cause, context.DeadlineExceeded):
+		return "telemetry operation timed out"
+	case errors.Is(e.cause, context.Canceled):
+		return "telemetry operation canceled"
+	default:
+		return "telemetry operation failed; check collector availability and OTEL configuration"
+	}
+}
+
+func (e tracingError) Unwrap() error { return e.cause }

@@ -1,10 +1,14 @@
 package postgres
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -12,6 +16,35 @@ import (
 
 	"github.com/ipekutku/llm-gateway/internal/usage"
 )
+
+func TestDatabaseDiagnosticsExcludeServerValues(t *testing.T) {
+	const secret = "DATABASE-VALUE-MARKER-713e0f"
+	useMigrations(t, map[string]string{
+		"0001_rejected.sql": "DO $$ BEGIN RAISE EXCEPTION '" + secret + "'; END $$;",
+	})
+	s, spans, _ := tracedStore(t)
+	_, err := s.Migrate(testContext(t))
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	if !ok || pgErr.Code != "P0001" {
+		t.Fatalf("Migrate() error = %v, want inspectable SQLSTATE P0001", err)
+	}
+	var logs bytes.Buffer
+	slog.New(slog.NewJSONHandler(&logs, nil)).Error("migration failed", "error", err)
+	if strings.Contains(logs.String(), secret) {
+		t.Error("database error log contains a server value")
+	}
+	if !strings.Contains(logs.String(), "P0001") || !strings.Contains(logs.String(), "0001_rejected.sql") {
+		t.Error("database error log lost the SQLSTATE or migration name")
+	}
+	if len(spans.Ended()) != 2 {
+		t.Fatal("expected migration and run spans")
+	}
+	for _, span := range spans.Ended() {
+		if strings.Contains(fmt.Sprint(span.Status(), span.Attributes(), span.Events()), secret) {
+			t.Error("database span contains a server value")
+		}
+	}
+}
 
 // tracedStore is newStore with spans recorded in memory. It also returns
 // the database URL.
