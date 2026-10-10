@@ -137,6 +137,8 @@ Local synthetic measurements on an Apple M1 (Go 1.26.9) reached **947 successful
 
 `make loadtest` reproduces direct-fake/gateway comparisons, a fixed-arrival check, metrics, and CPU/heap profiles without paid calls. It needs a migrated disposable PostgreSQL database and is not run in CI. See [performance measurements](docs/performance.md#running-local-load-scenarios) for setup, raw results, caveats, and component benchmarks.
 
+The [follow-up measurements](docs/performance.md#redis-and-connection-management-follow-up) compare optional Redis, HTTP/1.1 versus TLS/HTTP/2 reuse, recorder loss, and binary size. `LOADTEST_REDIS_URL` explicitly enables a disposable local Redis comparison; `make performance-probes` and `make binary-size` are opt-in developer tools, not CI load/timing gates. Production tuning remains a separate measured change.
+
 ## Running Locally
 
 Requires Go 1.26.9 or later and PostgreSQL. For a disposable local database, use Docker:
@@ -514,7 +516,7 @@ Usage is queried directly in PostgreSQL. [docs/usage.md](docs/usage.md) provides
 
 ## Development
 
-The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke tests), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck).
+The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck).
 
 `make bench` measures request-path components with allocation counts. It uses in-process fixtures and synthetic credentials; only the shared rate-limiter benchmark contacts Redis, gated on `GATEWAY_TEST_REDIS_URL` as below. [Performance measurements](docs/performance.md) describes the fixtures, baseline results, and comparisons with pinned `benchstat`. CI runs `make bench-check` to exercise the fixtures, without timing thresholds.
 

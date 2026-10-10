@@ -1,6 +1,6 @@
 # Performance measurements
 
-Milestone 8 measures component costs and the real HTTP request path. The local load scenarios below measure throughput, latency percentiles, CPU, memory, and accounting loss. Redis comparisons and connection-management measurements remain separate work. No production behavior has been optimized from these results.
+Milestone 8 measures component costs and the real HTTP request path. The local scenarios measure throughput, latency percentiles, CPU, memory, accounting loss, Redis costs, and connection reuse. No production behavior has been optimized from these results; a separate HTTP/1.1 pooling change is proposed below.
 
 ## Running local load scenarios
 
@@ -17,9 +17,11 @@ LOADTEST_PROVIDER=anthropic make loadtest
 
 The script never migrates, clears, or deletes the supplied database. It persists synthetic `loadtest` usage rows, potentially hundreds of thousands per run: do not use an operator/production database. Retention is your responsibility. For isolated comparisons, supply a fresh database of your own and migrate it first. Both models have explicitly synthetic prices to exercise known-cost accounting; neither the tokens nor prices represent real charges. The fixture key `synthetic-loadtest-key` is public and development-only, with only its SHA-256 hash in `clients.json`; never deploy these files as real client configuration.
 
-All destinations are fixed to `127.0.0.1`. The gateway runs in a clean environment: both provider keys are synthetic, both base URLs point at the fake, local rate limits are used, tracing and fallback are off, and retry/breaker/recorder settings stay at production defaults. Metrics, JSON outcome logging, and PostgreSQL writes remain enabled. Inherited provider, Redis, OTLP, proxy, and resilience settings cannot alter gateway configuration. There are no paid calls and no need for `make smoke`.
+All destinations are fixed to `127.0.0.1`. The gateway runs in a clean environment: both provider keys are synthetic, both base URLs point at the fake, local rate limits are the default, tracing and fallback are off, and retry/breaker/recorder settings stay at production defaults. Metrics, JSON outcome logging, and PostgreSQL writes remain enabled. Inherited provider, Redis, OTLP, proxy, and resilience settings cannot alter gateway configuration. There are no paid calls and no need for `make smoke`.
 
-The runner uses HTTP/1.1 with keep-alive and reads/discards response bodies. Each direct-fake/gateway pair gets a fresh gateway and fake:
+To compare shared limits, explicitly set `LOADTEST_REDIS_URL=redis://127.0.0.1:PORT/DB` to a disposable local Redis (`make redis`). Remote hosts, credentials, and URL options are intentionally rejected by this development runner; the production gateway's Redis configuration is unchanged. URLs are not written into metadata. Every phase generates a unique `loadtest-...` client ID with the same public synthetic key and limits, isolating its Redis state and usage rows from other runs. Only that client's expiring rate/lease keys are created; the runner never scans, flushes, or deletes Redis data. The summary rejects failed Redis calls or sampled local-mode intervals rather than reporting a degraded run as a healthy Redis comparison.
+
+The runner uses HTTP/1.1 with keep-alive and reads/discards response bodies. Each pair gets a fresh gateway, and separate fake processes for the direct and gateway phases, so accepted TCP counts are attributable to each path:
 
 | Scenario | Fake delay | Load model | Purpose |
 |---|---:|---|---|
@@ -34,6 +36,7 @@ Keep these settings identical across comparisons:
 | Setting | Default | Notes |
 |---|---:|---|
 | `LOADTEST_PROVIDER` | `openai` | `openai` or `anthropic`; one route per invocation. |
+| `LOADTEST_REDIS_URL` | unset | Explicit disposable loopback Redis enables shared limits; never inherited from `GATEWAY_REDIS_URL`. |
 | `LOADTEST_SCENARIO` | `all` | `all`, `A`, `B`, or `C`; select a pair for targeted comparisons. |
 | `LOADTEST_OPEN_RATE` | derived | Only for standalone C: required positive integer RPS. `all` always derives it from A. |
 | `LOADTEST_SECONDS` | 30 | Integer, 1–3600; must exceed profile duration. |
@@ -103,7 +106,7 @@ Successful throughput and all-response latency percentiles, rounded from raw Veg
 
 A issued 1,022,807 gateway requests: 21,278 returned 200 and the rest 502/503. B issued 298,895: 22,575 returned 200 and the rest failed. Their high error rates make them **saturation findings, not usable capacity results**. B's p95 difference of **−4.931 ms is not negative gateway overhead**: fast failures changed its latency distribution. C issued 14,880 requests per path, all 200; its target was 496 RPS (70% of A's *successful* throughput, not 70% of proven maximum capacity), and both paths issued 496.03 RPS. Its p95 comparison difference was +0.548 ms. No run logged failed database batches; queue-full losses are nevertheless substantial in A/B.
 
-Provider connection failures exhausted retries and opened the circuit in A/B. The laptop has an ephemeral-port range of 49152–65535 (16,384 ports) and a 30-second default TIME_WAIT lifetime; a read-only socket snapshot during A counted 15,785 TIME_WAIT connections. Together with the stock two-idle-connections-per-host transport, these observations point to HTTP/1.1 connection churn/socket pressure, not a demonstrated gateway CPU ceiling. That attribution is an inference to verify in the next connection-management PR, especially against TLS/HTTP/2; these loopback results do not establish real-provider performance. Recorder loss is also visible, and useful throughput must not be confused with complete accounting.
+Provider connection failures exhausted retries and opened the circuit in A/B. The laptop has an ephemeral-port range of 49152–65535 (16,384 ports) and a 30-second default TIME_WAIT lifetime; a read-only socket snapshot during A counted 15,785 TIME_WAIT connections. Together with the stock two-idle-connections-per-host transport, these observations point to HTTP/1.1 connection churn/socket pressure, not a demonstrated gateway CPU ceiling. The follow-up below directly verifies transport churn and observes a generator-side bind failure in a later high-rate experiment, while the exact syscall causing the original A/B upstream failures was not captured. These loopback results do not establish real-provider performance. Recorder loss is also visible, and useful throughput must not be confused with complete accounting.
 
 The first ten seconds of A's CPU profile contained 26.49 sampled CPU seconds over 10.14 seconds wall time. Top flat entries:
 
@@ -137,7 +140,103 @@ The observed p95 gateway-minus-baseline difference was **18.596 ms**; sampled ga
 
 The Anthropic target files were also checked through both direct and gateway paths in a separate, three-second, 20-worker B run (`LOADTEST_PROVIDER=anthropic LOADTEST_SCENARIO=B LOADTEST_SECONDS=3 LOADTEST_WARMUP_SECONDS=1 LOADTEST_PROFILE_SECONDS=1 LOADTEST_WORKERS=20 make loadtest`). Each path completed 121 requests, all 200, with no queue drops or failed batches and valid CPU/heap captures. That verifies wiring, not Anthropic capacity; the performance tables above describe the OpenAI route only. `make smoke` was not run.
 
-The headline results deliberately retain both healthy and saturated runs. No provider access was needed. Raw reports/profiles/logs remain local and gitignored; the task-owned measurement database was removed after verification, without stopping shared development containers. Redis comparisons, connection-reuse/TLS/HTTP/2 verification, recorder saturation characterization, and binary-size analysis remain later milestone work.
+The headline results deliberately retain both healthy and saturated runs. No provider access was needed. Raw reports/profiles/logs remain local and gitignored; the task-owned measurement database was removed after verification, without stopping shared development containers. The follow-up below adds Redis, connection, recorder, and binary-size measurements without changing production settings.
+
+## Redis and connection-management follow-up
+
+Measured on 2026-10-11, on the same M1 / Go 1.26.9 / macOS / Colima environment above. Production binaries are built from `9712ca2` (merged load-scenario PR); this PR changes only measurement tooling, tests, and documentation. PostgreSQL 18.6 used a new task-owned migrated database; Redis 8.10.2 used the existing disposable container. Store URLs and profile/log artifacts remain private. Runs were sequential, not concurrent with builds or race tests.
+
+### Redis at 500 workers
+
+Both B runs used 500 workers, 500 ms fake delay, ten-second attacks, three-second warmups, five-second CPU captures, and the unchanged production transport/recorder. Redis is the only gateway configuration difference:
+
+```bash
+LOADTEST_SCENARIO=B LOADTEST_SECONDS=10 LOADTEST_PROFILE_SECONDS=5 make loadtest
+LOADTEST_REDIS_URL='redis://127.0.0.1:56379/0' \
+  LOADTEST_SCENARIO=B LOADTEST_SECONDS=10 LOADTEST_PROFILE_SECONDS=5 make loadtest
+```
+
+| Path / limits | Successful RPS | p50 ms | p95 ms | p99 ms | Errors | Peak RSS MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| Direct, local pair | 948.65 | 501.437 | 507.155 | 585.232 | 0% | — |
+| Gateway, local | 947.62 | 501.896 | 519.790 | 637.909 | 0% | 90.88 |
+| Direct, Redis pair | 948.43 | 500.866 | 506.590 | 544.664 | 0% | — |
+| Gateway, Redis | 939.08 | 506.014 | 552.183 | 600.692 | 0% | 101.66 |
+
+Each measured path completed 10,001 requests, all 200. Neither gateway logged queue drops, failed batches, or Redis errors. SQL confirmed 10,301 successful records per client (10,001 measured + 300 warmup). Gateway CPU deltas were 2.328 core-seconds locally and 3.930 with Redis. Raw run IDs: `20261010T224529Z-openai.GYgRnQ` and `20261010T224741Z-openai.mcBhTf`.
+
+The store histogram's sampling-window deltas count 10,001 calls of each operation: **mean acquire 6.001 ms, mean synchronous release 3.926 ms**, with zero errors and shared mode throughout sampling. These means include client/pool/Lua/network work, not just network RTT. Redis gateway p95 minus local gateway p95 was +32.393 ms; their direct-baseline-adjusted differences were +45.593 and +12.635 ms. These independent tails are noisy: p99 actually decreased between the gateways. Neither the percentile subtraction nor the sum of Redis means is a measured percentile of paired overhead.
+
+The healthy Redis CPU capture has 1.68 sampled CPU seconds over 5.04 wall seconds. `Fallback.Acquire` has zero flat samples and 0.17 seconds cumulative, of which 0.16 seconds is syscall work through Shared/Redis. CPU sampling does not measure blocked mutex time; it cannot prove the lock never contends. Together with the earlier ~96 ns/op local-wrapper difference, this does not justify a risky fallback fast-path change before addressing the clearly measured connection churn.
+
+### Pool waits and protocol reuse
+
+The optional probes run outside CI and do not call provider APIs:
+
+```bash
+export GATEWAY_TEST_REDIS_URL='redis://127.0.0.1:56379/0'
+# Optional: use a pinned tool already installed by a completed load run.
+export LOADTEST_VEGETA_BIN="$PWD/deploy/loadtest/results/<run-id>/bin/vegeta"
+GOMAXPROCS=8 make performance-probes
+```
+
+The Redis probe uses the real `redisClientOptions`, Shared, and healthy Fallback, with its own random key prefix and cleanup. Five synchronized waves each perform 500 admissions followed by 500 releases, without an upstream or usage writer. At `GOMAXPROCS=8`, the base pool is 80, `MaxActiveConns=0`, and observed connections remain 80. Each wave records **840 successful semaphore waits and zero pool timeouts**. First-wave aggregate wait was 16,497.449 ms; later waves 7,366.184–7,848.823 ms. Aggregate time sums waits across goroutines, not elapsed wall time. Warm-wave operation means were 11.643–12.252 ms for admission and 8.256–9.467 ms for release. Probe output is retained under `20261010T230011Z-pr6-probes.H7BU2F`.
+
+The pinned go-redis options describe `PoolSize` as a base size rather than a total hard cap. However, its ordinary script checkout path gates borrowing with a `PoolSize` semaphore; this probe demonstrates waiting at 80 even with no total active-connection cap. This is a deliberately synchronized burst, not proof that every steady-state B request waits or a production Redis capacity ceiling. A future pool-sizing experiment must compare throughput, tails, errors, and Redis connection/resource cost before changing defaults.
+
+`TestUpstreamConnectionReuse` runs the unchanged `newUpstreamClient` against HTTP/1.1 and certificate-trusted TLS/HTTP/2 servers. Each has two synchronized waves of 500 concurrent requests. HTTP/1.1 opened **499 then 498** new connections (998 including its initial warmup); HTTP/2 opened **39 then 0** (40 total). The first HTTP/2 wave includes speculative parallel TLS dials, so its total is not the number of streams or useful multiplexing connections; earlier samples opened 72 or 149 then 0. The repeatable finding is no second-wave churn after negotiation, versus 498 with HTTP/1.1. The zero-valued `MaxIdleConnsPerHost` field means Go's effective default of two. No live provider protocol was inspected: HTTP/2 is negotiated when the configured origin supports it, not guaranteed for all provider origins/proxies.
+
+In the full B pairs, accepted fake connections were **552 direct / 5,761 upstream** locally and **552 / 8,058** with Redis. Counts include each phase's own warmup and one readiness probe; they are not counts only within the measured attack. The separate five-second A run accepted **810 direct / 14,866 upstream**, while direct completed 328,468 requests and gateway completed 161,806 with 86.6309% errors and 152,182 queue drops. This directly verifies churn, but still does not isolate the exact OS error responsible for the earlier TIME_WAIT saturation. Raw A ID: `20261010T224946Z-openai.LHaAnW`.
+
+The normal inbound test uses production `newServer` settings and a keep-alive client, with two synchronized 500-request waves, to verify 1,000 requests use 500 TCP connections. The optional Vegeta probe uses the actual pinned generator against the same production-configured server with a 500 ms response fixture and fixed 500 workers: **3,001 requests, all 200, accepted 500 connections** in three seconds plus drain. It isolates inbound reuse rather than auth, routing, or accounting. The two-minute `IdleTimeout` remains unchanged; no inbound timeout tuning is justified by these short active-request runs.
+
+### Recorder sweep and saturation limits
+
+Standalone C runs used local limits, zero fake delay, fixed arrivals, five-second attacks, three-second warmups, two-second CPU captures, and the unchanged 1,024-slot / 100-record-batch writer. Run each separately, allowing the default socket cooldown:
+
+```bash
+LOADTEST_SCENARIO=C LOADTEST_OPEN_RATE=2000 \
+  LOADTEST_SECONDS=5 LOADTEST_PROFILE_SECONDS=2 make loadtest
+# Repeat with LOADTEST_OPEN_RATE=4000 and 8000; inspect issued rate and errors.
+```
+
+| Target RPS | Issued gateway RPS | Measured requests | p95 ms | Errors | Queue drops | Peak RSS MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 2,000 | 2,000.19 | 10,000 | 0.324 | 0% | 0 | 32.73 |
+| 4,000 | 4,000.34 | 20,000 | 0.266 | 0% | 0 | 33.58 |
+| 8,000 | 8,000.69 | 40,000 | 0.598 | 0% | 0 | 35.86 |
+
+All paths met their arrival targets; no failed batches were logged. SQL confirmed 10,300 / 20,300 / 40,300 successful rows for the respective clients, including 300 warmup records each. These establish short-run drop-free points, **not** sustained capacity or a writer-only ceiling. IDs: `20261010T225226Z-openai.1rhhsz`, `20261010T225417Z-openai.9epDbX`, `20261010T225530Z-openai.mttiGR`.
+
+The next **16,000-RPS target failed** (`20261010T225748Z-openai.Nb16uc`): metric sampling timed out and the runner exited nonzero rather than writing a misleading complete summary. The completed raw attack report contains only 35,640 requests / 6,979.73 issued RPS (far below target), 34,145 HTTP 200s, 491 HTTP 502s, two HTTP 503s, and 1,002 connection errors. Vegeta reports `bind: can't assign requested address`; the fake accepted 15,699 upstream connections and the circuit opened. Shutdown logs count 23,088 queue-full drops. Missing diagnostics make this an **incomplete saturation experiment**, not a valid 16,000-RPS open-model measurement; no CPU/RSS values are fabricated for it.
+
+The sweep first observes losses at that failed high-target point, while 8,000 RPS was clean for five seconds. Because socket/generator failures and scheduling pressure coexist, it does **not** locate an isolated recorder drop threshold—even the failed run's average issued rate is below the clean 8,000 point. The closed A overload also drops records. Keep writer defaults for now and repeat the sweep after addressing HTTP/1.1 pooling; increasing the queue merely postpones loss if sustained writes cannot keep up. Usage remains best-effort, and HTTP success alone never guarantees a stored record.
+
+### Binary size
+
+```bash
+make binary-size
+```
+
+The helper builds the same gateway source twice, retains matching binaries and `go tool nm -size` output privately, and maps **text symbols** to the longest linked package prefix/module. Same-address aliases are counted once. Zero-filled BSS, initialized data, read-only metadata, debug information, headers, alignment, and unmatched/generated ownership are not attributed as dependency file bytes. In particular, summing all nm sizes would count a 32 MiB FIPS BSS region that is not stored as 32 MiB of file contents and would double-count some aliases.
+
+The darwin/arm64 gateway is **40,124,674 bytes unstripped (38.27 MiB)** and **26,857,186 bytes with `-ldflags='-s -w'` (25.61 MiB)**. The 11,709,184 counted text-symbol bytes include:
+
+| Owner | Text-symbol bytes |
+|---|---:|
+| Standard library | 4,125,124 |
+| go-redis/v9 | 3,734,480 |
+| pgx/v5 | 1,311,584 |
+| protobuf | 767,872 |
+| gRPC | 513,248 |
+
+go-redis represents about 31.9% of counted text-symbol bytes, **not** 31.9% of the stripped executable and not an exact removable-size estimate. The earlier v0.7 before/after dependency build remains documented in [architecture.md](architecture.md#shared-limits-in-redis). Retain the maintained Redis client; a smaller custom RESP implementation would need to replace pooling, TLS, authentication, cancellation, and script handling. Stripping is a measured packaging option for the deployment milestone, not applied to production builds here.
+
+### Decisions and next PR
+
+Keep Redis release synchronous: it is measurable, but moving it changes when concurrency capacity is available and needs its own correctness/latency experiment. Pool waits deserve follow-up, not an unmeasured default increase. Keep Fallback locking and the maintained Redis dependency. Recorder losses remain best-effort accounting, never a complete bill.
+
+**Proposed PR 7:** bound and enlarge upstream idle pools for HTTP/1.1, then rerun the same local/shared B, A, and protocol probes with before/after numbers and no OS tweaks. Review both per-host and total idle caps, because the default total cap of 100 also matters; preserve shared clients, context deadlines, redirects, response draining, and bounded idle lifetime. Report HTTP/2 and idle-resource effects too. This PR intentionally leaves those defaults unchanged and leaves v0.8 in progress until the measured follow-up is reviewed.
 
 ## Local fake provider
 
@@ -281,7 +380,7 @@ Medians of ten samples, summarized with the pinned `benchstat` below. Time range
 | httpapi | Handler/metrics_true/tracing_false | 8,908 | ±3% | 11,916 | 92 |
 | httpapi | Handler/metrics_true/tracing_true | 14,210 | ±5% | 20,862 | 149 |
 
-The fallback wrapper adds about 96 ns/op in the parallel, many-client fixture (159.7 versus 64.14 ns/op), with the same 40 bytes and two allocations. Its shared mutex limits how much spreading work across per-client locks helps. This difference includes the mode check and the fixed-clock fixture described above; it is not an isolated mutex latency or a measurement of healthy Redis mode. The hot-client wrapper result is more variable (±16%), since the local limiter already contends on one client's lock. Whole-request Redis/degraded-mode comparisons and profiles remain needed before deciding whether changing this wrapper is justified; the local-only HTTP runs above do not use it.
+The fallback wrapper adds about 96 ns/op in the parallel, many-client fixture (159.7 versus 64.14 ns/op), with the same 40 bytes and two allocations. Its shared mutex limits how much spreading work across per-client locks helps. This difference includes the mode check and the fixed-clock fixture described above; it is not an isolated mutex latency or a measurement of healthy Redis mode. The hot-client wrapper result is more variable (±16%), since the local limiter already contends on one client's lock. The follow-up above adds a healthy shared-limit HTTP comparison and CPU profile; neither that profile nor this local benchmark isolates blocked mutex time. They do not justify changing the wrapper ahead of the measured connection-pooling issue; no degraded-mode load capacity is claimed.
 
 The handler median is 8.17 µs with both telemetry components off, 8.91 µs with metrics, and 14.21 µs with metrics and sampled synchronous in-memory tracing. Redis admission plus release is about 0.885 ms through Colima. These results do not establish RPS capacity, p95 gateway overhead, memory under concurrent HTTP load, or live-provider performance.
 

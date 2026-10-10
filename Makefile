@@ -25,7 +25,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest build vuln smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -38,10 +38,10 @@ fmt:
 		exit 1; \
 	fi
 
-## vet: go vet, including the smoke test so it keeps compiling
+## vet: go vet, including optional smoke/performance tests so they compile
 vet:
 	go vet ./...
-	go vet -tags smoke ./cmd/gateway
+	go vet -tags 'smoke performance' ./cmd/gateway
 
 ## test: unit and end-to-end tests against fake providers. The PostgreSQL
 ## integration tests run only when GATEWAY_TEST_DATABASE_URL is set (see db),
@@ -62,6 +62,16 @@ bench-check:
 ## GATEWAY_DATABASE_URL. Not a CI check; see docs/performance.md.
 loadtest:
 	bash deploy/loadtest/run.sh
+
+## binary-size: local stripped build and module symbol attribution, not CI.
+binary-size:
+	bash deploy/loadtest/binary-size.sh
+
+## performance-probes: local connection and Redis burst measurements, not CI.
+## Redis needs GATEWAY_TEST_REDIS_URL; output is evidence, not a timing gate.
+## LOADTEST_VEGETA_BIN optionally selects a completed load run's pinned tool.
+performance-probes:
+	go test -tags performance -count=1 -v -run '^Test(UpstreamConnectionReuse|InboundConnectionReuse|RedisPoolConcurrentMeasurement|VegetaInboundConnectionReuse)$$' ./cmd/gateway
 
 ## build: build both commands without leaving binaries behind
 build:
