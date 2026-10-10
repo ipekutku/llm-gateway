@@ -145,7 +145,7 @@ func (c *Client) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespons
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return llm.ChatResponse{}, upstreamError(ctx, 0, fmt.Errorf("send request: %w", err))
+		return llm.ChatResponse{}, upstreamError(ctx, 0, transportError{"send request", err})
 	}
 	defer resp.Body.Close()
 
@@ -161,7 +161,7 @@ func (c *Client) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespons
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return llm.ChatResponse{}, upstreamError(ctx, resp.StatusCode, fmt.Errorf("read response: %w", err))
+		return llm.ChatResponse{}, upstreamError(ctx, resp.StatusCode, transportError{"read response", err})
 	}
 	if len(data) > maxResponseBytes {
 		return llm.ChatResponse{}, upstreamError(ctx, resp.StatusCode, errors.New("response exceeds 4 MiB"))
@@ -222,7 +222,7 @@ func decodeResponse(data []byte) (llm.ChatResponse, error) {
 		return llm.ChatResponse{}, errors.New("response choice has no message")
 	}
 	if msg.Role != llm.RoleAssistant {
-		return llm.ChatResponse{}, fmt.Errorf("response message has role %q, want assistant", msg.Role)
+		return llm.ChatResponse{}, errors.New("response message role is not assistant")
 	}
 	if isPresent(msg.ToolCalls) || isPresent(msg.FunctionCall) {
 		return llm.ChatResponse{}, errors.New("response contains tool calls, which are unsupported")
@@ -290,7 +290,7 @@ func finishReason(reason string) (string, error) {
 		return llm.FinishReasonContentFilter, nil
 	default:
 		// tool_calls, function_call, and any undocumented reason.
-		return "", fmt.Errorf("unsupported finish reason %q", reason)
+		return "", errors.New("unsupported finish reason")
 	}
 }
 
@@ -300,6 +300,16 @@ func isPresent(raw json.RawMessage) bool {
 	s := strings.TrimSpace(string(raw))
 	return s != "" && s != "null" && s != "[]"
 }
+
+// HTTP parser errors can quote upstream bytes. Retain the cause for
+// cancellation and retry classification without exposing it in telemetry.
+type transportError struct {
+	operation string
+	cause     error
+}
+
+func (e transportError) Error() string { return e.operation + " failed" }
+func (e transportError) Unwrap() error { return e.cause }
 
 // upstreamError wraps cause in an *llm.ProviderError. If ctx is done, the
 // context error is wrapped as well, so callers can detect cancellation even

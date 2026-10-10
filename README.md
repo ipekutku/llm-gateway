@@ -33,7 +33,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Project Status
 
-v0.1 through v0.5 are complete; v0.6 observability is in progress. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+v0.1 through v0.6 are feature-complete; v0.7 distributed platform behavior is next. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
 
 ```text
 v0.1  Provider abstraction + routing          ✅
@@ -41,16 +41,16 @@ v0.2  Timeouts + retries                      ✅
 v0.3  Provider fallback + circuit breakers    ✅
 v0.4  Authentication + rate limiting          ✅
 v0.5  Usage + cost tracking + PostgreSQL      ✅
-v0.6  Prometheus + OpenTelemetry              in progress
+v0.6  Prometheus + OpenTelemetry              ✅
 v0.7  Redis + multi-instance behavior
 v0.8  Load testing + performance work
 v0.9  Docker + Kubernetes + Helm
 v1.0  AWS deployment with Terraform
 ```
 
-### v0.6 — Observability (in progress)
+### v0.6 — Observability ✅
 
-Implemented so far (see [Logs, metrics, and traces](#logs-metrics-and-traces)):
+Implemented (see [Logs, metrics, and traces](#logs-metrics-and-traces)):
 
 * structured logs as text or JSON; every line logged while handling a request carries its request ID and, once authenticated, its client ID, including retry, fallback, and circuit breaker lines
 * one outcome line per validated request with status, provider, latency, retry count, and whether a fallback ran
@@ -60,6 +60,7 @@ Implemented so far (see [Logs, metrics, and traces](#logs-metrics-and-traces)):
 * OpenTelemetry traces exported over OTLP/HTTP when an endpoint is configured: one span per request, routing step, provider, and upstream attempt, with retries and fallbacks as events, and the trace ID in every log line
 * traces of usage database writes, linked to the requests they record, and of migrations
 * a local Prometheus, Grafana, and Jaeger stack (`make observability`) with a provisioned dashboard
+* regression tests across logs, metrics, and exported spans for sensitive-data exclusion, including upstream protocol failures; database and trace-export diagnostics omit raw server messages
 
 ### v0.5 — Usage and Cost Accounting ✅
 
@@ -362,7 +363,7 @@ Failed spans have an error status and an `error.type`. A request rejected before
 
 Usage records are written in the background, so each batch insert is a trace of its own, `INSERT usage_records`, with the number of records and of rows inserted. It links to the request spans of the records it stores, so a tracing UI can navigate from a write to its requests. `go run ./cmd/gateway migrate` reads the same `OTEL_*` variables and exports a `migrate` span with one child per migration applied. Database spans never contain record values, SQL parameters, or the database URL.
 
-A client may send a W3C `traceparent` header; the gateway's spans then join the client's trace, and the client's sampling decision applies. The gateway never sends trace headers to OpenAI or Anthropic. Spans are exported in batches in the background; failed exports are logged as `tracing error` warnings and never affect requests. Shutdown flushes pending spans last, after the usage records are written, within a 5-second budget of its own. Only OTLP over HTTP is supported: an endpoint that is not an `http` or `https` URL, or `OTEL_EXPORTER_OTLP_PROTOCOL` other than `http/protobuf`, fails startup. Use `https` for a collector on another host, and put collector credentials in `OTEL_EXPORTER_OTLP_HEADERS`, not in the URL, which can appear in export error logs.
+A client may send a W3C `traceparent` header; the gateway's spans then join the client's trace, and the client's sampling decision applies. The gateway never sends trace headers to OpenAI or Anthropic. Spans are exported in batches in the background; failed exports are logged as `tracing error` warnings and never affect requests. Those warnings report a safe failure category, omitting exporter URLs and collector responses; use the collector's own diagnostics for details. Shutdown flushes pending spans last, after the usage records are written, within a 5-second budget of its own. Only OTLP over HTTP is supported: an endpoint that is not an `http` or `https` URL, or `OTEL_EXPORTER_OTLP_PROTOCOL` other than `http/protobuf`, fails startup. Use `https` for a collector on another host, and put collector credentials in `OTEL_EXPORTER_OTLP_HEADERS`, not in the URL.
 
 #### Local dashboards
 
@@ -407,6 +408,7 @@ The gateway's provider endpoints are fixed, so dashboard data comes from real tr
 * Every rejected key logs one warning, and there is no per-IP limit on unauthenticated requests; anyone who can reach the port can fill the logs. Another reason to keep the gateway behind a proxy.
 * A request body must arrive within 30 seconds (otherwise `408`), and idle keep-alive connections close after 2 minutes. Both are fixed.
 * Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
+* The gateway does not follow provider HTTP redirects, to keep keys and prompts at the configured destination. A redirect is an upstream failure (`502 upstream_error` unless a configured fallback answers).
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
 * Usage records cover requests that pass body validation, including unknown models and upstream failures. Authentication, gateway rate-limit, malformed-body, and body-size rejections are excluded. A disconnected client is recorded as status `499` with `client_closed`; this status is never sent as a response.
 * Accounting is asynchronous: a full queue drops new records, a failed batch is retried once and then logged and discarded, and a shutdown deadline can lose pending records. Database failure after startup does not fail otherwise successful requests. Records contain metadata, tokens, and estimated costs, never prompt or completion content.
@@ -420,6 +422,10 @@ Usage is queried directly in PostgreSQL. [docs/usage.md](docs/usage.md) provides
 ## Development
 
 The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke tests), `test` (`go test -race -timeout 2m ./...`), `build`, and `vuln` (govulncheck).
+
+The v0.6 release checks include `TestObservabilityExcludesSensitiveData`: the real handler, router, resilience layers, and adapters call fake upstreams while text/JSON logs, Prometheus output, and exported spans are checked together. It covers both providers, retries, fallback, admission errors, malformed upstream responses, and unexpected protocol field values. Separate tests cover provider redirect isolation, collector error responses, and database errors containing rejected values. No paid calls are needed. Database diagnostics retain operation context and SQLSTATE while omitting server messages and connection details.
+
+Before tagging, run `make check` with the disposable database enabled as below and require green CI on the merged commit. This verifies behavior and known Go vulnerabilities, not throughput or latency overhead; benchmarks and load tests remain v0.8 work. The local stack was exercised with fake traffic during PR 8 (see [verification](docs/architecture.md#local-observability-stack)); the Linux Docker path and container-image vulnerability scanning are not covered by `make check`. A fresh live `make smoke` is optional and was not run for the v0.6 closeout.
 
 ### PostgreSQL integration tests
 

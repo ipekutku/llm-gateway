@@ -492,7 +492,7 @@ Test:
 
 **Target version:** `v0.5.0`
 
-**Status:** Feature-complete. Usage accounting is wired into the gateway, with SQL reporting documented in [usage.md](usage.md). Milestone 6 is next; its metrics, tracing, and dashboards are not implemented yet.
+**Status:** Feature-complete. Usage accounting is wired into the gateway, with SQL reporting documented in [usage.md](usage.md). Milestone 6 adds metrics, tracing, and dashboards over this baseline.
 
 ## Objective
 
@@ -584,6 +584,8 @@ Implemented decisions and test boundaries are described in [architecture.md](arc
 
 **Target version:** `v0.6.0`
 
+**Status:** Feature-complete. Structured logging, Prometheus metrics, optional OpenTelemetry tracing, and the local Grafana dashboard are implemented. Milestone 7 is next. Release tagging follows merged-commit CI and the [release checks](../README.md#development).
+
 ## Objective
 
 Make the gateway observable as a production service.
@@ -666,11 +668,11 @@ The implemented log fields, metric names, and the decisions behind deviations fr
 
 ## Exit Criteria
 
-* logs are structured
-* Prometheus metrics are exposed
-* distributed traces are generated
-* Grafana dashboards are documented
-* sensitive data is excluded by default
+* [x] logs are structured — text or JSON, request/client/trace context, and one outcome line per validated request; request-path tests cover retries, fallback, failures, and cancellation
+* [x] Prometheus metrics are exposed — a separate loopback-default listener exports bounded request/provider labels, resilience activity, tokens, and estimated costs; scenario tests verify the values
+* [x] distributed traces are generated — optional OTLP/HTTP export, incoming trace context, per-attempt spans and retry/fallback events, plus linked asynchronous database writes and migration spans; fake-collector and PostgreSQL tests verify export and linkage
+* [x] Grafana dashboards are documented — the provisioned local stack, commands, panels, and platform limitations are documented in the [README](../README.md#local-dashboards); metric-query coverage is tested and PR 8's fake-traffic verification is recorded in the [architecture](architecture.md#local-observability-stack)
+* [x] sensitive data is excluded by default — combined logs/metrics/exported-span marker tests cover both providers, success, retries, fallback, and rejection/protocol errors; additional tests guard database/collector diagnostics and provider redirect isolation
 
 ---
 

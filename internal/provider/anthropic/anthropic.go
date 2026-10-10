@@ -141,7 +141,7 @@ func (c *Client) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespons
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return llm.ChatResponse{}, upstreamError(ctx, 0, fmt.Errorf("send request: %w", err))
+		return llm.ChatResponse{}, upstreamError(ctx, 0, transportError{"send request", err})
 	}
 	defer resp.Body.Close()
 
@@ -157,7 +157,7 @@ func (c *Client) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatRespons
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return llm.ChatResponse{}, upstreamError(ctx, resp.StatusCode, fmt.Errorf("read response: %w", err))
+		return llm.ChatResponse{}, upstreamError(ctx, resp.StatusCode, transportError{"read response", err})
 	}
 	if len(data) > maxResponseBytes {
 		return llm.ChatResponse{}, upstreamError(ctx, resp.StatusCode, errors.New("response exceeds 4 MiB"))
@@ -223,10 +223,10 @@ func decodeResponse(data []byte) (llm.ChatResponse, error) {
 		return llm.ChatResponse{}, errors.New("malformed response JSON")
 	}
 	if resp.Type != "message" {
-		return llm.ChatResponse{}, fmt.Errorf("response has type %q, want message", resp.Type)
+		return llm.ChatResponse{}, errors.New("response type is not message")
 	}
 	if resp.Role != llm.RoleAssistant {
-		return llm.ChatResponse{}, fmt.Errorf("response has role %q, want assistant", resp.Role)
+		return llm.ChatResponse{}, errors.New("response role is not assistant")
 	}
 	if resp.Content == nil {
 		return llm.ChatResponse{}, errors.New("response has no content")
@@ -242,7 +242,7 @@ func decodeResponse(data []byte) (llm.ChatResponse, error) {
 			text.WriteString(*block.Text)
 		case "thinking", "redacted_thinking":
 		default:
-			return llm.ChatResponse{}, fmt.Errorf("content[%d] has unsupported type %q", i, block.Type)
+			return llm.ChatResponse{}, fmt.Errorf("content[%d] has unsupported type", i)
 		}
 	}
 
@@ -297,9 +297,19 @@ func finishReason(reason string) (string, error) {
 	case "refusal":
 		return llm.FinishReasonContentFilter, nil
 	default:
-		return "", fmt.Errorf("unsupported stop reason %q", reason)
+		return "", errors.New("unsupported stop reason")
 	}
 }
+
+// HTTP parser errors can quote upstream bytes. Retain the cause for
+// cancellation and retry classification without exposing it in telemetry.
+type transportError struct {
+	operation string
+	cause     error
+}
+
+func (e transportError) Error() string { return e.operation + " failed" }
+func (e transportError) Unwrap() error { return e.cause }
 
 // upstreamError wraps cause in an *llm.ProviderError. If ctx is done, the
 // context error is wrapped as well, so callers can detect cancellation even
