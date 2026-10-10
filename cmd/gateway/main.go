@@ -370,7 +370,7 @@ func newUpstreamClient(cfg config) *http.Client {
 	t.IdleConnTimeout = idleConnTimeout
 	return &http.Client{
 		Transport: t,
-		// Provider destinations are fixed. Following a redirect could send
+		// Provider destinations are operator-configured. A redirect could send
 		// API keys (including Anthropic's X-Api-Key) and prompts elsewhere.
 		// Return the 3xx to the adapter as an upstream failure instead.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },

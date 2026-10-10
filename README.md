@@ -217,7 +217,9 @@ The `model` field must match a configured model exactly; the request is routed t
 | `GATEWAY_DATABASE_URL` | Required. PostgreSQL URL or connection string. Startup requires a reachable database with the current schema; `go run ./cmd/gateway migrate` applies pending migrations. Never log or commit this setting if it contains credentials. For any database not on the local host, add `sslmode=verify-full` (with `sslrootcert` if the server's CA is not in the system store): the default, `prefer`, uses TLS when offered but does not verify the server, so the password and records could be intercepted. |
 | `GATEWAY_PRICING_FILE` | Required. Path of the JSON pricing file, read once at startup. Missing model prices produce unknown costs and a startup warning. |
 | `OPENAI_MODEL`, `OPENAI_API_KEY` | Enable OpenAI for one model. Set both or neither. |
+| `OPENAI_BASE_URL` | Optional provider origin with an optional path prefix, without `/v1/chat/completions`. Default `https://api.openai.com`. See [Provider destinations](#provider-destinations). |
 | `ANTHROPIC_MODEL`, `ANTHROPIC_API_KEY` | Enable Anthropic for one model. Set both or neither. |
+| `ANTHROPIC_BASE_URL` | Optional provider origin with an optional path prefix, without `/v1/messages`. Default `https://api.anthropic.com`. See [Provider destinations](#provider-destinations). |
 | `GATEWAY_ADDR` | Listen address. Default `127.0.0.1:8080`. |
 | `GATEWAY_METRICS_ADDR` | Listen address of the unauthenticated Prometheus endpoint, `/metrics`. Default `127.0.0.1:9464`. Must differ from `GATEWAY_ADDR`. See [Logs, metrics, and traces](#logs-metrics-and-traces). |
 | `GATEWAY_LOG_FORMAT` | `text` (default) or `json`, written to standard error. See [Logs, metrics, and traces](#logs-metrics-and-traces). |
@@ -241,6 +243,21 @@ export OPENAI_FALLBACK=anthropic
 ```
 
 A request for `gpt-4o` that OpenAI cannot serve is then answered by `claude-opus-5-5`; the response's `model` field shows which model answered. While a provider is skipped and no fallback can answer, requests fail with `503 provider_unavailable`.
+
+### Provider destinations
+
+Provider base URLs are operator-controlled settings, read once at startup, never chosen by a request. Unset or whitespace-only values keep the production defaults. Overrides require the corresponding model and API key. Use HTTPS for any remote destination; plain HTTP is accepted only for `localhost` (case-insensitive) or a literal loopback IP address, including `127.0.0.1` and `::1`. DNS aliases that happen to resolve to loopback are not accepted for HTTP. URLs must have a host and, if present, a port from 1–65535, with no credentials, query (even an empty `?`), or fragment (even an empty `#`). An optional path prefix is supported; the adapter appends its endpoint path.
+
+For a local fake server implementing the OpenAI response format, for example:
+
+```bash
+export OPENAI_MODEL=local-model
+export OPENAI_API_KEY=synthetic-local-key
+export OPENAI_BASE_URL=http://127.0.0.1:9000
+go run ./cmd/gateway
+```
+
+The fake server must already be running and serve `POST /v1/chat/completions`; the gateway still needs its clients and pricing files and a migrated PostgreSQL database. Anthropic works the same way with `ANTHROPIC_BASE_URL` and `POST /v1/messages`. Use synthetic provider keys for fakes. An override receives the configured provider key and prompts, so trust the destination before pointing real credentials at it. Redirects remain disabled, and URLs are never included in configuration errors or startup logs.
 
 ### Shared rate limits with Redis
 
@@ -292,6 +309,8 @@ Generate keys with a secure random source, as above; the hash protects only rand
 Startup fails if the clients file is missing, malformed, has unknown fields, or enables no client, if no provider is configured, if only one variable of a pair is set, if both providers use the same model name, if a timeout or delay is not a positive duration, if the attempt count is outside 1–10, if the maximum retry delay is less than the base delay, if the provider timeout is not less than the upstream timeout, if a fallback names a provider that is not configured, or if an OTLP endpoint or protocol is invalid. Error messages name the variables and clients but never print keys, hashes, or other values.
 
 Startup also fails if either accounting setting is absent, the pricing file is invalid, the database cannot be reached, or its migration history is behind, newer, or inconsistent with this binary. Database connectivity and schema checks share a 10-second startup budget. Migrations have a 1-minute budget and run transactionally under an advisory lock.
+
+An invalid provider base URL, or an override for a disabled provider, fails configuration validation before any database or upstream connection is opened. Errors name `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`, never their values.
 
 The model names above are examples. Any model the provider's API accepts can be configured. The automated tests run both adapters against fake servers built from the providers' documented API formats.
 
@@ -425,7 +444,7 @@ All ports are published on loopback only, and Grafana lets anyone who reaches it
 
 Prometheus scrapes `host.docker.internal:9464`, the default `GATEWAY_METRICS_ADDR`. With Docker Desktop or Colima on macOS, that reaches the gateway's loopback listener. On Linux, `host.docker.internal` is the Docker bridge address, so the gateway must listen there instead, for example `GATEWAY_METRICS_ADDR=172.17.0.1:9464`; this has not been tested. For another metrics port, edit [`prometheus.yml`](deploy/observability/prometheus.yml).
 
-The gateway's provider endpoints are fixed, so dashboard data comes from real traffic. Requests with an unknown model or a wrong gateway key fill the request panels without calling a provider; provider, token, and cost panels need completions from the configured providers. The rate-limit store panels need `GATEWAY_REDIS_URL` (for example `make redis`) and requests from an authenticated client, since the limits are checked after authentication.
+Requests with an unknown model or a wrong gateway key fill the request panels without calling a provider; provider, token, and cost panels need completions from the configured providers. Provider destinations default to the production APIs; [base URL overrides](#provider-destinations) allow local fake traffic instead. Cost panels also need matching prices; fake usage and estimated costs do not represent real charges. The rate-limit store panels need `GATEWAY_REDIS_URL` (for example `make redis`) and requests from an authenticated client, since the limits are checked after authentication.
 
 ### Limitations
 
@@ -444,7 +463,7 @@ The gateway's provider endpoints are fixed, so dashboard data comes from real tr
 * With tracing enabled, every request, including rejected ones, produces spans, and a client's `traceparent` decides whether its requests are sampled. Clients cannot see trace data, but anyone who can reach the gateway can add to the collector's load.
 * Every rejected key logs one warning, and there is no per-IP limit on unauthenticated requests; anyone who can reach the port can fill the logs. Another reason to keep the gateway behind a proxy.
 * A request body must arrive within 30 seconds (otherwise `408`), and idle keep-alive connections close after 2 minutes. Both are fixed.
-* Provider endpoints are fixed to the production APIs, so running the gateway needs real API keys and may incur charges. It cannot be pointed at a local fake provider; the automated tests exercise the full request path against fake upstreams instead.
+* Provider endpoints default to the production APIs, where requests may incur charges. For local fake providers, use [base URL overrides](#provider-destinations) with synthetic keys. Remote overrides require HTTPS and receive the configured provider key and prompts; only use trusted destinations.
 * The gateway does not follow provider HTTP redirects, to keep keys and prompts at the configured destination. A redirect is an upstream failure (`502 upstream_error` unless a configured fallback answers).
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
 * Usage records cover requests that pass body validation, including unknown models and upstream failures. Authentication, gateway rate-limit, malformed-body, and body-size rejections are excluded. A disconnected client is recorded as status `499` with `client_closed`; this status is never sent as a response.

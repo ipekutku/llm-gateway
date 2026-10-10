@@ -101,13 +101,13 @@ func gatewayWith(t *testing.T, oa, an *upstream, edit func(*config)) *httptest.S
 	t.Helper()
 	cfg, err := load(map[string]string{
 		"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+		"OPENAI_BASE_URL": oa.srv.URL,
 		"ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_API_KEY": anthropicKey,
+		"ANTHROPIC_BASE_URL": an.srv.URL,
 	})
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
 	}
-	cfg.OpenAI.BaseURL = oa.srv.URL
-	cfg.Anthropic.BaseURL = an.srv.URL
 	cfg.Retry = fastRetry
 	edit(&cfg)
 
