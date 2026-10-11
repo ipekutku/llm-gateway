@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"testing"
 	"time"
@@ -80,14 +83,14 @@ func TestRunKeepsServingDuringShutdownDelay(t *testing.T) {
 		t.Fatalf("readiness before shutdown = %d, want 200", got)
 	}
 
-	inFlight := make(chan int, 1)
+	inFlight := make(chan *http.Response, 1)
 	go func() {
 		resp, _, err := postChat(t, context.Background(), api, chatBody("gpt-4o"))
 		if err != nil {
-			inFlight <- 0
+			inFlight <- nil
 			return
 		}
-		inFlight <- resp.StatusCode
+		inFlight <- resp
 	}()
 	waitFor(t, slow.started, "the in-flight request to reach the upstream")
 
@@ -114,9 +117,13 @@ func TestRunKeepsServingDuringShutdownDelay(t *testing.T) {
 	}
 	slow.Release()
 	select {
-	case got := <-inFlight:
-		if got != http.StatusOK {
-			t.Errorf("in-flight request = %d, want 200", got)
+	case resp := <-inFlight:
+		if resp == nil || resp.StatusCode != http.StatusOK {
+			t.Errorf("in-flight request = %v, want 200", resp)
+		} else if !resp.Close {
+			// The response ends its keep-alive connection, so the client
+			// does not reuse it when the listener closes.
+			t.Error("in-flight response during the delay does not close its connection")
 		}
 	case <-time.After(guard):
 		t.Fatal("in-flight request did not finish")
@@ -181,6 +188,72 @@ func TestRunShutdownTimeoutCancelsSlowRequests(t *testing.T) {
 	records := store.stored()
 	if len(records) != 1 || records[0].Status != usage.StatusClientClosed || records[0].ErrorCode != "client_closed" {
 		t.Errorf("usage records = %+v, want one 499 client_closed", records)
+	}
+}
+
+func TestCloseWhenDraining(t *testing.T) {
+	ctx, startDraining := context.WithCancel(context.Background())
+	defer startDraining()
+	// A request to /slow waits for release, so it is in flight when draining
+	// starts.
+	arrived, release := make(chan struct{}), make(chan struct{})
+	srv := httptest.NewServer(closeWhenDraining(ctx, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The API handler sets its body read deadline this way.
+		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(time.Minute)); err != nil {
+			t.Errorf("SetReadDeadline through the wrapper = %v", err)
+		}
+		if r.URL.Path == "/slow" {
+			close(arrived)
+			<-release
+		}
+		_, _ = io.WriteString(w, "ok")
+	})))
+	t.Cleanup(srv.Close)
+	client := srv.Client()
+
+	// post reports whether the request reused a connection and whether the
+	// response asked to close it.
+	post := func(path string) (reused, closed bool) {
+		t.Helper()
+		ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+path, strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST error = %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return reused, resp.Close
+	}
+
+	post("/")
+	if reused, closed := post("/"); !reused || closed {
+		t.Errorf("before shutdown: reused, closed = %v, %v; want the connection kept alive", reused, closed)
+	}
+
+	inFlight := make(chan bool, 1)
+	go func() {
+		_, closed := post("/slow")
+		inFlight <- closed
+	}()
+	waitFor(t, arrived, "the request to reach the handler")
+	startDraining()
+	close(release)
+	select {
+	case closed := <-inFlight:
+		if !closed {
+			t.Error("response of a request in flight when shutdown began does not close its connection")
+		}
+	case <-time.After(guard):
+		t.Fatal("in-flight request did not finish")
+	}
+	if reused, closed := post("/"); reused || !closed {
+		t.Errorf("next request: reused, closed = %v, %v; want a new connection, closed after the response", reused, closed)
 	}
 }
 

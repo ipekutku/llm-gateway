@@ -6,6 +6,7 @@
 # still scaled out by the autoscaler.
 #
 #   deploy/kind/demo.sh [scale] [limits] [sigterm] [rollout] [database]
+#   ROLLOUT_RATE=200 ROLLOUT_RESTARTS=5 deploy/kind/demo.sh rollout
 #
 # With no arguments, all scenarios run in that order. scale first waits for
 # the autoscaler to return to its minimum of two pods, which takes up to five
@@ -201,23 +202,29 @@ EOF
 }
 
 rollout() {
+    # ROLLOUT_RATE and ROLLOUT_RESTARTS raise the load and repeat the restart,
+    # to compare shutdown behavior between builds.
+    local rate=${ROLLOUT_RATE:-50} restarts=${ROLLOUT_RESTARTS:-1} duration
+    duration=$((60 + 30 * restarts))
     note "## Rolling restart under load"
     note
-    note "50 requests/s for 90 s through the Service; \`kubectl rollout restart\` after 15 s."
+    note "$rate requests/s for $duration s through the Service; \`kubectl rollout restart\` after 15 s, $restarts time(s), each once the previous one has finished."
     note
-    attack rollout 50 90s &
+    attack rollout "$rate" "${duration}s" &
     local load=$!
     sleep 15
-    local start old pod
-    old=$(gateway_pods | awk '{ print $1 }')
-    start=$(date +%s)
-    k rollout restart "deployment/$release" >/dev/null
-    k rollout status "deployment/$release" --timeout=180s >/dev/null
-    note "- the Deployment reported $(k get deployment "$release" -o jsonpath='{.status.replicas}') new pods ready after $(($(date +%s) - start)) s"
-    for pod in $old; do
-        k wait --for=delete "pod/$pod" --timeout=120s >/dev/null 2>&1 || true
+    local i start old pod
+    for i in $(seq "$restarts"); do
+        old=$(gateway_pods | awk '{ print $1 }')
+        start=$(date +%s)
+        k rollout restart "deployment/$release" >/dev/null
+        k rollout status "deployment/$release" --timeout=180s >/dev/null
+        note "- restart $i: the Deployment reported $(k get deployment "$release" -o jsonpath='{.status.replicas}') new pods ready after $(($(date +%s) - start)) s"
+        for pod in $old; do
+            k wait --for=delete "pod/$pod" --timeout=120s >/dev/null 2>&1 || true
+        done
+        note "- restart $i: the old pods had drained and exited after $(($(date +%s) - start)) s"
     done
-    note "- the old pods had drained and exited after $(($(date +%s) - start)) s"
     wait "$load"
     report rollout
     note
