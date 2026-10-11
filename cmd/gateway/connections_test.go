@@ -17,16 +17,20 @@ import (
 // Two synchronized waves prove reuse without timing assertions or a paid
 // origin. Warm HTTP/2 negotiation first; speculative parallel dials may still
 // inflate the first wave. The second wave measures established reuse.
-// The transport is the real, unchanged gateway client.
+// The transport is the real, unchanged gateway client. Reading a body to EOF
+// returns its connection to the idle pool before the read returns, so the
+// second wave starts with every first-wave connection available.
 func TestUpstreamConnectionReuse(t *testing.T) {
 	for _, h2 := range []bool{false, true} {
 		t.Run(fmt.Sprintf("http2=%t", h2), func(t *testing.T) {
 			const workers = 500
+			if workers > maxIdleConnsPerHost {
+				t.Fatalf("%d workers exceed the idle pool of %d", workers, maxIdleConnsPerHost)
+			}
 			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 			defer cancel()
 			var accepted, closed, arrivals atomic.Int64
 			var protocolBad atomic.Bool
-			changed := make(chan struct{}, 1)
 			all := make(chan struct{}, 2)
 			gates := []chan struct{}{make(chan struct{}), make(chan struct{})}
 			s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -60,10 +64,6 @@ func TestUpstreamConnectionReuse(t *testing.T) {
 				}
 				if state == http.StateClosed {
 					closed.Add(1)
-				}
-				select {
-				case changed <- struct{}{}:
-				default:
 				}
 			}
 			if h2 {
@@ -118,32 +118,17 @@ func TestUpstreamConnectionReuse(t *testing.T) {
 					}
 				}
 				counts[wave] = accepted.Load() - start
-				if !h2 {
-					// Wait for the server to observe all idle-pool excess closes;
-					// this makes the second wave independent of close scheduling.
-					for accepted.Load()-closed.Load() > 2 {
-						select {
-						case <-changed:
-						case <-ctx.Done():
-							t.Fatal("idle connections did not close")
-						}
-					}
-				}
 			}
 			if protocolBad.Load() {
 				t.Fatal("unexpected negotiated protocol")
 			}
-			if !h2 && counts[1] < workers-2 {
-				t.Fatalf("HTTP/1.1 second wave opened %d connections", counts[1])
+			if counts[1] != 0 {
+				t.Fatalf("second wave opened %d new connections, want reuse of all %d", counts[1], workers)
 			}
-			if h2 && counts[1] >= workers-2 {
-				t.Fatalf("HTTP/2 second wave did not reuse multiplexed connections: %d new", counts[1])
+			if !h2 && closed.Load() != 0 {
+				t.Fatalf("idle pool closed %d HTTP/1.1 connections", closed.Load())
 			}
-			idle := transport.MaxIdleConnsPerHost
-			if idle == 0 {
-				idle = http.DefaultMaxIdleConnsPerHost
-			}
-			t.Logf("workers=%d new connections per wave=%v total=%d (includes warmup and speculative dials); effective idle limit=%d", workers, counts, accepted.Load(), idle)
+			t.Logf("workers=%d new connections per wave=%v total=%d (includes warmup and speculative dials); idle limit=%d per host", workers, counts, accepted.Load(), transport.MaxIdleConnsPerHost)
 		})
 	}
 }

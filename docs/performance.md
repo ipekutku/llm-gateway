@@ -1,6 +1,6 @@
 # Performance measurements
 
-Milestone 8 measures component costs and the real HTTP request path. The local scenarios measure throughput, latency percentiles, CPU, memory, accounting loss, Redis costs, and connection reuse. No production behavior has been optimized from these results; a separate HTTP/1.1 pooling change is proposed below.
+Milestone 8 measures component costs and the real HTTP request path. The local scenarios measure throughput, latency percentiles, CPU, memory, accounting loss, Redis costs, and connection reuse. One production change followed from them: a larger [upstream idle pool](#upstream-idle-pool), measured before and after. The baseline and follow-up sections below describe the gateway before that change.
 
 ## Running local load scenarios
 
@@ -184,7 +184,7 @@ The Redis probe uses the real `redisClientOptions`, Shared, and healthy Fallback
 
 The pinned go-redis options describe `PoolSize` as a base size rather than a total hard cap. However, its ordinary script checkout path gates borrowing with a `PoolSize` semaphore; this probe demonstrates waiting at 80 even with no total active-connection cap. This is a deliberately synchronized burst, not proof that every steady-state B request waits or a production Redis capacity ceiling. A future pool-sizing experiment must compare throughput, tails, errors, and Redis connection/resource cost before changing defaults.
 
-`TestUpstreamConnectionReuse` runs the unchanged `newUpstreamClient` against HTTP/1.1 and certificate-trusted TLS/HTTP/2 servers. Each has two synchronized waves of 500 concurrent requests. HTTP/1.1 opened **499 then 498** new connections (998 including its initial warmup); HTTP/2 opened **39 then 0** (40 total). The first HTTP/2 wave includes speculative parallel TLS dials, so its total is not the number of streams or useful multiplexing connections; earlier samples opened 72 or 149 then 0. The repeatable finding is no second-wave churn after negotiation, versus 498 with HTTP/1.1. The zero-valued `MaxIdleConnsPerHost` field means Go's effective default of two. No live provider protocol was inspected: HTTP/2 is negotiated when the configured origin supports it, not guaranteed for all provider origins/proxies.
+Before the [idle-pool change](#upstream-idle-pool), `TestUpstreamConnectionReuse` ran the then-unchanged `newUpstreamClient` against HTTP/1.1 and certificate-trusted TLS/HTTP/2 servers. Each has two synchronized waves of 500 concurrent requests. HTTP/1.1 opened **499 then 498** new connections (998 including its initial warmup); HTTP/2 opened **39 then 0** (40 total). The first HTTP/2 wave includes speculative parallel TLS dials, so its total is not the number of streams or useful multiplexing connections; earlier samples opened 72 or 149 then 0. The repeatable finding is no second-wave churn after negotiation, versus 498 with HTTP/1.1. The zero-valued `MaxIdleConnsPerHost` field means Go's effective default of two. No live provider protocol was inspected: HTTP/2 is negotiated when the configured origin supports it, not guaranteed for all provider origins/proxies.
 
 In the full B pairs, accepted fake connections were **552 direct / 5,761 upstream** locally and **552 / 8,058** with Redis. Counts include each phase's own warmup and one readiness probe; they are not counts only within the measured attack. The separate five-second A run accepted **810 direct / 14,866 upstream**, while direct completed 328,468 requests and gateway completed 161,806 with 86.6309% errors and 152,182 queue drops. This directly verifies churn, but still does not isolate the exact OS error responsible for the earlier TIME_WAIT saturation. Raw A ID: `20261010T224946Z-openai.LHaAnW`.
 
@@ -210,7 +210,7 @@ All paths met their arrival targets; no failed batches were logged. SQL confirme
 
 The next **16,000-RPS target failed** (`20261010T225748Z-openai.Nb16uc`): metric sampling timed out and the runner exited nonzero rather than writing a misleading complete summary. The completed raw attack report contains only 35,640 requests / 6,979.73 issued RPS (far below target), 34,145 HTTP 200s, 491 HTTP 502s, two HTTP 503s, and 1,002 connection errors. Vegeta reports `bind: can't assign requested address`; the fake accepted 15,699 upstream connections and the circuit opened. Shutdown logs count 23,088 queue-full drops. Missing diagnostics make this an **incomplete saturation experiment**, not a valid 16,000-RPS open-model measurement; no CPU/RSS values are fabricated for it.
 
-The sweep first observes losses at that failed high-target point, while 8,000 RPS was clean for five seconds. Because socket/generator failures and scheduling pressure coexist, it does **not** locate an isolated recorder drop threshold—even the failed run's average issued rate is below the clean 8,000 point. The closed A overload also drops records. Keep writer defaults for now and repeat the sweep after addressing HTTP/1.1 pooling; increasing the queue merely postpones loss if sustained writes cannot keep up. Usage remains best-effort, and HTTP success alone never guarantees a stored record.
+The sweep first observes losses at that failed high-target point, while 8,000 RPS was clean for five seconds. Because socket/generator failures and scheduling pressure coexist, it does **not** locate an isolated recorder drop threshold—even the failed run's average issued rate is below the clean 8,000 point. The closed A overload also drops records. Keep writer defaults for now and repeat the sweep after addressing HTTP/1.1 pooling; increasing the queue merely postpones loss if sustained writes cannot keep up. The [repeated sweep](#repeated-fixed-arrival-sweep) does locate the threshold. Usage remains best-effort, and HTTP success alone never guarantees a stored record.
 
 ### Binary size
 
@@ -236,7 +236,75 @@ go-redis represents about 31.9% of counted text-symbol bytes, **not** 31.9% of t
 
 Keep Redis release synchronous: it is measurable, but moving it changes when concurrency capacity is available and needs its own correctness/latency experiment. Pool waits deserve follow-up, not an unmeasured default increase. Keep Fallback locking and the maintained Redis dependency. Recorder losses remain best-effort accounting, never a complete bill.
 
-**Proposed PR 7:** bound and enlarge upstream idle pools for HTTP/1.1, then rerun the same local/shared B, A, and protocol probes with before/after numbers and no OS tweaks. Review both per-host and total idle caps, because the default total cap of 100 also matters; preserve shared clients, context deadlines, redirects, response draining, and bounded idle lifetime. Report HTTP/2 and idle-resource effects too. This PR intentionally leaves those defaults unchanged and leaves v0.8 in progress until the measured follow-up is reviewed.
+**Proposed PR 7:** bound and enlarge upstream idle pools for HTTP/1.1, then rerun the same local/shared B, A, and protocol probes with before/after numbers and no OS tweaks. Review both per-host and total idle caps, because the default total cap of 100 also matters; preserve shared clients, context deadlines, redirects, response draining, and bounded idle lifetime. Report HTTP/2 and idle-resource effects too. This PR intentionally leaves those defaults unchanged and leaves v0.8 in progress until the measured follow-up is reviewed. The follow-up is [below](#upstream-idle-pool).
+
+## Upstream idle pool
+
+The shared upstream transport now keeps up to **512 idle connections per provider origin and 1,024 in total**, instead of Go's defaults of 2 per host and 100 in total. Everything else is unchanged: the 90-second idle lifetime, the connect timeout, no limit on active connections, disabled redirects, and response draining. Measured on 2026-10-11 on the same M1 / macOS 26.6.2 / Go 1.26.9 / Colima environment as above. "Before" binaries are built from `fcbb188` (merged PR 6), "after" from the same commit plus only this change. Both were measured in the same session, in the same order, each against a fresh, task-owned, migrated database that was dropped afterwards. No OS socket settings were changed.
+
+### Choosing the limit
+
+Over HTTP/1.1, each concurrent upstream request holds its own connection. When a response finishes, its connection goes back to the idle pool; if the pool is already full, the connection is closed, and a later request dials a new one (plus a TLS handshake against a real provider). A throwaway in-process probe, using the same two synchronized 500-request waves as `TestUpstreamConnectionReuse`, counted the new connections in the second wave for different per-host limits:
+
+| Idle limit per host | 2 (Go default) | 100 | 256 | 512 |
+|---|---:|---:|---:|---:|
+| New connections, second wave | 498 | 400 | 244 | 0 |
+
+Each wave opens `concurrency − limit` new connections, so the limit has to cover the peak number of concurrent requests to one origin. A larger limit opens no extra connections. It only keeps those that traffic already opened, for at most 90 seconds, so the cost is retaining a recent peak's sockets and buffers. 512 covers the 500-worker scenarios. Above 512 concurrent HTTP/1.1 requests to one origin, the surplus churns again, as all of it did before. `TestUpstreamConnectionReuse` now requires the second wave to open no connection for both HTTP/1.1 and HTTP/2; 20 consecutive race-enabled runs all opened `[499 0]` over HTTP/1.1 and 0 in the second HTTP/2 wave.
+
+### Before and after
+
+The same `make loadtest` invocations before and after. Successful RPS and percentiles of all responses, as in the earlier tables; upstream connections are those the fake provider accepted for the gateway path, including warmup and the readiness probe.
+
+| Run | | Successful RPS | p50 ms | p95 ms | p99 ms | Errors | Upstream connections | CPU core-s | Peak RSS MiB | Queue drops |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| B, 10 s, local | before | 946.87 | 501.244 | 517.050 | 560.058 | 0% | 5,591 | 2.720 | 91.50 | 0 |
+| | after | 943.29 | 502.818 | 516.210 | 583.062 | 0% | 501 | 1.827 | 83.17 | 0 |
+| B, 10 s, Redis | before | 937.37 | 507.300 | 558.138 | 609.874 | 0% | 8,202 | 4.176 | 104.84 | 0 |
+| | after | 937.57 | 511.325 | 542.370 | 624.560 | 0% | 501 | 3.317 | 93.16 | 0 |
+| A, 5 s | before | 4,561.43 | 8.312 | 36.075 | 65.858 | 85.77% | 14,952 | 14.832 | 102.92 | 150,612 |
+| | after | 20,937.91 | 18.507 | 53.451 | 82.022 | 0% | 527 | 14.499 | 90.09 | 96,586 |
+| A, 30 s | before | 759.04 | 8.047 | 32.324 | 50.722 | 98.03% | 14,855 | 91.855 | 103.98 | 1,101,380 |
+| | after | 21,946.81 | 17.938 | 49.911 | 77.719 | 0% | 504 | 92.257 | 90.47 | 601,498 |
+| B, 30 s | before | 852.32 | 9.649 | 502.629 | 505.943 | 86.51% | 15,353 | 17.592 | 93.86 | 154,237 |
+| | after | 977.34 | 502.277 | 506.790 | 533.489 | 0% | 501 | 5.732 | 88.48 | 0 |
+
+The direct-to-fake baselines stayed within the usual run-to-run range: 947.6–979.9 RPS for B and 56,298–62,110 RPS for A, never with errors. In the after runs, the gateway's p95 minus the direct p95 was 2.839 ms for the 30-second B run, 10.578 ms for the 10-second local B, and 36.842 ms with Redis. The Redis means were 6.781 ms for admission and 5.636 ms for release (6.820 and 4.346 ms before), so Redis still costs what PR 6 measured.
+
+What changed:
+
+- **Churn is gone at 500 workers.** The gateway path now opens about one upstream connection per worker (501–527) instead of 5,591–15,353. The 30-second A and B runs, which failed with 98% and 87% errors before, now complete with no errors. That confirms the failures were socket exhaustion from upstream churn, not a gateway CPU limit.
+- **Higher A latency is not a regression.** Before, most A responses were fast 502/503 failures, which pull every percentile down. After, every response is a success, and with 500 fixed workers the latency is about 500 ÷ RPS (≈ 23 ms) because the gateway is saturated.
+- **Less work per request.** Without the dials, the gateway used 33% less CPU for the same 10-second B load (1.827 vs. 2.720 core-seconds) and 21% less with Redis. Peak RSS also fell, because thousands of short-lived connections no longer pile up.
+- **Accounting is the next limit.** The 30-second A run stored only 57,624 of 659,122 records (658,822 measured + 300 warmup); 601,498 queue-full drops account exactly for the rest. At about 22,000 RPS, the single writer cannot keep up with PostgreSQL on this laptop (it runs in a VM competing for the same CPUs). Records were only dropped from the queue, never as failed batches.
+
+SQL counts matched the runner in every after run: 10,301 rows for each 10-second B (10,001 measured + 300 warmup) and 30,301 for the 30-second B. Raw run IDs, before: `20261010T232744Z-openai.V83PPa`, `20261010T232905Z-openai.HmOF4M`, `20261010T233017Z-openai.GQWoIs`, `20261010T233120Z-openai.yDwS47`; after: `20261010T234348Z-openai.sChD8r`, `20261010T234503Z-openai.Z81tbO`, `20261010T234616Z-openai.m9lH6y`, `20261010T234718Z-openai.16VOPO`.
+
+### Where the time goes now
+
+During the 30-second A run after the change, the gateway's CPU profile (first 10 seconds, 29.28 sampled CPU seconds) attributes 82.8% of samples to system calls. Cumulatively, about 53% are socket and file writes and 30% socket reads, across the client and upstream connections on the loopback interface. About 15% comes from the per-request JSON outcome log line, written synchronously to a file. Auth, routing, pricing, and JSON handling do not show up near the top. These are the costs of moving bytes on one machine, not of gateway logic. The run directory keeps the profile for `go tool pprof -top -cum`.
+
+### Fixed-arrival scenario C
+
+The full run's C phase derives its rate from A's successful throughput. That rate rose from 531 to 15,363 RPS, and the phase **failed**: Vegeta issued only 12,578.98 RPS, its connections to the gateway failed with `bind: can't assign requested address`, a metrics scrape timed out, and the runner exited without a summary, as designed. As latency grew, the open model added workers. The gateway logged failed upstream sends, returned 502/503 (the circuit opened), and its heap profile shows connection dials again, which suggests more than 512 requests in flight to one origin and the surplus churning; the run did not capture the in-flight count directly. One laptop running the load generator, the gateway, and the fake provider cannot sustain that rate for 30 seconds. This is an incomplete saturation experiment, not a capacity result; no numbers from it are reported as one.
+
+### Repeated fixed-arrival sweep
+
+PR 6's five-second sweep, repeated after the change with the same settings (`LOADTEST_SCENARIO=C LOADTEST_OPEN_RATE=<rate> LOADTEST_SECONDS=5 LOADTEST_PROFILE_SECONDS=2 make loadtest`):
+
+| Target RPS | Issued gateway RPS | Requests | p50 ms | p95 ms | p99 ms | Errors | Upstream connections | Queue drops | Peak RSS MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8,000 | 8,000.90 | 40,000 | 0.148 | 0.505 | 0.915 | 0% | 39 | 0 | 36.67 |
+| 12,000 | 12,000.70 | 60,001 | 0.247 | 1.005 | 4.730 | 0% | 198 | 2,340 | 53.97 |
+| 16,000 | 16,001.95 | 80,000 | 0.346 | 2.908 | 23.938 | 0% | 453 | 37,876 | 82.73 |
+
+Before the change, the 16,000-RPS run failed with bind errors and an open circuit; now every target is met with no HTTP errors. Stored rows match: 40,300, 57,961, and 42,424 (measured + 300 warmup − drops). On this machine, with PostgreSQL in the Colima VM, the usage writer keeps up at 8,000 RPS and starts dropping records between 8,000 and 12,000 RPS. These are five-second points, not sustained capacity. Raw IDs: `20261010T235938Z-openai.SqFi6L`, `20261011T000101Z-openai.ZCewDf`, `20261011T000203Z-openai.ZmHbYC`.
+
+### Decisions
+
+- **Fixed constants, not a setting.** Real provider APIs normally negotiate HTTP/2, where the idle limit barely matters; HTTP/1.1 appears with proxies or local base URLs. A setting would add configuration without a current need. Raise the constants in code if a deployment sustains more than 512 concurrent HTTP/1.1 requests to one origin.
+- **Active connections stay uncapped.** `MaxConnsPerHost` would make requests wait inside the transport for a free connection, bounded only by their deadline, and would hide overload as latency.
+- **Not changed:** Redis pool size, the recorder's queue and batch settings, `Fallback` locking, and synchronous logging. Each is now measured: Redis costs about 6–7 ms admission and 4–6 ms release per request here, the recorder drops above about 8,000 RPS on this laptop, and the outcome log takes about 15% of CPU at saturation. None blocks the 500-worker scenarios, and each would need its own before/after experiment. Usage accounting stays best-effort, as documented.
 
 ## Local fake provider
 

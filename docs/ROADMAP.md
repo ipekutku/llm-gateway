@@ -734,7 +734,7 @@ The implemented responsibilities, failure behavior, and the decisions behind wha
 
 **Target version:** `v0.8.0`
 
-**Status:** In progress. Request-path benchmarks, reproducible end-to-end load scenarios, CPU/heap captures, and [measurements](performance.md) cover throughput, percentile comparison differences, memory, errors, accounting loss, Redis admission/release and pool waits, HTTP/1.1/TLS/HTTP/2 reuse, inbound keep-alives, and binary size. The measurable-results exit criterion is demonstrated. HTTP/1.1 upstream churn justifies a separate pooling follow-up with before/after measurements; production defaults remain unchanged and the milestone is not yet feature-complete.
+**Status:** Feature-complete. Request-path benchmarks, reproducible end-to-end load scenarios, CPU/heap captures, and [measurements](performance.md) cover throughput, percentile comparison differences, memory, errors, accounting loss, Redis admission/release and pool waits, HTTP/1.1/TLS/HTTP/2 reuse, inbound keep-alives, and binary size. The one production change they justified, a larger upstream idle pool, removed the HTTP/1.1 connection churn that made the high-concurrency runs fail, with [before/after measurements](performance.md#upstream-idle-pool). Milestone 9 is next. Release tagging follows merged-commit CI and the [release checks](../README.md#development).
 
 ## Objective
 
@@ -826,6 +826,8 @@ X requests/sec
 Y ms p95 gateway overhead
 Z MiB memory under load
 ```
+
+* [x] README or benchmark documentation contains measurable results — the [README](../README.md#performance) and [performance.md](performance.md) report, for one instance with 500 concurrent clients and a 500 ms fake provider over 30 seconds, 977 successful requests/sec, a 2.8 ms p95 gateway-minus-baseline difference, and 88.5 MiB sampled peak RSS; plus about 21,900 requests/sec against an immediate fake provider, a fixed-arrival sweep up to 16,000 requests/sec, component benchmarks, and the environment, commands, raw run IDs, and limitations of each measurement. The scaling limits found are documented with them: upstream HTTP/1.1 connection churn (fixed, with before/after runs), the usage writer dropping records above about 8,000 requests/sec on the test machine, Redis admission and release costs and pool waits, socket I/O and the synchronous outcome log at saturation, and same-machine generator limits, each unchanged limit with its reason
 
 ---
 

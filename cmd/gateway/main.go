@@ -51,6 +51,18 @@ const (
 	// idleConnTimeout is how long an unused upstream connection stays in
 	// the pool.
 	idleConnTimeout = 90 * time.Second
+
+	// maxIdleConnsPerHost is how many unused connections to one provider
+	// origin stay in the pool. Over HTTP/1.1 every concurrent upstream
+	// request needs its own connection; one returned beyond this limit is
+	// closed, and a later request dials and handshakes again. The value
+	// covers the 500 concurrent requests of the v0.8 load scenarios. The
+	// pool keeps only connections that concurrent traffic opened, for at
+	// most idleConnTimeout; HTTP/2 origins multiplex and need far fewer.
+	maxIdleConnsPerHost = 512
+
+	// maxIdleConns bounds unused connections across both provider origins.
+	maxIdleConns = 2 * maxIdleConnsPerHost
 )
 
 func main() {
@@ -369,13 +381,17 @@ func resilient(name string, p llm.Provider, cfg config, m *metrics.Metrics, t *t
 }
 
 // newUpstreamClient returns the HTTP client shared by all provider
-// adapters. Its transport bounds connection setup; the per-request upstream
-// timeout is applied through the request context by the handler.
+// adapters. Its transport bounds connection setup and keeps enough idle
+// connections for concurrent HTTP/1.1 requests to reuse them; the
+// per-request upstream timeout is applied through the request context by
+// the handler.
 func newUpstreamClient(cfg config) *http.Client {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.DialContext = (&net.Dialer{Timeout: cfg.ConnectTimeout, KeepAlive: 30 * time.Second}).DialContext
 	t.TLSHandshakeTimeout = cfg.ConnectTimeout
 	t.IdleConnTimeout = idleConnTimeout
+	t.MaxIdleConns = maxIdleConns
+	t.MaxIdleConnsPerHost = maxIdleConnsPerHost
 	return &http.Client{
 		Transport: t,
 		// Provider destinations are operator-configured. A redirect could send
