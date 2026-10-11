@@ -33,7 +33,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Project Status
 
-v0.1 through v0.7 are feature-complete; v0.8 performance engineering is in progress. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+v0.1 through v0.8 are feature-complete; v0.9 (Docker, Kubernetes, and Helm) is next. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
 
 ```text
 v0.1  Provider abstraction + routing          ✅
@@ -43,10 +43,21 @@ v0.4  Authentication + rate limiting          ✅
 v0.5  Usage + cost tracking + PostgreSQL      ✅
 v0.6  Prometheus + OpenTelemetry              ✅
 v0.7  Redis + multi-instance behavior        ✅
-v0.8  Load testing + performance work
+v0.8  Load testing + performance work          ✅
 v0.9  Docker + Kubernetes + Helm
 v1.0  AWS deployment with Terraform
 ```
+
+### v0.8 — Performance Engineering ✅
+
+Implemented (see [Performance](#performance)):
+
+* Go benchmarks for authentication, routing, rate limiting, cost estimation, and the full handler with metrics and tracing (`make bench`); CI runs each once so they keep working
+* provider base URLs (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`), with plain HTTP allowed only on loopback, and a local fake provider (`cmd/fakeprovider`) for free, repeatable load
+* opt-in pprof on the metrics listener (`GATEWAY_PPROF`), never on the API port
+* reproducible load scenarios with Vegeta (`make loadtest`) that compare the gateway against the fake provider directly, with CPU, memory, accounting loss, and profiles
+* measurements of Redis costs, connection reuse over HTTP/1.1 and HTTP/2, recorder limits, and binary size
+* an upstream idle pool sized for concurrent requests, which removed the connection churn that made the high-concurrency runs fail
 
 ### v0.7 — Redis and Distributed Rate Limits ✅
 
@@ -133,11 +144,17 @@ This project prioritizes:
 
 ## Performance
 
-Local synthetic measurements on an Apple M1 (Go 1.26.9) reached **947 successful requests/sec with 500 workers** over a 10-second run against a 500 ms fake provider, with an **18.6 ms p95 gateway-minus-baseline difference** and **89.5 MiB sampled peak RSS**. These are single-run loopback comparisons, not capacity or isolated-overhead guarantees. The default 30-second high-concurrency runs saturated with many errors and accounting drops; those results are documented too, not hidden.
+Local synthetic measurements on an Apple M1 (Go 1.26.9), with the load generator, gateway, and fake provider on the same machine:
+
+* **977 successful requests/sec with 500 concurrent clients** for 30 seconds against a fake provider that waits 500 ms, with no errors, a **2.8 ms p95 gateway-minus-baseline difference**, and **88.5 MiB sampled peak RSS**
+* **about 21,900 requests/sec with 500 concurrent clients** and no errors for 30 seconds against a fake provider that answers immediately, limited by socket I/O on one machine
+* **16,000 requests/sec at a fixed arrival rate** with no errors for 5 seconds; above about 8,000 requests/sec, the usage writer starts dropping records
+
+These are single-run loopback comparisons, not capacity or isolated-overhead guarantees. Before the [upstream idle pool](docs/performance.md#upstream-idle-pool) was enlarged, the same 30-second runs failed with 87–98% errors from upstream connection churn; those results are documented too, not hidden.
 
 `make loadtest` reproduces direct-fake/gateway comparisons, a fixed-arrival check, metrics, and CPU/heap profiles without paid calls. It needs a migrated disposable PostgreSQL database and is not run in CI. See [performance measurements](docs/performance.md#running-local-load-scenarios) for setup, raw results, caveats, and component benchmarks.
 
-The [follow-up measurements](docs/performance.md#redis-and-connection-management-follow-up) compare optional Redis, HTTP/1.1 versus TLS/HTTP/2 reuse, recorder loss, and binary size. `LOADTEST_REDIS_URL` explicitly enables a disposable local Redis comparison; `make performance-probes` and `make binary-size` are opt-in developer tools, not CI load/timing gates. Production tuning remains a separate measured change.
+The [follow-up measurements](docs/performance.md#redis-and-connection-management-follow-up) compare optional Redis, HTTP/1.1 versus TLS/HTTP/2 reuse, recorder loss, and binary size. `LOADTEST_REDIS_URL` explicitly enables a disposable local Redis comparison; `make performance-probes` and `make binary-size` are opt-in developer tools, not CI load/timing gates. The one production change they justified, the upstream idle pool, has [before/after measurements](docs/performance.md#upstream-idle-pool).
 
 ## Running Locally
 
@@ -502,6 +519,7 @@ Requests with an unknown model or a wrong gateway key fill the request panels wi
 * With tracing enabled, every request, including rejected ones, produces spans, and a client's `traceparent` decides whether its requests are sampled. Clients cannot see trace data, but anyone who can reach the gateway can add to the collector's load.
 * Every rejected key logs one warning, and there is no per-IP limit on unauthenticated requests; anyone who can reach the port can fill the logs. Another reason to keep the gateway behind a proxy.
 * A request body must arrive within 30 seconds (otherwise `408`), and idle keep-alive connections close after 2 minutes. Both are fixed.
+* Up to 512 idle upstream connections are kept per provider origin, for 90 seconds. Over HTTP/1.1, more than 512 concurrent requests to one origin close their extra connections after use, and later requests connect again. HTTP/2 origins share connections and are not affected. Both values are fixed.
 * Provider endpoints default to the production APIs, where requests may incur charges. For local fake providers, use [base URL overrides](#provider-destinations) with synthetic keys. Remote overrides require HTTPS and receive the configured provider key and prompts; only use trusted destinations.
 * The gateway does not follow provider HTTP redirects, to keep keys and prompts at the configured destination. A redirect is an upstream failure (`502 upstream_error` unless a configured fallback answers).
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
