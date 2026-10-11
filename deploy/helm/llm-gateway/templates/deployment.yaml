@@ -6,7 +6,11 @@ metadata:
   labels:
     {{- include "llm-gateway.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
+  # Left out under autoscaling, so an upgrade never resets the autoscaler's
+  # replica count.
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "llm-gateway.selectorLabels" . | nindent 6 }}
@@ -26,6 +30,17 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # Prefer different nodes, so one node failing or draining takes out as
+      # few pods as possible; still schedule when there are too few nodes.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "llm-gateway.selectorLabels" . | nindent 14 }}
+          matchLabelKeys:
+            - pod-template-hash
       # Covers the shutdown delay, the HTTP drain, and the cleanup after it.
       terminationGracePeriodSeconds: {{ .Values.shutdown.terminationGracePeriodSeconds }}
       securityContext:
