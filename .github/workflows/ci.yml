@@ -128,3 +128,46 @@ jobs:
       # invalid values are rejected. No cluster is involved.
       - name: Lint chart
         run: make helm-lint
+
+  kind:
+    name: Kubernetes (kind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # kind runs pinned through go run; kubectl is preinstalled.
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v4.3.0
+
+      # Builds both images, creates the cluster, and starts metrics-server and
+      # the disposable PostgreSQL and Redis.
+      - name: Start cluster
+        run: make kind-up
+
+      # Synthetic Secrets, then the chart with the migration hook, waiting for
+      # the pods to become ready.
+      - name: Deploy chart
+        run: make kind-deploy
+
+      # One authenticated completion per provider from the fake sidecar, and
+      # the metrics port. No timing thresholds.
+      - name: Check gateway
+        run: make kind-check
+
+      - name: Show cluster state
+        if: failure()
+        run: |
+          kubectl --context kind-llm-gateway --namespace llm-gateway get all,events
+          kubectl --context kind-llm-gateway --namespace llm-gateway logs --all-containers --prefix \
+            --selector app.kubernetes.io/name=llm-gateway --tail 100 || true

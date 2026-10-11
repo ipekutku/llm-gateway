@@ -84,6 +84,13 @@ gateway checks its configuration again at startup.
 {{- end }}
 {{- end }}
 {{- end }}
+{{- $names := list "gateway" }}
+{{- range $v.sidecars }}
+{{- if has .name $names }}
+{{- fail (printf "sidecars: the container name %s is already used" .name) }}
+{{- end }}
+{{- $names = append $names .name }}
+{{- end }}
 {{- $s := $v.shutdown }}
 {{- if lt (int $s.terminationGracePeriodSeconds) (add $s.delaySeconds $s.timeoutSeconds 10 | int) }}
 {{- fail (printf "shutdown.terminationGracePeriodSeconds must be at least delaySeconds + timeoutSeconds + 10 (%d), or the final usage records and spans can be lost" (add $s.delaySeconds $s.timeoutSeconds 10 | int)) }}

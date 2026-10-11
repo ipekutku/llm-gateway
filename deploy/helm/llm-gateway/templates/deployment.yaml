@@ -51,6 +51,16 @@ spec:
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      {{- with .Values.sidecars }}
+      # Native sidecars: init containers that keep running. They start before
+      # the gateway and receive SIGTERM only after it has exited.
+      {{- $sidecars := list }}
+      {{- range . }}
+      {{- $sidecars = append $sidecars (merge (dict "restartPolicy" "Always") .) }}
+      {{- end }}
+      initContainers:
+        {{- toYaml $sidecars | nindent 8 }}
+      {{- end }}
       containers:
         - name: gateway
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

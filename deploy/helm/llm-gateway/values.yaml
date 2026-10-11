@@ -14,7 +14,8 @@ imagePullSecrets: []
 # limits on its own, so N pods admit up to N times a client's limits.
 replicaCount: 2
 
-# A HorizontalPodAutoscaler on average CPU use relative to the CPU request.
+# A HorizontalPodAutoscaler on the gateway container's average CPU use relative
+# to its CPU request; sidecars are not counted.
 # Needs the metrics API (metrics-server) and resources.requests.cpu. The
 # gateway mostly waits on providers, so CPU follows load only loosely.
 autoscaling:
@@ -133,3 +134,10 @@ resources:
   requests:
     cpu: 100m
     memory: 128Mi
+
+# Containers that run next to the gateway in each pod, such as a database
+# proxy, as native sidecars: they start before the gateway and stop only after
+# it has exited, so they keep serving through its shutdown delay and drain.
+# Each is a container spec, with its own securityContext and resources.
+# Needs Kubernetes 1.29 or later.
+sidecars: []

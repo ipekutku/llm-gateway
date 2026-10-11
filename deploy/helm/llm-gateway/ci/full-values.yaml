@@ -81,3 +81,16 @@ resources:
     memory: 256Mi
   limits:
     memory: 512Mi
+sidecars:
+  - name: proxy
+    image: registry.example.com/proxy:1.0
+    args: ["--port=5432"]
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]

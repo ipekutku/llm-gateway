@@ -1,0 +1,66 @@
+# Chart values for the local kind cluster (make kind-deploy). Everything here is
+# synthetic: the provider keys, the demo client's key (synthetic-kind-demo-key),
+# and the prices. Both providers point at the fake provider, a sidecar on
+# 127.0.0.1:9000 in each pod; no request leaves the cluster.
+
+image:
+  # Loaded into the cluster by make kind-up, never pulled.
+  pullPolicy: Never
+
+providers:
+  openai:
+    model: local-openai
+    apiKeySecret:
+      name: llm-gateway-openai
+    baseURL: http://127.0.0.1:9000
+  anthropic:
+    model: local-anthropic
+    apiKeySecret:
+      name: llm-gateway-anthropic
+    baseURL: http://127.0.0.1:9000
+
+clients:
+  secretName: llm-gateway-clients
+
+database:
+  urlSecret:
+    name: llm-gateway-database
+
+# Shared rate limits across all pods.
+redis:
+  urlSecret:
+    name: llm-gateway-redis
+
+prices:
+  - provider: openai
+    model: local-openai
+    input: "1"
+    cache_read: "0.1"
+    cache_write: "0"
+    output: "2"
+  - provider: anthropic
+    model: local-anthropic
+    input: "1"
+    cache_read: "0.1"
+    cache_write: "1.25"
+    output: "2"
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+sidecars:
+  - name: fakeprovider
+    image: llm-gateway-fakeprovider:dev
+    imagePullPolicy: Never
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]

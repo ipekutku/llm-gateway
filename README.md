@@ -323,9 +323,10 @@ Migrations are forward-only, and a gateway refuses to start on a schema with mig
 | `env` | `[]` | Further environment variables, such as `GATEWAY_UPSTREAM_TIMEOUT`, retry and breaker settings, or `OTEL_EXPORTER_OTLP_ENDPOINT` for tracing. Use `valueFrom.secretKeyRef` for secrets. Variables the chart sets are rejected. |
 | `logFormat` | `json` | `json` or `text`. |
 | `replicaCount` | `2` | Pods in the Deployment when autoscaling is off. |
-| `autoscaling.enabled`, `.minReplicas`, `.maxReplicas`, `.targetCPUUtilizationPercentage` | `false`, `2`, `6`, `70` | A HorizontalPodAutoscaler on average CPU use relative to `resources.requests.cpu`. Needs the cluster's metrics API (metrics-server). |
+| `autoscaling.enabled`, `.minReplicas`, `.maxReplicas`, `.targetCPUUtilizationPercentage` | `false`, `2`, `6`, `70` | A HorizontalPodAutoscaler on the gateway container's average CPU use relative to `resources.requests.cpu`; sidecars are not counted. Needs the cluster's metrics API (metrics-server) and Kubernetes 1.30 or later. |
 | `podDisruptionBudget.maxUnavailable` | `1` | Pods that voluntary disruptions, such as node drains, may evict at a time; a number or a percentage such as `"25%"`. |
 | `resources` | requests `100m` CPU, `128Mi` memory | Container resources; no limits are set by default. |
+| `sidecars` | `[]` | Containers that run next to the gateway, such as a database proxy, as native sidecars: they start first and stop only after the gateway has exited, so they serve through its shutdown. Each is a container spec with its own `securityContext` and `resources`. Needs Kubernetes 1.29 or later. |
 
 The chart runs two pods by default and spreads them across nodes where it can (`ScheduleAnyway`, so a single-node cluster still runs both). A PodDisruptionBudget lets a drain evict only one at a time, so one keeps serving while the other is replaced; every evicted pod shuts down gracefully. With `autoscaling.enabled`, the HPA keeps between `minReplicas` and `maxReplicas` pods and the chart stops setting the Deployment's replica count, so upgrades leave the autoscaler's count alone. Switching autoscaling on in an upgrade briefly scales the Deployment to one pod, until the HPA raises it to `minReplicas` within seconds; do it outside busy periods. CPU is a loose signal for the gateway, whose requests mostly wait on providers: a pod can be saturated with in-flight requests while its CPU stays low. Scaling on requests in flight would need a custom metrics adapter, which the chart does not include.
 
@@ -334,6 +335,30 @@ Without Redis, each pod enforces every client's rate and concurrency limits on i
 The pods run as user `65532` with a read-only root filesystem, no privilege escalation, all capabilities dropped, and the `RuntimeDefault` seccomp profile, which meets the Kubernetes "restricted" Pod Security Standard. Liveness probes `/livez` and readiness `/readyz`; readiness does not depend on PostgreSQL, Redis, or the providers. A change to `prices` rolls the pods; a change to a referenced Secret does not, so restart them afterwards with `kubectl rollout restart deployment`. A JSON schema and template checks reject unknown values, mistyped prices, missing Secrets, and a grace period too short for the shutdown settings before anything is applied.
 
 The gateway serves plain HTTP, and the Service is ClusterIP only, with no Ingress. Put TLS in front of the gateway before exposing it outside the cluster. Metrics listen on the pod network at port `9464` (Service port `service.metricsPort`) without authentication, so anything in the cluster that can reach the pods can read them; pprof stays off unless `GATEWAY_PPROF=true` is set in `env`, which would expose it the same way.
+
+### Local Kubernetes with kind
+
+[`deploy/kind`](deploy/kind) runs the chart in a local [kind](https://kind.sigs.k8s.io) cluster, with nothing but synthetic credentials. Each gateway pod gets the [fake provider](#container-image) as a sidecar on `127.0.0.1:9000`, and both providers point at it, so no request leaves the cluster. It needs Docker, Go, `kubectl`, and `helm`; kind itself runs pinned through `go run`.
+
+```bash
+make kind-up       # build both images, create the cluster, load the images, start metrics-server, PostgreSQL, and Redis
+make kind-deploy   # create the synthetic Secrets and install the chart; the migration hook prepares the database
+make kind-check    # one completion per provider through the Service, and the metrics port
+make kind-down     # delete the cluster and everything in it
+```
+
+All four can be run again: `kind-up` keeps an existing cluster and reloads the images, and `kind-deploy` upgrades the release. After changing Go code, run `make kind-up kind-deploy` and restart the pods (`kubectl --context kind-llm-gateway -n llm-gateway rollout restart deployment/llm-gateway`), since the image tag stays `dev`.
+
+The cluster has one node running Kubernetes 1.37 (`kind-llm-gateway` context, `llm-gateway` namespace). The release uses [`deploy/kind/values.yaml`](deploy/kind/values.yaml): two to four pods under the autoscaler, shared limits in Redis, and synthetic prices. PostgreSQL and Redis have no volumes and a fixed password, so their data disappears with their pods; they are for local demonstrations only. To send requests yourself:
+
+```bash
+kubectl --context kind-llm-gateway -n llm-gateway port-forward service/llm-gateway 18080:8080
+curl -s http://127.0.0.1:18080/v1/chat/completions \
+  -H 'Authorization: Bearer synthetic-kind-demo-key' -H 'Content-Type: application/json' \
+  -d '{"model": "local-openai", "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+The demo client (`deploy/kind/clients.json`) may send 600 requests per minute, bursts of 20, and 10 at a time. Its key, `synthetic-kind-demo-key`, is public: never reuse it, the values, or the stores outside this cluster. With Colima, give the VM at least 4 GiB of memory (`colima start --memory 4`); the default 2 GiB is enough for the cluster but leaves little room for building the images.
 
 ### Configuration
 
@@ -652,7 +677,7 @@ Usage is queried directly in PostgreSQL. [docs/usage.md](docs/usage.md) provides
 
 ## Development
 
-The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check`, which builds the [container images](#container-image) for amd64 and arm64; it needs Docker, so it is not part of `make check`. Another job runs `make helm-lint`, which lints and renders the [Helm chart](#kubernetes-with-helm) with the values in its `ci/` directory and checks that invalid values are rejected; locally it needs `helm` on `PATH`.
+The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check`, which builds the [container images](#container-image) for amd64 and arm64; it needs Docker, so it is not part of `make check`. Another job runs `make helm-lint`, which lints and renders the [Helm chart](#kubernetes-with-helm) with the values in its `ci/` directory and checks that invalid values are rejected; locally it needs `helm` on `PATH`. A fourth job runs `make kind-up kind-deploy kind-check`: it installs the chart in a [kind cluster](#local-kubernetes-with-kind) and sends one completion per provider through it.
 
 `make bench` measures request-path components with allocation counts. It uses in-process fixtures and synthetic credentials; only the shared rate-limiter benchmark contacts Redis, gated on `GATEWAY_TEST_REDIS_URL` as below. [Performance measurements](docs/performance.md) describes the fixtures, baseline results, and comparisons with pinned `benchstat`. CI runs `make bench-check` to exercise the fixtures, without timing thresholds.
 
