@@ -1,4 +1,5 @@
-# Every optional setting: both providers with fallbacks and a base URL, Redis,
+# Every optional setting: both providers with fallbacks and a base URL, a
+# separate migration database URL, Redis,
 # prices, extra environment variables, and a different shutdown budget.
 image:
   repository: registry.example.com/llm-gateway
@@ -28,6 +29,12 @@ database:
   urlSecret:
     name: gateway-database
     key: postgres-url
+migrations:
+  urlSecret:
+    name: gateway-database-owner
+    key: postgres-url
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
 redis:
   urlSecret:
     name: gateway-redis

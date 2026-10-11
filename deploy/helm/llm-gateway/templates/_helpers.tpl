@@ -24,6 +24,19 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
+{{/*
+Labels of the migration Job and its pod. Its name differs from the gateway's,
+so the Deployment's and Service's selectors never match the migration pod.
+*/}}
+{{- define "llm-gateway.migrationLabels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+app.kubernetes.io/name: {{ include "llm-gateway.name" . | trunc 55 | trimSuffix "-" }}-migrate
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: migrate
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
 {{- define "llm-gateway.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create }}
 {{- default (include "llm-gateway.fullname" .) .Values.serviceAccount.name }}

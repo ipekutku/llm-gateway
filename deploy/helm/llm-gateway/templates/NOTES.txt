@@ -11,6 +11,11 @@ The gateway serves plain HTTP and the Service is ClusterIP only. Put TLS in
 front of it before exposing it outside the cluster. The metrics port ({{ .Values.service.metricsPort }}) is
 unauthenticated; limit who can reach it on the pod network.
 
-The pods check the database schema at startup but never migrate it. Run
-`gateway migrate` with the same image and database URL before the first
-install and after upgrades that add migrations.
+{{ if .Values.migrations.enabled -}}
+Database migrations ran in the {{ include "llm-gateway.fullname" . }}-migrate hook Job before
+this release. Migrations are forward-only: roll forward rather than back.
+{{- else -}}
+Migrations are disabled. The pods check the database schema at startup but
+never migrate it: run `gateway migrate` with the same image before installing
+and after upgrades that add migrations.
+{{- end }}
