@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the implemented gateway through v0.7 shared rate limits. The request path has client authentication and per-client rate limits, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, a circuit breaker per provider, and asynchronous usage persistence with estimated costs. Structured logs, bounded Prometheus metrics, optional OpenTelemetry traces, and a local Grafana dashboard make that behavior observable. With optional Redis, several gateway instances share the rate limits and fall back to their own when Redis is unavailable.
+This document describes the implemented gateway through v0.9 containers and Kubernetes. The request path has client authentication and per-client rate limits, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, a circuit breaker per provider, and asynchronous usage persistence with estimated costs. Structured logs, bounded Prometheus metrics, optional OpenTelemetry traces, and a local Grafana dashboard make that behavior observable. With optional Redis, several gateway instances share the rate limits and fall back to their own when Redis is unavailable. A distroless image and a Helm chart run it in Kubernetes, with health probes, a graceful shutdown drain, a migration hook, a disruption budget, and optional autoscaling; a local kind cluster runs the same chart in CI.
 
 ## Request flow
 
@@ -886,9 +886,10 @@ Chart 0.3.0 was checked the same way, with metrics-server v0.8.1 added to the cl
 | `cluster.yaml` | One control-plane node, `kindest/node:v1.37.0` pinned by digest, the image kind v0.33.0 was released with. |
 | `metrics-server/kustomization.yaml` | metrics-server v0.9.0 from its release manifest, with `--kubelet-insecure-tls`, because kind's kubelets serve self-signed certificates. A kustomization keeps reapplying it idempotent. |
 | `stores.yaml` | PostgreSQL 18 and Redis 8, the images of `make db` and `make redis`, without volumes and with a fixed local password. |
-| `clients.json` | One `demo` client with the public key `synthetic-kind-demo-key`. |
-| `values.yaml` | Chart values: both providers at `http://127.0.0.1:9000`, the fake provider as a sidecar, Redis for shared limits, autoscaling from two to four pods, synthetic prices, `pullPolicy: Never`. |
+| `clients.json` | Three clients with public synthetic keys: `demo` (`synthetic-kind-demo-key`, 600 requests per minute), `load` (`synthetic-kind-load-key`, effectively unlimited, for load), and `limited` (`synthetic-kind-limited-key`, bursts of 10, then 1 per second). |
+| `values.yaml` | Chart values: both providers at `http://127.0.0.1:9000`, the fake provider as a sidecar with a 200 ms delay, so requests are in flight during shutdowns, Redis for shared limits, autoscaling from two to four pods, synthetic prices, `pullPolicy: Never`. |
 | `check.sh` | Waits for the rollout, port-forwards the Service, requires one completion per provider and a successful request on the metrics port. No timing thresholds. |
+| `demo.sh` | The [demonstrations](#demonstrations) (`make kind-demo`), run by hand only. |
 
 `make kind-up` builds both images, creates the `llm-gateway` cluster unless it exists, loads the images (they are never pushed), and starts metrics-server and the stores; `make kind-deploy` creates the Secrets with `--dry-run=client | apply`, so reruns update them, and runs `helm upgrade --install`, whose migration hook prepares the database; `make kind-check` runs `check.sh`; `make kind-down` deletes the cluster. CI runs the first three in a fourth job, and prints the namespace's resources, events, and the gateway pods' logs if they fail.
 
@@ -900,6 +901,36 @@ Decisions:
 - **One node.** A laptop VM holds one kind node comfortably; spreading, drains across nodes, and zone failures are not demonstrated locally.
 
 On 2026-10-11, under Colima (2 CPUs, 2 GiB) on an Apple M1, with kubectl 1.37.0 and Helm 4.3.0 run from their official images: `make kind-up` took 4 minutes 40 seconds from nothing, including building the images; `make kind-deploy` installed the release in under 6 seconds with the migration hook; and `make kind-check` passed, with two usage rows stored with costs. The HPA read the gateway container's CPU (1% idle). A pod deleted while requests were sent to it every quarter second kept answering `200` for its 5-second shutdown delay and then refused connections, with no `502`: the fake provider, which stops at once on `SIGTERM`, was still running. Rerunning all three targets changed nothing but the release revision, and `make kind-down` removed the cluster and its kubeconfig entry.
+
+### Demonstrations
+
+`make kind-demo` runs `deploy/kind/demo.sh` on a cluster prepared by `make kind-up kind-deploy`: five scenarios in about twelve minutes, never in CI. Load comes from Vegeta v12.13.0, built pinned for the node's platform and run inside the kind node against the Service's cluster IP, so kube-proxy spreads its connections across the pods as it would for any in-cluster client; a port-forward would pin them to one pod. Requests go to the fake provider sidecar, which answers after 200 ms. Each run writes the Vegeta reports, gateway logs, and a `summary.md` to the gitignored `deploy/kind/results/`. The script asserts nothing about timing: the numbers are a record.
+
+| Scenario | What happens |
+|---|---|
+| `scale` | 200 requests/s for 180 s as the `load` client, sampling the HPA's CPU measurement and the pods every 15 s. Starts only once the autoscaler is back at two pods: the HPA controller remembers its recent recommendations for five minutes, even for a reinstalled HPA of the same name. |
+| `limits` | 30 requests for an unconfigured model in about half a second as the `limited` client, each on a new connection; an admitted request gets `404` and a limited one `429`, without calling a provider. Repeated after a `helm upgrade` that removes Redis, and restored with `make kind-deploy`. Per-pod counts come from each pod's metrics. |
+| `sigterm` | One pod receives a readiness probe and a completion about every 0.3 s, directly on its IP, while it is deleted. |
+| `rollout` | 50 requests/s for 90 s; `kubectl rollout restart` after 15 s. |
+| `database` | 20 requests/s for 120 s. After 15 s PostgreSQL is scaled to zero, which deletes its data; after 60 s it is scaled back and `make kind-deploy` reruns the migration hook. Lost records are counted from the gateway logs and the rows of both databases. |
+
+Results of 2026-10-11 (run `20261011T165145Z`; Colima on an Apple M1 with 2 CPUs and 1.9 GiB for the whole cluster, Kubernetes 1.37.0, chart 0.4.0, three gateway pods except where stated):
+
+| Scenario | Result |
+|---|---|
+| `scale` | From two pods: CPU rose to 44%, then 78% of the request after 47 s, when the HPA added a third pod; with three, it settled at 50–54% and stayed below the 70% target, so a fourth was never added. 36,000 requests, all `200`, p99 205.8 ms. |
+| `limits` | With Redis, 10 of 30 admitted (2, 5, and 3 by the three pods) and 20 limited: one bucket for the client across all pods. Without Redis, 29 of 30 admitted (10, 9, and 10): each pod applied the burst of 10 on its own. |
+| `sigterm` | Readiness answered `503` from 0.5 s after the delete request; completions kept succeeding until 5.4 s, then connections were refused at 5.5 s. No request failed with an HTTP error. |
+| `rollout` | The Deployment reported three new pods ready after 4 s, and the old pods had drained and exited after 10 s. 4,499 of 4,500 requests succeeded; one failed with `connection reset by peer`. Two earlier runs of the same scenario had no failures. |
+| `database` | All three pods stayed ready throughout, and all 2,400 requests succeeded with unchanged latency (p99 208.7 ms). The migration hook prepared the new database 5 s after it was ready. Of the 2,400 usage records, 297 were in the deleted database, 1,010 were reported lost in 80 `usage records not persisted` warnings, and 1,087 were stored afterwards; the remaining 6 were written between counting the old database's rows and its deletion. |
+
+What they show, and what they do not:
+
+- **Shutdown drains, with one remaining race.** A terminating pod fails readiness at once and keeps serving through its delay, so nothing new is routed to it once the endpoints update, and requests already in flight finish. The rollout failure is the HTTP/1.1 keep-alive race: when the delay ends, the server closes its idle connections, and a client that sends a request on one at that moment gets a reset, which it cannot safely retry for a `POST`. Clients with their own retry logic recover; making the gateway close connections during the delay (`Connection: close` on each response) would remove the race, and is not implemented.
+- **Accounting losses are in the logs, not the metrics.** During the outage the gateway logged every failed batch with its record count, but there is no metric for lost records, so `gateway_requests_total` alone cannot show them; comparing it with stored rows, or watching the warnings, can.
+- **CPU is a coarse scaling signal.** Requests here cost little CPU and mostly wait on the fake provider's 200 ms, so 200 requests/s needed only a third pod.
+- **One node, one laptop.** Spreading, drains across nodes, and network partitions are not shown; the load generator, the cluster, and the stores share two CPUs. The numbers demonstrate behavior, not capacity.
+
 
 ## Testing
 

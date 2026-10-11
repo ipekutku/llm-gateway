@@ -29,6 +29,7 @@ go.work.sum
 
 # Local load-test reports, profiles, logs, and binaries
 /deploy/loadtest/results/
+/deploy/kind/results/
 
 # Editor/IDE
 # .idea/

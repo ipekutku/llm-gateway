@@ -835,6 +835,8 @@ Z MiB memory under load
 
 **Target version:** `v0.9.0`
 
+**Status:** Feature-complete. A multi-platform distroless image, a Helm chart with a migration hook, health probes, a configurable shutdown drain, a disruption budget, CPU autoscaling, and native sidecars run in a local kind cluster, installed and checked in CI. A scripted [demonstration](architecture.md#demonstrations) covers autoscaling, shared limits across pods, `SIGTERM`, a rolling restart under load, and a database outage. Milestone 10 is next. Release tagging follows merged-commit CI and the [release checks](../README.md#development).
+
 ## Objective
 
 Package and operate the gateway as a cloud-native service.
@@ -900,11 +902,11 @@ Make key deployment parameters configurable.
 
 ## Exit Criteria
 
-* gateway runs locally in Kubernetes
-* Helm installation works
-* horizontal scaling works
-* graceful shutdown is demonstrated
-* health checks behave correctly
+* [x] gateway runs locally in Kubernetes — `make kind-up kind-deploy kind-check` runs it in a single-node kind cluster with disposable PostgreSQL and Redis and the fake provider as a sidecar, locally and in a CI job that sends one completion per provider through the Service and checks the metrics port
+* [x] Helm installation works — `deploy/helm/llm-gateway` installs with a pre-install/pre-upgrade migration Job; `make helm-lint` lints and renders it in CI and checks that invalid values are rejected; install, upgrade, a failed migration, and recovery were verified on kind
+* [x] horizontal scaling works — two pods by default with a preference for different nodes, a PodDisruptionBudget, and an optional CPU HorizontalPodAutoscaler; the demonstration scaled from two to three pods at 200 requests/s with no failed request, and Redis kept one client's burst of 10 across three pods (10 of 30 admitted; 29 without Redis)
+* [x] graceful shutdown is demonstrated — `GATEWAY_SHUTDOWN_DELAY` and `GATEWAY_SHUTDOWN_TIMEOUT` with lifecycle tests; after `SIGTERM` a pod failed readiness within 0.5 s and answered completions for its 5-second delay before closing its listener, and a rolling restart under 50 requests/s completed 4,499 of 4,500 requests; the one failure, a reset keep-alive connection as an old pod closed its listener, is documented with the [demonstration](architecture.md#demonstrations)
+* [x] health checks behave correctly — `/livez` and `/readyz` are tested without telemetry; readiness ignores dependencies, and with PostgreSQL deleted for a minute all pods stayed ready and every request succeeded, while lost usage records were logged
 
 ---
 

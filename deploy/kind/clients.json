@@ -6,6 +6,20 @@
       "requests_per_minute": 600,
       "burst": 20,
       "max_concurrent": 10
+    },
+    {
+      "id": "load",
+      "key_sha256": "794c257c7c9c1e55b0aa4beb83cc79776daf3bc5e1e255d448ee9f53b23d3c55",
+      "requests_per_minute": 1000000,
+      "burst": 1000000,
+      "max_concurrent": 10000
+    },
+    {
+      "id": "limited",
+      "key_sha256": "44dabdd888a947682092f883fbf63045e7a6983c664c6b66371ce8af23d1935a",
+      "requests_per_minute": 60,
+      "burst": 10,
+      "max_concurrent": 5
     }
   ]
 }

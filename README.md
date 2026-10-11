@@ -33,7 +33,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Project Status
 
-v0.1 through v0.8 are feature-complete; v0.9 (Docker, Kubernetes, and Helm) is next. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is next. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
 
 ```text
 v0.1  Provider abstraction + routing          ✅
@@ -44,9 +44,19 @@ v0.5  Usage + cost tracking + PostgreSQL      ✅
 v0.6  Prometheus + OpenTelemetry              ✅
 v0.7  Redis + multi-instance behavior        ✅
 v0.8  Load testing + performance work          ✅
-v0.9  Docker + Kubernetes + Helm
+v0.9  Docker + Kubernetes + Helm               ✅
 v1.0  AWS deployment with Terraform
 ```
+
+### v0.9 — Containers and Kubernetes ✅
+
+Implemented (see [Container image](#container-image), [Kubernetes with Helm](#kubernetes-with-helm), and [Local Kubernetes with kind](#local-kubernetes-with-kind)):
+
+* `/livez` and `/readyz` on the API port, outside authentication and telemetry; readiness fails when shutdown begins and never because of PostgreSQL, Redis, or a provider
+* a configurable shutdown: `GATEWAY_SHUTDOWN_DELAY` keeps serving with readiness failing, then `GATEWAY_SHUTDOWN_TIMEOUT` drains the listener
+* a distroless, non-root image for amd64 and arm64, built in CI
+* a Helm chart: Secret references only, a migration hook Job, a restricted security context, a PodDisruptionBudget, optional CPU autoscaling, and native sidecars
+* a local kind cluster with disposable stores and the fake provider as a sidecar, installed and checked in CI, and a scripted demonstration of autoscaling, shared limits across pods, `SIGTERM`, a rolling restart under load, and a database outage (`make kind-demo`)
 
 ### v0.8 — Performance Engineering ✅
 
@@ -347,7 +357,9 @@ make kind-check    # one completion per provider through the Service, and the me
 make kind-down     # delete the cluster and everything in it
 ```
 
-All four can be run again: `kind-up` keeps an existing cluster and reloads the images, and `kind-deploy` upgrades the release. After changing Go code, run `make kind-up kind-deploy` and restart the pods (`kubectl --context kind-llm-gateway -n llm-gateway rollout restart deployment/llm-gateway`), since the image tag stays `dev`.
+`make kind-demo` then demonstrates autoscaling, shared limits across pods, `SIGTERM` to one pod, a rolling restart under load, and a PostgreSQL outage, in about twelve minutes; results go to `deploy/kind/results/`. See [demonstrations](docs/architecture.md#demonstrations) for what each does and the recorded results.
+
+All four setup targets can be run again: `kind-up` keeps an existing cluster and reloads the images, and `kind-deploy` upgrades the release. After changing Go code, run `make kind-up kind-deploy` and restart the pods (`kubectl --context kind-llm-gateway -n llm-gateway rollout restart deployment/llm-gateway`), since the image tag stays `dev`.
 
 The cluster has one node running Kubernetes 1.37 (`kind-llm-gateway` context, `llm-gateway` namespace). The release uses [`deploy/kind/values.yaml`](deploy/kind/values.yaml): two to four pods under the autoscaler, shared limits in Redis, and synthetic prices. PostgreSQL and Redis have no volumes and a fixed password, so their data disappears with their pods; they are for local demonstrations only. To send requests yourself:
 
@@ -358,7 +370,7 @@ curl -s http://127.0.0.1:18080/v1/chat/completions \
   -d '{"model": "local-openai", "messages": [{"role": "user", "content": "hello"}]}'
 ```
 
-The demo client (`deploy/kind/clients.json`) may send 600 requests per minute, bursts of 20, and 10 at a time. Its key, `synthetic-kind-demo-key`, is public: never reuse it, the values, or the stores outside this cluster. With Colima, give the VM at least 4 GiB of memory (`colima start --memory 4`); the default 2 GiB is enough for the cluster but leaves little room for building the images.
+The `demo` client (`deploy/kind/clients.json`, key `synthetic-kind-demo-key`) may send 600 requests per minute, bursts of 20, and 10 at a time; `load` (`synthetic-kind-load-key`) is effectively unlimited, and `limited` (`synthetic-kind-limited-key`) gets bursts of 10, then one request per second. The keys are public: never reuse them, the values, or the stores outside this cluster. With Colima, give the VM at least 4 GiB of memory (`colima start --memory 4`); the default 2 GiB is enough for the cluster but leaves little room for building the images.
 
 ### Configuration
 
@@ -668,6 +680,8 @@ Requests with an unknown model or a wrong gateway key fill the request panels wi
 * On reasoning models, thinking counts toward `max_tokens`, so a small limit can end with `length` and little text.
 * Usage records cover requests that pass body validation, including unknown models and upstream failures. Authentication, gateway rate-limit, malformed-body, and body-size rejections are excluded. A disconnected client is recorded as status `499` with `client_closed`; this status is never sent as a response.
 * Accounting is asynchronous: a full queue drops new records, a failed batch is retried once and then logged and discarded, and a shutdown deadline can lose pending records. Database failure after startup does not fail otherwise successful requests. Records contain metadata, tokens, and estimated costs, never prompt or completion content.
+* While a pod shuts down, an HTTP/1.1 client that reuses an idle keep-alive connection just as the listener closes gets a connection reset: 1 of 4,500 requests in one of three rolling restarts under load in the [demonstration](docs/architecture.md#demonstrations). Retry such failures where a duplicate generation is acceptable.
+* Usage records lost to a database outage are logged with their count (`usage records not persisted`), but no metric counts them.
 * Usage records are never deleted automatically; the table grows with traffic. Delete old rows on your own schedule; [docs/usage.md](docs/usage.md#retention) shows how.
 * Estimated costs cover only provider-reported usage, including a successful generation whose client disconnected before receiving it. Failed retries and a failed primary before fallback may incur charges without reporting usage. Unknown usage and cost are stored as `NULL`, never as fabricated zeros.
 
