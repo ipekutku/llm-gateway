@@ -215,7 +215,7 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	}()
 	// Probes are answered ahead of the handler tracker, tracing, and the API
 	// handler.
-	err = serve(stopping, newServer(withProbes(draining, active), logger), ln, cfg.ShutdownTimeout)
+	err = serve(stopping, newServer(closeWhenDraining(draining, withProbes(draining, active)), logger), ln, cfg.ShutdownTimeout)
 	stopServers()
 	if metricsErr := <-metricsDone; metricsErr != nil {
 		err = errors.Join(err, fmt.Errorf("metrics: %w", metricsErr))
@@ -251,6 +251,49 @@ func shutdownStages(ctx context.Context, delay time.Duration, logger *slog.Logge
 	}()
 	return draining, stopping, func() { drain(); stopServing() }
 }
+
+// closeWhenDraining asks each client to close its connection after a
+// response whose headers are written once ctx is done, when shutdown begins,
+// including the responses of requests already in flight then. During the
+// shutdown delay, clients then reconnect, reaching instances that are still
+// ready, instead of reusing a keep-alive connection that the server closes
+// when the delay ends: a request sent on it at that moment fails with a
+// connection reset, and a client cannot safely retry a POST. Unlike
+// http.Server.SetKeepAlivesEnabled, it leaves idle connections open, so it
+// does not cause the same race when the delay begins.
+func closeWhenDraining(ctx context.Context, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(&drainingWriter{ResponseWriter: w, draining: ctx}, r)
+	})
+}
+
+// drainingWriter adds "Connection: close" to the response headers if draining
+// is done when they are written. Unwrap lets http.ResponseController reach
+// the underlying writer.
+type drainingWriter struct {
+	http.ResponseWriter
+	draining    context.Context
+	wroteHeader bool
+}
+
+func (w *drainingWriter) WriteHeader(status int) {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+		if w.draining.Err() != nil {
+			w.Header().Set("Connection", "close")
+		}
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *drainingWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *drainingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // rateLimitMode names where rate limits are kept, for the startup log:
 // "shared" through Redis, or "local" to the instance.
