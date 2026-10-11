@@ -36,7 +36,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Project Status
 
-v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is in progress, beginning with the [state and image repository bootstrap](docs/aws.md). Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is in progress, beginning with the [state and image repository bootstrap](docs/aws.md) and images published from CI. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
 
 ```text
 v0.1  Provider abstraction + routing          ✅
@@ -249,7 +249,9 @@ The `model` field must match a configured model exactly; the request is routed t
 
 ### Container image
 
-`make image` builds two images for this machine's platform and loads them into Docker: the gateway, `llm-gateway:dev`, and the local fake provider, `llm-gateway-fakeprovider:dev`. `make image-check` builds both for `linux/amd64` and `linux/arm64` without loading or pushing them, as CI does; locally it needs Docker's containerd image store or a buildx `docker-container` builder. Manual arm64 publication to private ECR repositories is [verified](docs/aws.md#bootstrap-verification--2026-10-11); automatic publication is not implemented.
+`make image` builds two images for this machine's platform and loads them into Docker: the gateway, `llm-gateway:dev`, and the local fake provider, `llm-gateway-fakeprovider:dev`. `make image-check` builds both for `linux/amd64` and `linux/arm64` without loading or pushing them, as CI does; locally it needs Docker's containerd image store or a buildx `docker-container` builder. `make image-scan` scans each image for each platform with a digest-pinned [Trivy](https://trivy.dev) and fails on HIGH or CRITICAL vulnerabilities that have a fix, and on secrets; it needs only Docker.
+
+CI publishes both images for both platforms to the GitHub Container Registry after every merge to `main` once all other CI jobs have passed, tagged with the full commit SHA: `ghcr.io/ipekutku/llm-gateway:<sha>` and `ghcr.io/ipekutku/llm-gateway-fakeprovider:<sha>`. There is no `latest` tag. Pull requests are scanned, and `main` is scanned again just before publishing. CI pushes with its own short-lived `GITHUB_TOKEN`; GitHub holds no AWS or registry secret. Manual arm64 publication to private ECR repositories is [verified](docs/aws.md#bootstrap-verification--2026-10-11) as well.
 
 The images are based on distroless `static`: a static binary, CA certificates, and time zone data, with no shell or package manager. They run as the numeric user `65532`, need no writable root filesystem or Linux capabilities, and set `GATEWAY_ADDR=:8080`, so the API port can be published. The metrics listener stays on `127.0.0.1:9464` inside the container unless `GATEWAY_METRICS_ADDR` says otherwise. There is no Docker `HEALTHCHECK`; use the [health probes](#supported-api). The gateway image is about 32 MB unpacked and 9.5 MB compressed, most of it the 26 MB gateway binary.
 
@@ -323,7 +325,7 @@ Migrations are forward-only, and a gateway refuses to start on a schema with mig
 
 | Value | Default | Description |
 |---|---|---|
-| `image.repository`, `image.tag` | `llm-gateway`, `dev` | Local defaults: build with `make image` and load into a local cluster, or set a registry and tag the cluster can pull. [Manual private ECR publication](docs/aws.md#manually-verify-image-publication) is verified for arm64. |
+| `image.repository`, `image.tag` | `llm-gateway`, `dev` | Local defaults: build with `make image` and load into a local cluster, or set a registry and tag the cluster can pull, such as `ghcr.io/ipekutku/llm-gateway` and a commit SHA from `main` (see [Container image](#container-image)). [Manual private ECR publication](docs/aws.md#manually-verify-image-publication) is verified for arm64. |
 | `providers.<openai\|anthropic>.model`, `.apiKeySecret` | none | Enable a provider with its model and the Secret (`name`, `key`, default `api-key`) holding its key. At least one is required. `.baseURL` and `.fallback` set `<PROVIDER>_BASE_URL` and `<PROVIDER>_FALLBACK`. |
 | `clients.secretName`, `clients.key` | none, `clients.json` | Required. The Secret holding the [clients file](#clients). |
 | `database.urlSecret` | none, key `url` | Required. The Secret holding `GATEWAY_DATABASE_URL`. |
@@ -384,8 +386,10 @@ plans; Terraform 1.16.5 is required. The [AWS runbook](docs/aws.md) covers accou
 setup and costs, the first local apply, migration into S3 with native locking,
 and manually pushing the local images. [Live bootstrap verification](docs/aws.md#bootstrap-verification--2026-10-11)
 confirmed a no-change plan, encrypted/versioned remote state, and both arm64 image
-pushes with completed basic scans and no findings reported. AWS gateway deployment
-and automatic image publication are not implemented yet.
+pushes with completed basic scans and no findings reported. CI publishes images
+to GHCR rather than ECR, because the AWS project does not allow the GitHub OIDC
+identity provider that keyless ECR pushes need (see the [runbook](docs/aws.md#ci-images-and-aws-credentials)).
+AWS gateway deployment is not implemented yet.
 
 ### Configuration
 
@@ -705,7 +709,7 @@ Usage is queried directly in PostgreSQL. [docs/usage.md](docs/usage.md) provides
 
 ## Development
 
-The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check`, which builds the [container images](#container-image) for amd64 and arm64; it needs Docker, so it is not part of `make check`. Another job runs `make helm-lint`, which lints and renders the [Helm chart](#kubernetes-with-helm) with the values in its `ci/` directory and checks that invalid values are rejected; locally it needs `helm` on `PATH`. A fourth job runs `make kind-up kind-deploy kind-check`: it installs the chart in a [kind cluster](#local-kubernetes-with-kind) and sends one completion per provider through it. A fifth runs `make terraform-check` for the [AWS bootstrap](#aws-bootstrap), without AWS credentials.
+The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check image-scan`, which builds the [container images](#container-image) for amd64 and arm64 and scans them; it needs Docker, so it is not part of `make check`. On `main`, a final job scans the images again and publishes them with `make image-publish` once every other job has passed. Another job runs `make helm-lint`, which lints and renders the [Helm chart](#kubernetes-with-helm) with the values in its `ci/` directory and checks that invalid values are rejected; locally it needs `helm` on `PATH`. A fourth job runs `make kind-up kind-deploy kind-check`: it installs the chart in a [kind cluster](#local-kubernetes-with-kind) and sends one completion per provider through it. A fifth runs `make terraform-check` for the [AWS bootstrap](#aws-bootstrap), without AWS credentials.
 
 `make bench` measures request-path components with allocation counts. It uses in-process fixtures and synthetic credentials; only the shared rate-limiter benchmark contacts Redis, gated on `GATEWAY_TEST_REDIS_URL` as below. [Performance measurements](docs/performance.md) describes the fixtures, baseline results, and comparisons with pinned `benchstat`. CI runs `make bench-check` to exercise the fixtures, without timing thresholds.
 

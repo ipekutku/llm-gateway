@@ -110,6 +110,11 @@ jobs:
       - name: Build images
         run: make image-check
 
+      # Each image and platform, scanned by a digest-pinned Trivy; fails on
+      # fixable HIGH or CRITICAL vulnerabilities and on secrets.
+      - name: Scan images
+        run: make image-scan
+
   chart:
     name: Helm chart
     runs-on: ubuntu-latest
@@ -190,3 +195,46 @@ jobs:
           kubectl --context kind-llm-gateway --namespace llm-gateway get all,events
           kubectl --context kind-llm-gateway --namespace llm-gateway logs --all-containers --prefix \
             --selector app.kubernetes.io/name=llm-gateway --tail 100 || true
+
+  # Pushes both images for amd64 and arm64 to GHCR, tagged with the commit
+  # SHA, for pushes to main only and after every other job passed. The job's
+  # GITHUB_TOKEN is the only credential; GitHub holds no AWS or registry secret.
+  publish:
+    name: Publish images
+    if: github.repository == 'ipekutku/llm-gateway' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, image, chart, terraform, kind]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Scanned again in this builder just before the push, so the pushed
+      # layers come from the same build cache as the scanned ones.
+      - name: Scan images
+        run: make image-scan
+
+      # Only after the scan, and never handed to an action.
+      - name: Log in to GHCR
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish images
+        run: make image-publish
+        env:
+          PUBLISH_REGISTRY: ghcr.io/ipekutku
+          PUBLISH_TAG: ${{ github.sha }}
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io

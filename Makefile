@@ -17,11 +17,31 @@ REDIS_IMAGE := redis:8
 REDIS_PORT ?= 56379
 REDIS_URL := redis://127.0.0.1:$(REDIS_PORT)/0
 
-# Container images (see the Dockerfile). CI builds both platforms without
-# pushing; manual private ECR publication is documented in docs/aws.md.
+# Container images (see the Dockerfile). CI builds and scans both platforms on
+# every run, and publishes them from main to PUBLISH_REGISTRY; manual private
+# ECR publication is documented in docs/aws.md.
 IMAGE ?= llm-gateway:dev
 FAKEPROVIDER_IMAGE ?= llm-gateway-fakeprovider:dev
 IMAGE_PLATFORMS := linux/amd64,linux/arm64
+IMAGE_SOURCE := https://github.com/ipekutku/llm-gateway
+PUBLISH_REGISTRY ?=
+PUBLISH_TAG ?=
+# The source label (and, for the multi-platform index, annotation) links a
+# GHCR package to the repository; the revision is the commit built. Minimal
+# provenance records the repository, commit, and pinned base images.
+PUBLISH_FLAGS = --label org.opencontainers.image.source=$(IMAGE_SOURCE) \
+	--annotation index:org.opencontainers.image.source=$(IMAGE_SOURCE) \
+	--label org.opencontainers.image.revision=$$(git rev-parse HEAD) \
+	--provenance=mode=min
+
+# Image scanner, pinned by the digest of its multi-platform index (the same on
+# GHCR, Docker Hub, and ECR Public). Update the tag and digest together:
+#   docker buildx imagetools inspect ghcr.io/aquasecurity/trivy:<version>
+# The vulnerability database is cached in a Docker volume between runs.
+TRIVY_IMAGE := ghcr.io/aquasecurity/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+TRIVY_CACHE_VOLUME := llm-gateway-trivy-cache
+TRIVY_FLAGS := --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed \
+	--exit-code 1 --no-progress --disable-telemetry --skip-version-check
 
 # Local Kubernetes in kind (see deploy/kind). kind runs pinned through go run;
 # kubectl and helm must be on PATH. The cluster name, its kubectl context, the
@@ -39,7 +59,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check helm-lint terraform-check kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -109,6 +129,32 @@ image:
 image-check:
 	docker buildx build --platform $(IMAGE_PLATFORMS) .
 	docker buildx build --platform $(IMAGE_PLATFORMS) --target fakeprovider .
+
+## image-scan: build each image for amd64 and arm64 and scan it with the
+## pinned Trivy; fails on HIGH or CRITICAL vulnerabilities that have a fix,
+## and on secrets. Each image reaches the scanner through a pipe, so it needs
+## no bind mount or Docker socket. A failed build also fails the scan.
+image-scan:
+	@set -e; for platform in $$(echo '$(IMAGE_PLATFORMS)' | tr , ' '); do \
+		for target in gateway fakeprovider; do \
+			echo "Scanning $$target for $$platform"; \
+			docker buildx build --progress quiet --platform $$platform --target $$target \
+				--output type=docker,dest=- . | \
+			docker run --rm -i -v $(TRIVY_CACHE_VOLUME):/root/.cache/trivy --entrypoint sh $(TRIVY_IMAGE) \
+				-c 'cat >/tmp/image.tar && exec trivy image --input /tmp/image.tar $(TRIVY_FLAGS)'; \
+		done; \
+	done
+
+## image-publish: build both images for amd64 and arm64 and push them as
+## $(PUBLISH_REGISTRY)/llm-gateway[-fakeprovider]:$(PUBLISH_TAG). CI runs it
+## on main after image-scan, logged in to the registry.
+image-publish:
+	@test -n '$(PUBLISH_REGISTRY)' && test -n '$(PUBLISH_TAG)' || \
+		{ echo 'Set PUBLISH_REGISTRY and PUBLISH_TAG'; exit 1; }
+	docker buildx build --platform $(IMAGE_PLATFORMS) --push $(PUBLISH_FLAGS) \
+		--tag $(PUBLISH_REGISTRY)/llm-gateway:$(PUBLISH_TAG) .
+	docker buildx build --platform $(IMAGE_PLATFORMS) --push $(PUBLISH_FLAGS) --target fakeprovider \
+		--tag $(PUBLISH_REGISTRY)/llm-gateway-fakeprovider:$(PUBLISH_TAG) .
 
 ## helm-lint: lint and render the Helm chart with its CI values, and check
 ## that invalid values are rejected. Needs helm on PATH; not part of check.

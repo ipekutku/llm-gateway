@@ -51,9 +51,8 @@ come from the AWS credential chain; never put keys in Terraform files, backend
 arguments, GitHub secrets, or Git. Renew the login if it expires.
 
 The current project's restrictions prohibit IAM identity providers and Spot
-instances. GitHub OIDC publication/deployment needs a separate decision in its
-own PR; this bootstrap adds no identity provider or CI AWS role. Its CI job needs
-no AWS credentials.
+instances. Bootstrap therefore adds no identity provider or CI AWS role, and no
+CI job uses AWS credentials; see [CI images and AWS credentials](#ci-images-and-aws-credentials).
 
 ## Create bootstrap with local state
 
@@ -139,8 +138,8 @@ overwrite the current version while another Terraform operation is active.
 
 ## Manually verify image publication
 
-CI still builds images without publishing. After applying bootstrap, build and
-push both local images once. Confirm both built images use the same Linux
+CI publishes to GHCR, not ECR (see [below](#ci-images-and-aws-credentials)).
+After applying bootstrap, build and push both local images once. Confirm both built images use the same Linux
 architecture; the tag below includes that architecture and a UTC timestamp.
 Use a unique tag; immutable repositories reject overwrites. These single-platform
 images do not establish multi-platform publication.
@@ -243,6 +242,39 @@ This verifies bootstrap and manual arm64 publication only, not EKS deployment,
 multi-platform publication, lock contention, or Go dependency security. Basic
 scan results are point-in-time OS-package findings, not proof of a vulnerability-free
 application. No state contents, backups, or credentials are included in this record.
+
+## CI images and AWS credentials
+
+Keyless pushes from GitHub Actions to ECR need an IAM OIDC identity provider for
+GitHub and a role that trusts it. The project's managed SCPs deny
+`iam:*Provider*`, so neither can be created. The remaining AWS options were
+long-lived IAM user access keys stored in GitHub, which the roadmap rules out in
+favor of workload identity, and activating advanced AWS features, which lifts the
+SCPs but changes the project's account model. Instead, CI publishes to the GitHub
+Container Registry with the workflow's own `GITHUB_TOKEN`:
+
+- The `publish` job runs only for pushes to `main` in this repository, after every
+  other job has passed, and is the only job with `packages: write`. Its token
+  expires with the job and is used only by `docker login`, never by an action;
+  the checkout keeps no credentials.
+- `make image-scan` scans both images for both platforms in the job's builder,
+  then `make image-publish` pushes them from the same build cache as
+  `ghcr.io/ipekutku/llm-gateway:<sha>` and `ghcr.io/ipekutku/llm-gateway-fakeprovider:<sha>`.
+  Each multi-platform index carries the repository source annotation and minimal
+  BuildKit provenance: the repository, the commit, and the pinned base image digests.
+- GitHub holds nothing that can reach the AWS project. ECR remains the manual
+  path from the operator's machine, above.
+
+A new GHCR package can start private. After the first publication, check both
+packages under the repository's Packages, and make them public so a cluster can
+pull them without a pull secret. The images contain no configuration or
+credentials, and the scan also looks for secrets. A cluster in private subnets
+will pull through the NAT gateway, which bills per GB processed; each image is
+about 10 MB compressed.
+
+Limitations: GHCR tags are mutable, so deployments should pin the digest that a
+SHA tag resolves to; SHA tags accumulate with no retention policy; and a CI
+deployment job would need AWS credentials, which the same restriction blocks.
 
 ## Validation and provider updates
 
