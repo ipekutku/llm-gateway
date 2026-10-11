@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ipekutku/llm-gateway/internal/llm"
@@ -18,11 +19,16 @@ import (
 type fakeStartupStore struct {
 	schemaErr error
 	closed    bool
+	inserted  atomic.Int64
 }
 
-func (s *fakeStartupStore) CheckSchema(context.Context) error            { return s.schemaErr }
-func (s *fakeStartupStore) Close()                                       { s.closed = true }
-func (s *fakeStartupStore) Insert(context.Context, []usage.Record) error { return nil }
+func (s *fakeStartupStore) CheckSchema(context.Context) error { return s.schemaErr }
+func (s *fakeStartupStore) Close()                            { s.closed = true }
+
+func (s *fakeStartupStore) Insert(_ context.Context, records []usage.Record) error {
+	s.inserted.Add(int64(len(records)))
+	return nil
+}
 
 func runWithFakeDatabase(ctx context.Context, vars map[string]string, logger *slog.Logger) error {
 	vars[databaseURLVar], vars[pricingFileVar] = testDatabaseURL, pricingPath

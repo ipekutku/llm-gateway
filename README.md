@@ -376,6 +376,15 @@ Live runs have not covered refusals (`content_filter`), Anthropic prompt-cache r
 
 The response contains exactly one choice with `finish_reason` `stop`, `length`, or `content_filter`, plus token usage. Every response, including errors, carries an `X-Request-ID` header; quote it when reporting a problem. A successful response's `id` is `chatcmpl-` followed by the same ID. An `X-Request-ID` sent by the client is ignored. Errors use the envelope `{"error": {"message", "type", "code"}}`; see [docs/architecture.md](docs/architecture.md#error-mapping) for the full status mapping.
 
+The API listener also serves two health probes, without a gateway key:
+
+| Probe | Response |
+|---|---|
+| `GET /livez` | `200 ok` while the process serves HTTP |
+| `GET /readyz` | `200 ok` after startup, `503 shutting down` once shutdown begins |
+
+Readiness does not depend on PostgreSQL, Redis, or the providers: the gateway keeps answering while they are unavailable, and their state is in the logs and metrics. Probes return no `X-Request-ID` and produce no logs, metrics, spans, or usage records. See [health probes](docs/architecture.md#health-probes) for the reasons.
+
 ### Logs, metrics, and traces
 
 Logs go to standard error, as text by default or as one JSON object per line with `GATEWAY_LOG_FORMAT=json`. Every line logged while handling a request carries its `request_id`, the same ID returned in `X-Request-ID`, once the client is authenticated, its `client_id`, and, with tracing enabled, its `trace_id`. That includes the intermediate lines for retries, fallbacks, and circuit breaker changes, so all lines of one request can be found by its ID.
@@ -516,7 +525,7 @@ Requests with an unknown model or a wrong gateway key fill the request panels wi
 * Clients are read from a file at startup; changing them requires a restart. Each client has one key, so rotating a key briefly means replacing it.
 * `/metrics` has no authentication; it reveals request counts per configured model and status and provider health, never keys, clients, or content. Keep `GATEWAY_METRICS_ADDR` on loopback or a network only Prometheus can reach.
 * With `GATEWAY_PPROF=true`, the same metrics listener exposes unauthenticated profiling and process diagnostics. Keep it on loopback for profiling; these outputs reveal internal details and are not covered by normal telemetry's content-exclusion guarantee.
-* With tracing enabled, every request, including rejected ones, produces spans, and a client's `traceparent` decides whether its requests are sampled. Clients cannot see trace data, but anyone who can reach the gateway can add to the collector's load.
+* With tracing enabled, every request except a health probe, including rejected ones, produces spans, and a client's `traceparent` decides whether its requests are sampled. Clients cannot see trace data, but anyone who can reach the gateway can add to the collector's load.
 * Every rejected key logs one warning, and there is no per-IP limit on unauthenticated requests; anyone who can reach the port can fill the logs. Another reason to keep the gateway behind a proxy.
 * A request body must arrive within 30 seconds (otherwise `408`), and idle keep-alive connections close after 2 minutes. Both are fixed.
 * Up to 512 idle upstream connections are kept per provider origin, for 90 seconds. Over HTTP/1.1, more than 512 concurrent requests to one origin close their extra connections after use, and later requests connect again. HTTP/2 origins share connections and are not affected. Both values are fixed.

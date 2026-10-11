@@ -210,7 +210,9 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 		stopServers()
 		metricsDone <- err
 	}()
-	err = serve(ctx, newServer(active, logger), ln, shutdownTimeout)
+	// Probes are answered ahead of the handler tracker, tracing, and the API
+	// handler. Readiness follows ctx, which also starts the shutdown.
+	err = serve(ctx, newServer(withProbes(ctx, active), logger), ln, shutdownTimeout)
 	stopServers()
 	if metricsErr := <-metricsDone; metricsErr != nil {
 		err = errors.Join(err, fmt.Errorf("metrics: %w", metricsErr))
