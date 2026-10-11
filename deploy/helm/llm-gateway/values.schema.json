@@ -1,0 +1,141 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "secretRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "key"],
+      "properties": {
+        "name": {"type": "string"},
+        "key": {"type": "string", "minLength": 1}
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "apiKeySecret", "baseURL", "fallback"],
+      "properties": {
+        "model": {"type": "string"},
+        "apiKeySecret": {"$ref": "#/definitions/secretRef"},
+        "baseURL": {"type": "string"},
+        "fallback": {"type": "string"}
+      }
+    },
+    "price": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]{1,6})?$"
+    },
+    "seconds": {"type": "integer", "minimum": 0}
+  },
+  "required": ["image", "providers", "clients", "database", "redis", "prices", "logFormat", "shutdown", "env", "service", "serviceAccount"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "minLength": 1},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {"type": "array"},
+    "replicaCount": {"type": "integer", "minimum": 0},
+    "providers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["openai", "anthropic"],
+      "properties": {
+        "openai": {
+          "allOf": [
+            {"$ref": "#/definitions/provider"},
+            {"properties": {"fallback": {"enum": ["", "anthropic"]}}}
+          ]
+        },
+        "anthropic": {
+          "allOf": [
+            {"$ref": "#/definitions/provider"},
+            {"properties": {"fallback": {"enum": ["", "openai"]}}}
+          ]
+        }
+      }
+    },
+    "clients": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["secretName", "key"],
+      "properties": {
+        "secretName": {"type": "string"},
+        "key": {"type": "string", "minLength": 1}
+      }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["urlSecret"],
+      "properties": {"urlSecret": {"$ref": "#/definitions/secretRef"}}
+    },
+    "redis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["urlSecret"],
+      "properties": {"urlSecret": {"$ref": "#/definitions/secretRef"}}
+    },
+    "prices": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider", "model", "input", "cache_read", "cache_write", "output"],
+        "properties": {
+          "provider": {"enum": ["openai", "anthropic"]},
+          "model": {"type": "string", "minLength": 1},
+          "input": {"$ref": "#/definitions/price"},
+          "cache_read": {"$ref": "#/definitions/price"},
+          "cache_write": {"$ref": "#/definitions/price"},
+          "output": {"$ref": "#/definitions/price"}
+        }
+      }
+    },
+    "logFormat": {"enum": ["json", "text"]},
+    "shutdown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["delaySeconds", "timeoutSeconds", "terminationGracePeriodSeconds"],
+      "properties": {
+        "delaySeconds": {"$ref": "#/definitions/seconds"},
+        "timeoutSeconds": {"type": "integer", "minimum": 1},
+        "terminationGracePeriodSeconds": {"$ref": "#/definitions/seconds"}
+      }
+    },
+    "env": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {"name": {"type": "string", "minLength": 1}}
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port", "metricsPort"],
+      "properties": {
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "metricsPort": {"type": "integer", "minimum": 1, "maximum": 65535}
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"}
+      }
+    },
+    "resources": {"type": "object"}
+  }
+}

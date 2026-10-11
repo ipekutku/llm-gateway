@@ -31,7 +31,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check helm-lint smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -101,6 +101,11 @@ image:
 image-check:
 	docker buildx build --platform $(IMAGE_PLATFORMS) .
 	docker buildx build --platform $(IMAGE_PLATFORMS) --target fakeprovider .
+
+## helm-lint: lint and render the Helm chart with its CI values, and check
+## that invalid values are rejected. Needs helm on PATH; not part of check.
+helm-lint:
+	bash deploy/helm/lint.sh
 
 ## smoke: call the REAL provider APIs (costs money; never run in CI).
 ## Needs OPENAI_MODEL and OPENAI_API_KEY, ANTHROPIC_MODEL and

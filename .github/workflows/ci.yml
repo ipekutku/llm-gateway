@@ -109,3 +109,22 @@ jobs:
       # Nothing is loaded or pushed.
       - name: Build images
         run: make image-check
+
+  chart:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v4.3.0
+
+      # Lints and renders the chart with its CI values, and checks that
+      # invalid values are rejected. No cluster is involved.
+      - name: Lint chart
+        run: make helm-lint

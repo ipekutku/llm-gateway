@@ -270,6 +270,49 @@ docker stop gateway fakeprovider && docker rm gateway fakeprovider
 
 The request is stored as a synthetic usage row in the development database; `make db-stop` deletes it. For real providers, pass keys from your environment with `-e OPENAI_API_KEY` (no value), so they stay out of shell history; anyone who can run `docker inspect` on the host can still read them. The gateway still serves plain HTTP: publish its port only on loopback, or behind a proxy that terminates TLS.
 
+### Kubernetes with Helm
+
+The chart in [`deploy/helm/llm-gateway`](deploy/helm/llm-gateway) installs a Deployment, a ClusterIP Service with the API and metrics ports, a ServiceAccount without an API token, and a ConfigMap holding the pricing file. It was tested with Helm 4.3.0. PostgreSQL and Redis are not part of it, and it never creates a Secret: create the Secrets first and name them in the values.
+
+```bash
+kubectl create namespace llm-gateway
+kubectl -n llm-gateway create secret generic llm-gateway-database \
+  --from-literal=url='postgres://gateway:...@db.example.internal:5432/gateway?sslmode=verify-full'
+kubectl -n llm-gateway create secret generic llm-gateway-openai --from-literal=api-key="$OPENAI_API_KEY"
+kubectl -n llm-gateway create secret generic llm-gateway-clients --from-file=clients.json
+```
+
+The chart does not migrate the database, and pods fail at startup until the schema is current. Run `migrate` with the same image first, from anywhere that reaches the database (see [Container image](#container-image)). Then install:
+
+```bash
+helm install llm-gateway deploy/helm/llm-gateway -n llm-gateway \
+  --set image.repository=registry.example.com/llm-gateway --set image.tag=<tag> \
+  --set providers.openai.model=gpt-4o \
+  --set providers.openai.apiKeySecret.name=llm-gateway-openai \
+  --set clients.secretName=llm-gateway-clients \
+  --set database.urlSecret.name=llm-gateway-database
+```
+
+[`values.yaml`](deploy/helm/llm-gateway/values.yaml) describes every value; the main ones:
+
+| Value | Default | Description |
+|---|---|---|
+| `image.repository`, `image.tag` | `llm-gateway`, `dev` | No image is published yet: build one with `make image` and push it to a registry the cluster can pull from, or load it into a local cluster. |
+| `providers.<openai\|anthropic>.model`, `.apiKeySecret` | none | Enable a provider with its model and the Secret (`name`, `key`, default `api-key`) holding its key. At least one is required. `.baseURL` and `.fallback` set `<PROVIDER>_BASE_URL` and `<PROVIDER>_FALLBACK`. |
+| `clients.secretName`, `clients.key` | none, `clients.json` | Required. The Secret holding the [clients file](#clients). |
+| `database.urlSecret` | none, key `url` | Required. The Secret holding `GATEWAY_DATABASE_URL`. |
+| `redis.urlSecret` | none, key `url` | Optional. The Secret holding `GATEWAY_REDIS_URL`; without it each pod limits on its own. |
+| `prices` | `[]` | Price entries as in the pricing file, with prices as quoted strings. |
+| `shutdown.delaySeconds`, `.timeoutSeconds`, `.terminationGracePeriodSeconds` | `5`, `25`, `45` | [Shutdown](#shutdown) settings. The grace period must be at least delay + timeout + 10 seconds; requests running longer than delay + timeout are canceled. |
+| `env` | `[]` | Further environment variables, such as `GATEWAY_UPSTREAM_TIMEOUT`, retry and breaker settings, or `OTEL_EXPORTER_OTLP_ENDPOINT` for tracing. Use `valueFrom.secretKeyRef` for secrets. Variables the chart sets are rejected. |
+| `logFormat` | `json` | `json` or `text`. |
+| `replicaCount` | `1` | Pods in the Deployment. |
+| `resources` | requests `100m` CPU, `128Mi` memory | Container resources; no limits are set by default. |
+
+The pods run as user `65532` with a read-only root filesystem, no privilege escalation, all capabilities dropped, and the `RuntimeDefault` seccomp profile, which meets the Kubernetes "restricted" Pod Security Standard. Liveness probes `/livez` and readiness `/readyz`; readiness does not depend on PostgreSQL, Redis, or the providers. A change to `prices` rolls the pods; a change to a referenced Secret does not, so restart them afterwards with `kubectl rollout restart deployment`. A JSON schema and template checks reject unknown values, mistyped prices, missing Secrets, and a grace period too short for the shutdown settings before anything is applied.
+
+The gateway serves plain HTTP, and the Service is ClusterIP only, with no Ingress. Put TLS in front of the gateway before exposing it outside the cluster. Metrics listen on the pod network at port `9464` (Service port `service.metricsPort`) without authentication, so anything in the cluster that can reach the pods can read them; pprof stays off unless `GATEWAY_PPROF=true` is set in `env`, which would expose it the same way.
+
 ### Configuration
 
 | Variable | Description |
@@ -587,7 +630,7 @@ Usage is queried directly in PostgreSQL. [docs/usage.md](docs/usage.md) provides
 
 ## Development
 
-The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check`, which builds the [container images](#container-image) for amd64 and arm64; it needs Docker, so it is not part of `make check`.
+The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check`, which builds the [container images](#container-image) for amd64 and arm64; it needs Docker, so it is not part of `make check`. Another job runs `make helm-lint`, which lints and renders the [Helm chart](#kubernetes-with-helm) with the values in its `ci/` directory and checks that invalid values are rejected; locally it needs `helm` on `PATH`.
 
 `make bench` measures request-path components with allocation counts. It uses in-process fixtures and synthetic credentials; only the shared rate-limiter benchmark contacts Redis, gated on `GATEWAY_TEST_REDIS_URL` as below. [Performance measurements](docs/performance.md) describes the fixtures, baseline results, and comparisons with pinned `benchstat`. CI runs `make bench-check` to exercise the fixtures, without timing thresholds.
 

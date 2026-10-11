@@ -1,0 +1,152 @@
+{{- include "llm-gateway.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "llm-gateway.fullname" . }}
+  labels:
+    {{- include "llm-gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "llm-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "llm-gateway.labels" . | nindent 8 }}
+      annotations:
+        # The gateway reads its files only at startup, so a pricing change
+        # rolls the pods. Changes to the referenced Secrets do not; restart
+        # the Deployment after changing one.
+        checksum/pricing: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "llm-gateway.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Covers the shutdown delay, the HTTP drain, and the cleanup after it.
+      terminationGracePeriodSeconds: {{ .Values.shutdown.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # Makes the mounted clients Secret readable by the gateway's group.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9464
+              protocol: TCP
+          env:
+            - name: GATEWAY_ADDR
+              value: ":8080"
+            # Unauthenticated, and reachable on the pod network; pprof stays
+            # off unless GATEWAY_PPROF is set in env.
+            - name: GATEWAY_METRICS_ADDR
+              value: ":9464"
+            - name: GATEWAY_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+            - name: GATEWAY_CLIENTS_FILE
+              value: /etc/llm-gateway/clients/clients.json
+            - name: GATEWAY_PRICING_FILE
+              value: /etc/llm-gateway/pricing/prices.json
+            - name: GATEWAY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.urlSecret.name }}
+                  key: {{ .Values.database.urlSecret.key }}
+            {{- with .Values.redis.urlSecret }}
+            {{- if .name }}
+            - name: GATEWAY_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .name }}
+                  key: {{ .key }}
+            {{- end }}
+            {{- end }}
+            - name: GATEWAY_SHUTDOWN_DELAY
+              value: "{{ .Values.shutdown.delaySeconds }}s"
+            - name: GATEWAY_SHUTDOWN_TIMEOUT
+              value: "{{ .Values.shutdown.timeoutSeconds }}s"
+            {{- range $name, $p := .Values.providers }}
+            {{- if $p.model }}
+            {{- $prefix := upper $name }}
+            - name: {{ $prefix }}_MODEL
+              value: {{ $p.model | quote }}
+            - name: {{ $prefix }}_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $p.apiKeySecret.name }}
+                  key: {{ $p.apiKeySecret.key }}
+            {{- if $p.baseURL }}
+            - name: {{ $prefix }}_BASE_URL
+              value: {{ $p.baseURL | quote }}
+            {{- end }}
+            {{- if $p.fallback }}
+            - name: {{ $prefix }}_FALLBACK
+              value: {{ $p.fallback | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: clients
+              mountPath: /etc/llm-gateway/clients
+              readOnly: true
+            - name: pricing
+              mountPath: /etc/llm-gateway/pricing
+              readOnly: true
+          # Liveness only checks that the process serves HTTP. Readiness fails
+          # once shutdown begins, never because of PostgreSQL, Redis, or a
+          # provider, so a dependency outage cannot take every pod out of
+          # service.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: clients
+          secret:
+            secretName: {{ .Values.clients.secretName }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.clients.key }}
+                path: clients.json
+        - name: pricing
+          configMap:
+            name: {{ include "llm-gateway.fullname" . }}-pricing
+            items:
+              - key: prices.json
+                path: prices.json
