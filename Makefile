@@ -39,7 +39,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check helm-lint kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check helm-lint terraform-check kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -114,6 +114,14 @@ image-check:
 ## that invalid values are rejected. Needs helm on PATH; not part of check.
 helm-lint:
 	bash deploy/helm/lint.sh
+
+## terraform-check: format, initialize without a backend, validate, and run
+## mocked plans. No AWS credentials; provider downloads need network access.
+terraform-check:
+	terraform fmt -check -recursive deploy/aws
+	terraform -chdir=deploy/aws/bootstrap init -backend=false -input=false -lockfile=readonly
+	terraform -chdir=deploy/aws/bootstrap validate
+	terraform -chdir=deploy/aws/bootstrap test
 
 ## kind-up: create the local cluster if it does not exist, load both images,
 ## and start metrics-server and the disposable PostgreSQL and Redis

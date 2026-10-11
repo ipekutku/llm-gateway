@@ -1,0 +1,10 @@
+# Copy to backend.tf only AFTER the first local apply (see docs/aws.md).
+# Supply the bucket and expected account with terraform init -backend-config.
+terraform {
+  backend "s3" {
+    key          = "bootstrap/terraform.tfstate"
+    region       = "eu-north-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}

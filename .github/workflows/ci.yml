@@ -129,6 +129,25 @@ jobs:
       - name: Lint chart
         run: make helm-lint
 
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+
+      # No backend initialization, credentials, or AWS API calls.
+      - name: Check Terraform
+        run: make terraform-check
+
   kind:
     name: Kubernetes (kind)
     runs-on: ubuntu-latest

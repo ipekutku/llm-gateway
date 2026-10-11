@@ -932,6 +932,57 @@ What they show, and what they do not:
 - **One node, one laptop.** Spreading, drains across nodes, and network partitions are not shown; the load generator, the cluster, and the stores share two CPUs. The numbers demonstrate behavior, not capacity.
 
 
+## AWS infrastructure
+
+Milestone 10 starts with `deploy/aws/bootstrap`, a persistent Terraform root module
+in `eu-north-1`. Terraform 1.16.5 and `hashicorp/aws` 6.68.0 are pinned; the provider
+lock file includes Linux amd64 and both Mac architectures. Terraform is a developer
+tool, outside `go.mod`, and does not change the gateway or its permissions.
+An explicit account ID limits which credentials the provider accepts.
+
+The planned split gives infrastructure two independent lifetimes and state keys:
+
+| Stack | Resources | State key | Lifetime |
+|---|---|---|---|
+| `bootstrap` (implemented) | S3 state bucket, two private ECR repositories | `bootstrap/terraform.tfstate` | Kept between sessions |
+| `platform` (future work) | VPC, EKS, managed data stores, deployment integrations | `platform/terraform.tfstate` | Created for demonstration sessions, then removed |
+
+Both keys use the bootstrap bucket. Only bootstrap exists in this PR; EKS, network
+boundaries, managed dependencies, ingress, and cloud logs have not been deployed.
+Taggable bootstrap resources inherit `Project=llm-gateway`, `Stack=bootstrap`;
+the future platform will use `Stack=platform`.
+
+The state bucket has versioning, explicit SSE-S3/AES256 encryption, all four public
+access blocks, bucket-owner-enforced ownership (ACLs disabled), and a policy denying
+non-TLS access by non-service principals. There is no access-granting bucket policy.
+`prevent_destroy` guards the bucket while its resource block is present, and
+`force_destroy=false` refuses automatic emptying. State versions are retained for
+recovery and can contain secrets in later milestones; protect access accordingly.
+Additional access logs, data-event trails, and paid metrics are outside this bootstrap.
+
+The initial apply uses local state to create the bucket; the operator then copies
+`backend.tf.example` to the gitignored `backend.tf` and migrates state into it.
+The S3 backend uses `use_lockfile=true`, without DynamoDB. A fresh checkout must
+initialize that backend before applying so it finds existing resources. State,
+plans, local variables, and `.terraform/` are gitignored; the provider lock file is
+committed. The [runbook](aws.md) describes migration, reconnecting, and key-scoped
+backend permissions.
+
+ECR holds `llm-gateway` and `llm-gateway-fakeprovider`, with immutable tags, AES256
+encryption, repository-scoped scan-on-push, and one lifecycle rule each retaining
+the newest 10 tagged or untagged images. Bootstrap does not change registry-wide
+scanning or create repository policies or CI roles. Retention can remove an old
+rollback image, so it is a demonstration policy. Basic scans cover OS packages;
+Go vulnerabilities still require `make vuln`. Nonempty repositories cannot be
+force-deleted. Manual local-platform pushes are documented; CI publication and
+multi-platform registry verification are future work.
+
+`make terraform-check` runs formatting, backend-free initialization with a read-only
+lock file, validation, and mocked plans in a separate CI job. The mocked provider
+checks bucket protections, image settings/retention, and account input without
+AWS credentials or API calls. These checks do not establish a live apply, remote
+state migration, scan result, or image push; those remain manual verification.
+
 ## Testing
 
 Automated tests use synthetic credentials, fake upstream HTTP servers, and fake recorders/stores, with no paid provider calls. PostgreSQL integration tests also need a disposable PostgreSQL, named by `GATEWAY_TEST_DATABASE_URL`, and Redis integration tests a disposable Redis, named by `GATEWAY_TEST_REDIS_URL`; without them they are skipped, except in CI, where they fail.

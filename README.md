@@ -1,6 +1,9 @@
 # llm-gateway
 
-[![CI](https://github.com/ipekutku/llm-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/ipekutku/llm-gateway/actions/workflows/ci.yml)
+[![CI](https://github.com/ipekutku/llm-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ipekutku/llm-gateway/actions/workflows/ci.yml?query=branch%3Amain)
+[![Go version](https://img.shields.io/github/go-mod/go-version/ipekutku/llm-gateway?logo=go)](go.mod)
+[![Latest version tag](https://img.shields.io/github/v/tag/ipekutku/llm-gateway?sort=semver&filter=v*&label=version)](https://github.com/ipekutku/llm-gateway/tags)
+[![License](https://img.shields.io/github/license/ipekutku/llm-gateway)](LICENSE)
 
 A production-oriented LLM gateway and AI platform built primarily in Go.
 
@@ -33,7 +36,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Project Status
 
-v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is next. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is in progress, beginning with the [state and image repository bootstrap](docs/aws.md). Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
 
 ```text
 v0.1  Provider abstraction + routing          ✅
@@ -372,6 +375,16 @@ curl -s http://127.0.0.1:18080/v1/chat/completions \
 
 The `demo` client (`deploy/kind/clients.json`, key `synthetic-kind-demo-key`) may send 600 requests per minute, bursts of 20, and 10 at a time; `load` (`synthetic-kind-load-key`) is effectively unlimited, and `limited` (`synthetic-kind-limited-key`) gets bursts of 10, then one request per second. The keys are public: never reuse them, the values, or the stores outside this cluster. With Colima, give the VM at least 4 GiB of memory (`colima start --memory 4`); the default 2 GiB is enough for the cluster but leaves little room for building the images.
 
+### AWS bootstrap
+
+[`deploy/aws/bootstrap`](deploy/aws/bootstrap) provisions a private, versioned,
+encrypted S3 state bucket and two private ECR repositories in `eu-north-1`.
+`make terraform-check` validates it without AWS credentials, including mocked
+plans; Terraform 1.16.5 is required. The [AWS runbook](docs/aws.md) covers account
+setup and costs, the first local apply, migration into S3 with native locking,
+and manually pushing the local images. AWS gateway deployment and automatic
+image publication are not implemented yet.
+
 ### Configuration
 
 | Variable | Description |
@@ -690,7 +703,7 @@ Usage is queried directly in PostgreSQL. [docs/usage.md](docs/usage.md) provides
 
 ## Development
 
-The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check`, which builds the [container images](#container-image) for amd64 and arm64; it needs Docker, so it is not part of `make check`. Another job runs `make helm-lint`, which lints and renders the [Helm chart](#kubernetes-with-helm) with the values in its `ci/` directory and checks that invalid values are rejected; locally it needs `helm` on `PATH`. A fourth job runs `make kind-up kind-deploy kind-check`: it installs the chart in a [kind cluster](#local-kubernetes-with-kind) and sends one completion per provider through it.
+The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check`, which builds the [container images](#container-image) for amd64 and arm64; it needs Docker, so it is not part of `make check`. Another job runs `make helm-lint`, which lints and renders the [Helm chart](#kubernetes-with-helm) with the values in its `ci/` directory and checks that invalid values are rejected; locally it needs `helm` on `PATH`. A fourth job runs `make kind-up kind-deploy kind-check`: it installs the chart in a [kind cluster](#local-kubernetes-with-kind) and sends one completion per provider through it. A fifth runs `make terraform-check` for the [AWS bootstrap](#aws-bootstrap), without AWS credentials.
 
 `make bench` measures request-path components with allocation counts. It uses in-process fixtures and synthetic credentials; only the shared rate-limiter benchmark contacts Redis, gated on `GATEWAY_TEST_REDIS_URL` as below. [Performance measurements](docs/performance.md) describes the fixtures, baseline results, and comparisons with pinned `benchstat`. CI runs `make bench-check` to exercise the fixtures, without timing thresholds.
 
