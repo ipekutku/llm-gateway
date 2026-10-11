@@ -74,6 +74,16 @@ gateway checks its configuration again at startup.
 {{- if and $anthropic.fallback (not (and $openai.model $anthropic.model)) }}
 {{- fail "providers.anthropic.fallback needs both providers configured" }}
 {{- end }}
+{{- with $v.autoscaling }}
+{{- if .enabled }}
+{{- if gt (int .minReplicas) (int .maxReplicas) }}
+{{- fail "autoscaling.minReplicas must not be greater than autoscaling.maxReplicas" }}
+{{- end }}
+{{- if not (and $v.resources $v.resources.requests $v.resources.requests.cpu) }}
+{{- fail "autoscaling needs resources.requests.cpu: utilization is measured against it" }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- $s := $v.shutdown }}
 {{- if lt (int $s.terminationGracePeriodSeconds) (add $s.delaySeconds $s.timeoutSeconds 10 | int) }}
 {{- fail (printf "shutdown.terminationGracePeriodSeconds must be at least delaySeconds + timeoutSeconds + 10 (%d), or the final usage records and spans can be lost" (add $s.delaySeconds $s.timeoutSeconds 10 | int)) }}

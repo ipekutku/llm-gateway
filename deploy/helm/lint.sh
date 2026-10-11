@@ -50,6 +50,11 @@ reject "'/logFormat'" --set logFormat=xml
 reject "additional properties 'replicas' not allowed" --set replicas=2
 reject "'/image/tag'" --set image.tag=
 reject "'/migrations/activeDeadlineSeconds'" --set migrations.activeDeadlineSeconds=0
+reject "minReplicas must not be greater than" --set autoscaling.enabled=true --set autoscaling.minReplicas=5 --set autoscaling.maxReplicas=4
+reject "autoscaling needs resources.requests.cpu" --set autoscaling.enabled=true --set resources.requests.cpu=null
+reject "'/autoscaling/targetCPUUtilizationPercentage'" --set autoscaling.targetCPUUtilizationPercentage=0
+reject "'/podDisruptionBudget/maxUnavailable'" --set podDisruptionBudget.maxUnavailable=0
+reject "'/podDisruptionBudget/maxUnavailable'" --set podDisruptionBudget.maxUnavailable=150%
 
 # render <values file> <expected: present|absent> <text> [helm template arguments...]
 # requires the rendered manifests to contain, or not contain, the text.
@@ -69,6 +74,12 @@ echo "== rendered resources"
 render "$minimal" present "helm.sh/hook: pre-install,pre-upgrade"
 render "$minimal" absent "kind: Job" --set migrations.enabled=false
 render "$chart/ci/full-values.yaml" present "name: gateway-database-owner"
+render "$minimal" present "replicas: 2" --show-only templates/deployment.yaml
+render "$minimal" absent "kind: HorizontalPodAutoscaler"
+render "$minimal" present "maxUnavailable: 1" --show-only templates/pdb.yaml
+render "$chart/ci/full-values.yaml" present "kind: HorizontalPodAutoscaler"
+render "$chart/ci/full-values.yaml" absent "replicas:" --show-only templates/deployment.yaml
+render "$chart/ci/full-values.yaml" present "maxUnavailable: 25%" --show-only templates/pdb.yaml
 # The migration pod must not match the selector of the Deployment and Service.
 if helm template gateway "$chart" -f "$minimal" --show-only templates/migration-job.yaml |
     grep -Eq '^ *app\.kubernetes\.io/name: llm-gateway$'; then

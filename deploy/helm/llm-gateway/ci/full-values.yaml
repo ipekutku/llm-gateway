@@ -1,5 +1,6 @@
 # Every optional setting: both providers with fallbacks and a base URL, a
-# separate migration database URL, Redis,
+# separate migration database URL, autoscaling, a percentage disruption budget,
+# Redis,
 # prices, extra environment variables, and a different shutdown budget.
 image:
   repository: registry.example.com/llm-gateway
@@ -8,6 +9,13 @@ image:
 imagePullSecrets:
   - name: registry
 replicaCount: 3
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
+podDisruptionBudget:
+  maxUnavailable: 25%
 providers:
   openai:
     model: gpt-4o

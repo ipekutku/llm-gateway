@@ -11,6 +11,12 @@ The gateway serves plain HTTP and the Service is ClusterIP only. Put TLS in
 front of it before exposing it outside the cluster. The metrics port ({{ .Values.service.metricsPort }}) is
 unauthenticated; limit who can reach it on the pod network.
 
+{{ if and (not .Values.redis.urlSecret.name) (or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1)) -}}
+Without Redis (redis.urlSecret), every pod enforces each client's rate and
+concurrency limits on its own, so the release admits up to as many times a
+client's limits as it has pods{{ if .Values.autoscaling.enabled }} (up to {{ .Values.autoscaling.maxReplicas }}){{ end }}.
+
+{{ end -}}
 {{ if .Values.migrations.enabled -}}
 Database migrations ran in the {{ include "llm-gateway.fullname" . }}-migrate hook Job before
 this release. Migrations are forward-only: roll forward rather than back.

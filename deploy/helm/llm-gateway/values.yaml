@@ -10,7 +10,23 @@ image:
 
 imagePullSecrets: []
 
-replicaCount: 1
+# Pods when autoscaling is off. Without Redis, each pod enforces every client's
+# limits on its own, so N pods admit up to N times a client's limits.
+replicaCount: 2
+
+# A HorizontalPodAutoscaler on average CPU use relative to the CPU request.
+# Needs the metrics API (metrics-server) and resources.requests.cpu. The
+# gateway mostly waits on providers, so CPU follows load only loosely.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+# Voluntary disruptions, such as node drains, evict at most this many pods at
+# a time: a number, or a percentage such as "25%".
+podDisruptionBudget:
+  maxUnavailable: 1
 
 # Each provider serves exactly one model. Enable at least one by setting its
 # model and the Secret holding its API key.
