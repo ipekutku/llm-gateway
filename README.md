@@ -272,7 +272,7 @@ The request is stored as a synthetic usage row in the development database; `mak
 
 ### Kubernetes with Helm
 
-The chart in [`deploy/helm/llm-gateway`](deploy/helm/llm-gateway) installs a Deployment, a ClusterIP Service with the API and metrics ports, a ServiceAccount without an API token, and a ConfigMap holding the pricing file. It was tested with Helm 4.3.0. PostgreSQL and Redis are not part of it, and it never creates a Secret: create the Secrets first and name them in the values.
+The chart in [`deploy/helm/llm-gateway`](deploy/helm/llm-gateway) installs a Deployment, a ClusterIP Service with the API and metrics ports, a ServiceAccount without an API token, a ConfigMap holding the pricing file, and a Job that applies database migrations before each install and upgrade. It was tested with Helm 4.3.0. PostgreSQL and Redis are not part of it, and it never creates a Secret: create the Secrets first and name them in the values.
 
 ```bash
 kubectl create namespace llm-gateway
@@ -282,7 +282,7 @@ kubectl -n llm-gateway create secret generic llm-gateway-openai --from-literal=a
 kubectl -n llm-gateway create secret generic llm-gateway-clients --from-file=clients.json
 ```
 
-The chart does not migrate the database, and pods fail at startup until the schema is current. Run `migrate` with the same image first, from anywhere that reaches the database (see [Container image](#container-image)). Then install:
+Then install:
 
 ```bash
 helm install llm-gateway deploy/helm/llm-gateway -n llm-gateway \
@@ -293,6 +293,19 @@ helm install llm-gateway deploy/helm/llm-gateway -n llm-gateway \
   --set database.urlSecret.name=llm-gateway-database
 ```
 
+Before Helm changes anything else, a hook Job runs `gateway migrate` with the same image and waits for it, so new pods find the schema they check at startup. A Job that fails, after one retry, fails the install or upgrade, leaves the running Deployment unchanged, and is kept for `kubectl logs job/<release>-llm-gateway-migrate` until the next attempt replaces it; a successful one is deleted. Repeated and concurrent runs are safe: each migration is applied once.
+
+By default the Job uses the gateway's own database URL, which then needs the right to change the schema. To keep the gateway's role limited to reading the migration history and inserting usage records, give the Job a separate owner URL with `migrations.urlSecret.name`, and grant the gateway's role its rights in advance:
+
+```sql
+CREATE ROLE gateway_app LOGIN PASSWORD '...';
+ALTER DEFAULT PRIVILEGES FOR ROLE gateway IN SCHEMA public GRANT SELECT, INSERT ON TABLES TO gateway_app;
+```
+
+Here `gateway` owns the schema and runs the migrations, and `gateway_app` is in `database.urlSecret`.
+
+Migrations are forward-only, and a gateway refuses to start on a schema with migrations it does not know. After an upgrade that adds a migration, pods of the previous version keep serving until they are replaced, but any of them that restarts fails its schema check, and so do the pods of a `helm rollback` to that version: roll forward instead. Set `migrations.enabled=false` to migrate another way, such as with the [container image](#container-image).
+
 [`values.yaml`](deploy/helm/llm-gateway/values.yaml) describes every value; the main ones:
 
 | Value | Default | Description |
@@ -301,6 +314,9 @@ helm install llm-gateway deploy/helm/llm-gateway -n llm-gateway \
 | `providers.<openai\|anthropic>.model`, `.apiKeySecret` | none | Enable a provider with its model and the Secret (`name`, `key`, default `api-key`) holding its key. At least one is required. `.baseURL` and `.fallback` set `<PROVIDER>_BASE_URL` and `<PROVIDER>_FALLBACK`. |
 | `clients.secretName`, `clients.key` | none, `clients.json` | Required. The Secret holding the [clients file](#clients). |
 | `database.urlSecret` | none, key `url` | Required. The Secret holding `GATEWAY_DATABASE_URL`. |
+| `migrations.enabled` | `true` | Run `gateway migrate` as a pre-install and pre-upgrade hook Job. |
+| `migrations.urlSecret` | none, key `url` | Optional. A Secret holding a database URL with the right to change the schema, for the Job only; empty uses `database.urlSecret`. |
+| `migrations.backoffLimit`, `.activeDeadlineSeconds` | `1`, `240` | Retries after a failed run, and the Job's time limit including the image pull; keep it below Helm's `--timeout` (default 5 minutes). |
 | `redis.urlSecret` | none, key `url` | Optional. The Secret holding `GATEWAY_REDIS_URL`; without it each pod limits on its own. |
 | `prices` | `[]` | Price entries as in the pricing file, with prices as quoted strings. |
 | `shutdown.delaySeconds`, `.timeoutSeconds`, `.terminationGracePeriodSeconds` | `5`, `25`, `45` | [Shutdown](#shutdown) settings. The grace period must be at least delay + timeout + 10 seconds; requests running longer than delay + timeout are canceled. |

@@ -47,6 +47,22 @@ database:
     name: ""
     key: url
 
+# A pre-install and pre-upgrade hook Job runs `gateway migrate` with the same
+# image, so pods find a current schema. Disable it to migrate another way.
+migrations:
+  enabled: true
+  # Optional. A Secret holding a database URL with the rights to change the
+  # schema; empty uses database.urlSecret. With it, the gateway's own URL needs
+  # only to read and write usage records.
+  urlSecret:
+    name: ""
+    key: url
+  # Retries after a failed run, such as a database that is briefly unreachable.
+  backoffLimit: 1
+  # Bounds the Job, including pulling the image; keep it below Helm's
+  # --timeout (default 5 minutes), so a stuck Job fails the release.
+  activeDeadlineSeconds: 240
+
 # Optional. The Secret holding the Redis URL for rate limits shared by all
 # replicas; without it, each replica limits on its own. Use rediss:// for any
 # Redis outside the pod.

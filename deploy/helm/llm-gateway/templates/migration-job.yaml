@@ -1,0 +1,70 @@
+{{- if .Values.migrations.enabled }}
+{{- $url := .Values.database.urlSecret }}
+{{- if .Values.migrations.urlSecret.name }}
+{{- $url = .Values.migrations.urlSecret }}
+{{- end }}
+# Applies pending migrations before an install or upgrade changes anything
+# else, so new pods find the schema they check at startup. Migrations take an
+# advisory lock and run in one transaction, so a repeated or concurrent run
+# applies each one once. A failed Job fails the release and is kept for
+# inspection until the next install or upgrade replaces it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "llm-gateway.fullname" . }}-migrate
+  labels:
+    {{- include "llm-gateway.migrationLabels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "llm-gateway.migrationLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      # Hooks run before the release's ServiceAccount exists, so the Job
+      # uses the namespace's default one, without its token.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate"]
+          # migrate reads only the database URL, the log format, and the
+          # OTLP variables, so env passes tracing settings through.
+          env:
+            - name: GATEWAY_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+            - name: GATEWAY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $url.name }}
+                  key: {{ $url.key }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+{{- end }}

@@ -29,7 +29,7 @@
     },
     "seconds": {"type": "integer", "minimum": 0}
   },
-  "required": ["image", "providers", "clients", "database", "redis", "prices", "logFormat", "shutdown", "env", "service", "serviceAccount"],
+  "required": ["image", "providers", "clients", "database", "migrations", "redis", "prices", "logFormat", "shutdown", "env", "service", "serviceAccount"],
   "properties": {
     "image": {
       "type": "object",
@@ -76,6 +76,17 @@
       "additionalProperties": false,
       "required": ["urlSecret"],
       "properties": {"urlSecret": {"$ref": "#/definitions/secretRef"}}
+    },
+    "migrations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "urlSecret", "backoffLimit", "activeDeadlineSeconds"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "urlSecret": {"$ref": "#/definitions/secretRef"},
+        "backoffLimit": {"type": "integer", "minimum": 0},
+        "activeDeadlineSeconds": {"type": "integer", "minimum": 1}
+      }
     },
     "redis": {
       "type": "object",
