@@ -914,7 +914,7 @@ Make key deployment parameters configurable.
 
 **Target version:** `v1.0.0`
 
-**Status:** In progress. The [Terraform bootstrap](aws.md) defines the persistent S3 state bucket and private ECR repositories, with credential-free validation in CI. AWS creation, state migration, and image publication still require manual verification; the platform stack and gateway deployment are not implemented yet.
+**Status:** In progress. The [Terraform bootstrap](aws.md) defines the persistent S3 state bucket and private ECR repositories, with credential-free validation in CI. [Manual bootstrap verification](aws.md#bootstrap-verification--2026-10-11) confirmed a no-change plan, encrypted/versioned S3 state, and both arm64 image pushes with completed basic scans and no findings reported. The platform stack and gateway deployment are not implemented yet.
 
 ## Objective
 

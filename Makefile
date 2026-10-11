@@ -18,7 +18,7 @@ REDIS_PORT ?= 56379
 REDIS_URL := redis://127.0.0.1:$(REDIS_PORT)/0
 
 # Container images (see the Dockerfile). CI builds both platforms without
-# pushing; publishing to a registry is not part of this repository yet.
+# pushing; manual private ECR publication is documented in docs/aws.md.
 IMAGE ?= llm-gateway:dev
 FAKEPROVIDER_IMAGE ?= llm-gateway-fakeprovider:dev
 IMAGE_PLATFORMS := linux/amd64,linux/arm64

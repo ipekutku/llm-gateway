@@ -7,8 +7,8 @@ The roadmap defines the remaining [milestone scope](ROADMAP.md#milestone-10--aws
 
 ## Setup and costs
 
-Use AWS CLI v2, Terraform **1.16.5**, Docker, and `jq`. The AWS provider is pinned
-to **6.68.0**. Kubernetes work later needs `kubectl` and Helm 4.3.0.
+Use AWS CLI v2, Terraform **1.16.5**, Docker with Buildx, and `jq`. The AWS provider
+is pinned to **6.68.0**. Kubernetes work later needs `kubectl` and Helm 4.3.0.
 The current AWS project permits only **eu-north-1**, which is fixed in the provider
 and the backend template. Do not substitute another Region from a pricing example.
 
@@ -140,35 +140,75 @@ overwrite the current version while another Terraform operation is active.
 ## Manually verify image publication
 
 CI still builds images without publishing. After applying bootstrap, build and
-push both local images once. This example is for an arm64 Mac: confirm the built
-architecture, and change the tag suffix on an amd64 machine. Use a unique tag;
-immutable repositories reject overwrites. These single-platform images do not
-establish multi-platform publication.
+push both local images once. Confirm both built images use the same Linux
+architecture; the tag below includes that architecture and a UTC timestamp.
+Use a unique tag; immutable repositories reject overwrites. These single-platform
+images do not establish multi-platform publication.
 
 ```bash
 make image
 docker image inspect llm-gateway:dev llm-gateway-fakeprovider:dev \
   --format '{{.RepoTags}} {{.Os}}/{{.Architecture}}'
-GATEWAY_REPO="$(terraform -chdir=deploy/aws/bootstrap output -json ecr_repository_urls | jq -r '.["llm-gateway"]')"
-FAKEPROVIDER_REPO="$(terraform -chdir=deploy/aws/bootstrap output -json ecr_repository_urls | jq -r '.["llm-gateway-fakeprovider"]')"
+IMAGE_ARCH="$(docker image inspect --format '{{.Architecture}}' llm-gateway:dev)"
+GATEWAY_REPO="$(terraform -chdir=deploy/aws/bootstrap output -json ecr_repository_urls | jq -er '.["llm-gateway"]')"
+FAKEPROVIDER_REPO="$(terraform -chdir=deploy/aws/bootstrap output -json ecr_repository_urls | jq -er '.["llm-gateway-fakeprovider"]')"
 ECR_REGISTRY="${GATEWAY_REPO%/*}"
-IMAGE_TAG="bootstrap-$(git rev-parse HEAD)-arm64"
-aws ecr get-login-password | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+IMAGE_TAG="bootstrap-$(git rev-parse --short=12 HEAD)-$IMAGE_ARCH-$(date -u +%Y%m%dT%H%M%SZ)"
+aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 docker tag llm-gateway:dev "$GATEWAY_REPO:$IMAGE_TAG"
 docker tag llm-gateway-fakeprovider:dev "$FAKEPROVIDER_REPO:$IMAGE_TAG"
 docker push "$GATEWAY_REPO:$IMAGE_TAG"
 docker push "$FAKEPROVIDER_REPO:$IMAGE_TAG"
+```
 
-aws ecr describe-images --repository-name llm-gateway --image-ids "imageTag=$IMAGE_TAG" \
-  --query 'imageDetails[].{Digest:imageDigest,Tags:imageTags,Bytes:imageSizeInBytes}'
-aws ecr describe-images --repository-name llm-gateway-fakeprovider --image-ids "imageTag=$IMAGE_TAG" \
-  --query 'imageDetails[].{Digest:imageDigest,Tags:imageTags,Bytes:imageSizeInBytes}'
-aws ecr wait image-scan-complete --repository-name llm-gateway --image-id "imageTag=$IMAGE_TAG"
-aws ecr describe-image-scan-findings --repository-name llm-gateway --image-id "imageTag=$IMAGE_TAG" \
-  --query '{Status:imageScanStatus,Counts:imageScanFindings.findingSeverityCounts}'
-aws ecr wait image-scan-complete --repository-name llm-gateway-fakeprovider --image-id "imageTag=$IMAGE_TAG"
-aws ecr describe-image-scan-findings --repository-name llm-gateway-fakeprovider --image-id "imageTag=$IMAGE_TAG" \
-  --query '{Status:imageScanStatus,Counts:imageScanFindings.findingSeverityCounts}'
+Keep the same `IMAGE_TAG` and `IMAGE_ARCH` for verification. Docker can publish an
+OCI index even for one runnable platform, with additional attestation manifests.
+The tag then identifies the index, not the image ECR scans; querying it can return
+`ScanNotFoundException` while the platform image's scan is complete. Resolve the
+Linux image for the built architecture and query that digest instead, excluding
+attestations. A plain image manifest uses the tag's digest directly.
+See [Docker's manifest inspection reference](https://docs.docker.com/reference/cli/docker/buildx/imagetools/inspect/).
+
+```bash
+(
+  set -eu
+  set -o pipefail
+  for repository in llm-gateway llm-gateway-fakeprovider; do
+    printf '\nRepository: %s\n' "$repository"
+    TAG_DIGEST="$(aws ecr describe-images \
+      --repository-name "$repository" --image-ids "imageTag=$IMAGE_TAG" \
+      --region eu-north-1 --output json \
+      --query 'imageDetails[0].imageDigest' | jq -er '.')"
+    printf 'Published digest: %s\n' "$TAG_DIGEST"
+    SCAN_DIGEST="$(docker buildx imagetools inspect \
+      --raw "$ECR_REGISTRY/$repository@$TAG_DIGEST" |
+      jq -er --arg arch "$IMAGE_ARCH" --arg digest "$TAG_DIGEST" '
+        if has("manifests") then
+          [.manifests[] |
+            select(.platform.os == "linux" and .platform.architecture == $arch)] |
+          if length == 1 then .[0].digest
+          else error("expected exactly one matching Linux image") end
+        else $digest end')"
+    printf 'Scan digest (linux/%s): %s\n' "$IMAGE_ARCH" "$SCAN_DIGEST"
+    aws ecr wait image-scan-complete \
+      --repository-name "$repository" --image-id "imageDigest=$SCAN_DIGEST" \
+      --region eu-north-1
+    aws ecr describe-image-scan-findings \
+      --repository-name "$repository" --image-id "imageDigest=$SCAN_DIGEST" \
+      --region eu-north-1 --output json \
+      --query '{Image:imageId,Status:imageScanStatus,Counts:imageScanFindings.findingSeverityCounts}'
+  done
+)
+```
+
+The verification subshell stops on errors without exiting your interactive shell.
+Do not mark a failed or missing scan as successful. If the runnable image has no
+scan, inspect `get-registry-scanning-configuration` and the repositories' scanning
+settings before changing configuration or starting a manual scan.
+
+After recording the results, remove the local ECR login:
+
+```bash
 docker logout "$ECR_REGISTRY"
 ```
 
@@ -179,6 +219,30 @@ not Go dependency vulnerabilities, and this manual check is not a CI security ga
 See [AWS basic scanning](https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-scanning-basic.html).
 Authentication expires; use password-stdin and a Docker credential helper to avoid
 keeping registry credentials in plaintext. Reauthenticate when needed.
+
+## Bootstrap verification — 2026-10-11
+
+The operator ran the live checks in `eu-north-1` and supplied their terminal
+results. The verified bootstrap/image revision is `512365bf8eee`; this record
+does not claim another live run for later documentation-only commits.
+
+- The post-apply Terraform plan refreshed all 10 resources and reported no changes.
+- After state migration troubleshooting, `head-object` confirmed
+  `bootstrap/terraform.tfstate` uses `AES256`, with version ID
+  `J6KnrNnX0h0U63nZ2B4ax654KzFH0Bzp`.
+- Both repositories contain tag `bootstrap-512365bf8eee-arm64-20261011T200534Z`.
+  Each tag identifies an OCI index; each `linux/arm64` child scan returned
+  `COMPLETE` with an empty severity-count map (`{}`), meaning no findings reported.
+
+| Repository | Published OCI index digest | Scanned linux/arm64 image digest |
+|---|---|---|
+| `llm-gateway` | `sha256:77eb74a930af5c07e64d4f8a7b6fc429ef5257a302719b91b6e7a97edde9c4a7` | `sha256:136d9db637873b0904fb94672c20e1c56ca73043a00235b70a79eeaf0e94ffd8` |
+| `llm-gateway-fakeprovider` | `sha256:a40627b6d4a939cf945a9d18eb2b06d43a41c69440c8e6b3a0aa22f8db2ffb9e` | `sha256:6f24f0da2bf19a4e61f6cf1430eb5556ebb3ad14278bbe6350d598930eb44842` |
+
+This verifies bootstrap and manual arm64 publication only, not EKS deployment,
+multi-platform publication, lock contention, or Go dependency security. Basic
+scan results are point-in-time OS-package findings, not proof of a vulnerability-free
+application. No state contents, backups, or credentials are included in this record.
 
 ## Validation and provider updates
 
@@ -201,4 +265,4 @@ make terraform-check
 Keep the Terraform CLI version aligned in `versions.tf`, CI, and this runbook.
 Terraform and its provider are development tools; they add no Go dependency or
 gateway runtime permission. Live creation, migration, and image push remain manual
-verification steps until results are recorded.
+verification steps; the bootstrap results above are separate from mocked CI checks.
