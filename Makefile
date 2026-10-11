@@ -23,6 +23,14 @@ IMAGE ?= llm-gateway:dev
 FAKEPROVIDER_IMAGE ?= llm-gateway-fakeprovider:dev
 IMAGE_PLATFORMS := linux/amd64,linux/arm64
 
+# Local Kubernetes in kind (see deploy/kind). kind runs pinned through go run;
+# kubectl and helm must be on PATH. The cluster name, its kubectl context, the
+# namespace, and the release name are also the defaults of deploy/kind/check.sh.
+KIND := go run sigs.k8s.io/kind@v0.33.0
+KIND_CLUSTER := llm-gateway
+KIND_NAMESPACE := llm-gateway
+KUBECTL_KIND := kubectl --context kind-$(KIND_CLUSTER) --namespace $(KIND_NAMESPACE)
+
 # Local Prometheus, Grafana, and Jaeger for a gateway running on the host,
 # and the loopback ports they are published on.
 OBSERVABILITY := docker compose -f deploy/observability/compose.yaml
@@ -31,7 +39,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check helm-lint smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check helm-lint kind-up kind-deploy kind-check kind-down smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -106,6 +114,42 @@ image-check:
 ## that invalid values are rejected. Needs helm on PATH; not part of check.
 helm-lint:
 	bash deploy/helm/lint.sh
+
+## kind-up: create the local cluster if it does not exist, load both images,
+## and start metrics-server and the disposable PostgreSQL and Redis
+kind-up: image
+	@$(KIND) get clusters | grep -qx '$(KIND_CLUSTER)' || \
+		$(KIND) create cluster --name $(KIND_CLUSTER) --config deploy/kind/cluster.yaml --wait 2m
+	$(KIND) load docker-image --name $(KIND_CLUSTER) $(IMAGE) $(FAKEPROVIDER_IMAGE)
+	kubectl --context kind-$(KIND_CLUSTER) apply -k deploy/kind/metrics-server
+	kubectl --context kind-$(KIND_CLUSTER) create namespace $(KIND_NAMESPACE) --dry-run=client -o yaml | \
+		kubectl --context kind-$(KIND_CLUSTER) apply -f -
+	$(KUBECTL_KIND) apply -f deploy/kind/stores.yaml
+	$(KUBECTL_KIND) rollout status deployment/postgres deployment/redis --timeout=5m
+	kubectl --context kind-$(KIND_CLUSTER) -n kube-system rollout status deployment/metrics-server --timeout=5m
+
+## kind-deploy: create the synthetic Secrets and install or upgrade the chart
+## with deploy/kind/values.yaml; the migration hook prepares the database
+kind-deploy:
+	@set -f; for secret in \
+		'llm-gateway-database --from-literal=url=postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable' \
+		'llm-gateway-redis --from-literal=url=redis://redis:6379/0' \
+		'llm-gateway-openai --from-literal=api-key=synthetic-openai-key' \
+		'llm-gateway-anthropic --from-literal=api-key=synthetic-anthropic-key' \
+		'llm-gateway-clients --from-file=clients.json=deploy/kind/clients.json'; do \
+		$(KUBECTL_KIND) create secret generic $$secret --dry-run=client -o yaml | $(KUBECTL_KIND) apply -f - || exit 1; \
+	done
+	helm --kube-context kind-$(KIND_CLUSTER) upgrade --install llm-gateway deploy/helm/llm-gateway \
+		--namespace $(KIND_NAMESPACE) -f deploy/kind/values.yaml --wait --timeout 5m
+
+## kind-check: one chat request per provider through the Service, and the
+## metrics port; needs kubectl and curl
+kind-check:
+	bash deploy/kind/check.sh
+
+## kind-down: delete the local cluster and everything in it
+kind-down:
+	$(KIND) delete cluster --name $(KIND_CLUSTER)
 
 ## smoke: call the REAL provider APIs (costs money; never run in CI).
 ## Needs OPENAI_MODEL and OPENAI_API_KEY, ANTHROPIC_MODEL and

@@ -1,0 +1,11 @@
+{
+  "clients": [
+    {
+      "id": "demo",
+      "key_sha256": "7064e7acfc6a376e10360dc8d63c2fa400766e2efeb4865d7fab8c1348ea9eb6",
+      "requests_per_minute": 600,
+      "burst": 20,
+      "max_concurrent": 10
+    }
+  ]
+}

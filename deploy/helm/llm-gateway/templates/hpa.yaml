@@ -1,7 +1,8 @@
 {{- if .Values.autoscaling.enabled }}
-# Scales on average CPU use relative to the pods' CPU request. Requests spend
-# most of their time waiting on providers, so CPU rises with load only
-# loosely; scaling on requests in flight would need a custom metrics adapter.
+# Scales on the gateway container's average CPU use relative to its CPU
+# request, ignoring sidecars. Requests spend most of their time waiting on
+# providers, so CPU rises with load only loosely; scaling on requests in
+# flight would need a custom metrics adapter.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -16,9 +17,10 @@ spec:
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
   metrics:
-    - type: Resource
-      resource:
+    - type: ContainerResource
+      containerResource:
         name: cpu
+        container: gateway
         target:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
