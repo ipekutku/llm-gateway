@@ -346,7 +346,7 @@ An invalid provider base URL, or an override for a disabled provider, fails conf
 
 The model names above are examples. Any model the provider's API accepts can be configured. The automated tests run both adapters against fake servers built from the providers' documented API formats.
 
-Verified against the live APIs with `make smoke` on 2026-10-10 during the v0.6 closeout. Both models passed normal completion and forced `length` tests with token usage; gateway authentication (unknown and missing keys) and rate limiting also passed:
+Verified against the live APIs with `make smoke` on 2026-10-11 for the v0.8 release, after the base URL settings and the larger upstream idle pool, and before that on 2026-10-10 during the v0.6 closeout. The smoke harness ignores `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`, so it always uses the default production origins through the gateway's real upstream client. Both times, both models passed normal completion and forced `length` tests with token usage; gateway authentication (unknown and missing keys) and rate limiting also passed:
 
 | Configured model | Model reported by the provider | Checked |
 |---|---|---|
@@ -540,7 +540,7 @@ The Makefile defines the verification commands used locally and in GitHub Action
 
 The v0.6 release checks include `TestObservabilityExcludesSensitiveData`: the real handler, router, resilience layers, and adapters call fake upstreams while text/JSON logs, Prometheus output, and exported spans are checked together. It covers both providers, retries, fallback, admission errors, malformed upstream responses, and unexpected protocol field values. Separate tests cover provider redirect isolation, collector error responses, and database errors containing rejected values. No paid calls are needed. Database diagnostics retain operation context and SQLSTATE while omitting server messages and connection details.
 
-Before tagging, run `make check` with the disposable database and Redis enabled as below and require green CI on the merged commit. This verifies behavior and known Go vulnerabilities, not throughput or latency overhead; `make loadtest` is a separate opt-in measurement target. The local stack was exercised with fake traffic during PR 8 (see [verification](docs/architecture.md#local-observability-stack)); the Linux Docker path and container-image vulnerability scanning are not covered by `make check`. The optional live `make smoke` passed for both providers on 2026-10-10 during the v0.6 closeout. That harness does not enable metrics or tracing or persist usage.
+Before tagging, run `make check` with the disposable database and Redis enabled as below and require green CI on the merged commit. This verifies behavior and known Go vulnerabilities, not throughput or latency overhead; `make loadtest` is a separate opt-in measurement target. The local stack was exercised with fake traffic during PR 8 (see [verification](docs/architecture.md#local-observability-stack)); the Linux Docker path and container-image vulnerability scanning are not covered by `make check`. The optional live `make smoke` passed for both providers on 2026-10-11 for the v0.8 release, and on 2026-10-10 during the v0.6 closeout. That harness does not enable metrics or tracing or persist usage.
 
 ### PostgreSQL integration tests
 
