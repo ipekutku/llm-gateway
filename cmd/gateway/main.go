@@ -41,9 +41,11 @@ const (
 	// may stay open between requests.
 	serverIdleTimeout = 2 * time.Minute
 
-	// shutdownTimeout bounds graceful shutdown. In-flight requests still
-	// running afterwards are cut off.
-	shutdownTimeout = 5 * time.Second
+	// cleanupTimeout bounds each cleanup step after the HTTP drain: waiting
+	// for canceled handlers and draining the usage recorder share one budget,
+	// and flushing pending spans has another. Neither depends on how long
+	// requests run, so neither follows GATEWAY_SHUTDOWN_TIMEOUT.
+	cleanupTimeout = 5 * time.Second
 
 	// metricsWriteTimeout bounds writing one metrics response.
 	metricsWriteTimeout = 10 * time.Second
@@ -138,7 +140,7 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	}
 	var active *activeHandlers
 	defer func() {
-		drainCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		drainCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
 		if active != nil {
 			result = errors.Join(result, active.stop(drainCtx))
@@ -185,6 +187,8 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 		slog.Duration("retry_max_delay", cfg.Retry.MaxDelay),
 		slog.Int("breaker_failures", cfg.Breaker.Failures),
 		slog.Duration("breaker_cooldown", cfg.Breaker.Cooldown),
+		slog.Duration("shutdown_delay", cfg.ShutdownDelay),
+		slog.Duration("shutdown_timeout", cfg.ShutdownTimeout),
 		slog.Bool("tracing", cfg.Tracing),
 		slog.String("rate_limits", rateLimitMode(cfg)),
 	)
@@ -200,25 +204,52 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 	attrs = append(attrs, slog.Int("clients", len(cfg.Clients)-disabled), slog.Int("disabled_clients", disabled))
 	logger.Info("gateway listening", attrs...)
 
-	// Both servers shut down when ctx is canceled, and either one failing
-	// stops the other.
-	ctx, stopServers := context.WithCancel(ctx)
+	// Either server failing stops the other one, without the delay.
+	draining, stopping, stopServers := shutdownStages(ctx, cfg.ShutdownDelay, logger)
 	defer stopServers()
 	metricsDone := make(chan error, 1)
 	go func() {
-		err := serve(ctx, newMetricsServer(m.Handler(logger), cfg.Pprof, logger), metricsLn, shutdownTimeout)
+		err := serve(stopping, newMetricsServer(m.Handler(logger), cfg.Pprof, logger), metricsLn, cfg.ShutdownTimeout)
 		stopServers()
 		metricsDone <- err
 	}()
 	// Probes are answered ahead of the handler tracker, tracing, and the API
-	// handler. Readiness follows ctx, which also starts the shutdown.
-	err = serve(ctx, newServer(withProbes(ctx, active), logger), ln, shutdownTimeout)
+	// handler.
+	err = serve(stopping, newServer(withProbes(draining, active), logger), ln, cfg.ShutdownTimeout)
 	stopServers()
 	if metricsErr := <-metricsDone; metricsErr != nil {
 		err = errors.Join(err, fmt.Errorf("metrics: %w", metricsErr))
 	}
 	logger.Info("HTTP servers stopped")
 	return err
+}
+
+// shutdownDelay returns a channel that receives once the shutdown delay
+// has passed. Tests replace it to end the delay themselves.
+var shutdownDelay = time.After
+
+// shutdownStages derives the servers' shutdown from ctx, which a signal
+// cancels. draining ends when shutdown begins; readiness fails from then
+// on. stopping ends when the servers are to stop serving: delay after the
+// signal, so load balancers can stop sending requests before the listeners
+// close. stop ends both at once, cutting a delay short; call it when a
+// server fails, and when the servers are done, to release the stages.
+func shutdownStages(ctx context.Context, delay time.Duration, logger *slog.Logger) (draining, stopping context.Context, stop func()) {
+	draining, drain := context.WithCancel(ctx)
+	stopping, stopServing := context.WithCancel(context.Background())
+	after := shutdownDelay
+	go func() {
+		<-draining.Done()
+		if ctx.Err() != nil {
+			logger.Info("shutting down", slog.Duration("shutdown_delay", delay))
+			select {
+			case <-after(delay):
+			case <-stopping.Done():
+			}
+		}
+		stopServing()
+	}()
+	return draining, stopping, func() { drain(); stopServing() }
 }
 
 // rateLimitMode names where rate limits are kept, for the startup log:

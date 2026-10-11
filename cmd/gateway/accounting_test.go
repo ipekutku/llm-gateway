@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 
 	"github.com/ipekutku/llm-gateway/internal/llm"
@@ -19,15 +19,25 @@ import (
 type fakeStartupStore struct {
 	schemaErr error
 	closed    bool
-	inserted  atomic.Int64
+	mu        sync.Mutex
+	records   []usage.Record
 }
 
 func (s *fakeStartupStore) CheckSchema(context.Context) error { return s.schemaErr }
 func (s *fakeStartupStore) Close()                            { s.closed = true }
 
 func (s *fakeStartupStore) Insert(_ context.Context, records []usage.Record) error {
-	s.inserted.Add(int64(len(records)))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records = append(s.records, records...)
 	return nil
+}
+
+// stored returns the records inserted so far.
+func (s *fakeStartupStore) stored() []usage.Record {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]usage.Record(nil), s.records...)
 }
 
 func runWithFakeDatabase(ctx context.Context, vars map[string]string, logger *slog.Logger) error {

@@ -48,7 +48,7 @@ func newTracerProvider(ctx context.Context, logger *slog.Logger) (*sdktrace.Trac
 
 // startTracing returns the tracer provider if tracing is enabled, or nil,
 // and a function that shuts it down, flushing pending spans within a
-// shutdownTimeout budget of its own.
+// cleanupTimeout budget of its own.
 func startTracing(ctx context.Context, enabled bool, logger *slog.Logger) (trace.TracerProvider, func() error, error) {
 	if !enabled {
 		return nil, func() error { return nil }, nil
@@ -58,7 +58,7 @@ func startTracing(ctx context.Context, enabled bool, logger *slog.Logger) (trace
 		return nil, nil, err
 	}
 	return tp, func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
 		if err := tp.Shutdown(ctx); err != nil {
 			return fmt.Errorf("tracing shutdown: %w", tracingError{err})

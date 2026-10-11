@@ -188,7 +188,7 @@ func TestRunServesProbesWithoutTelemetry(t *testing.T) {
 	case <-time.After(guard):
 		t.Fatal("timed out waiting for shutdown")
 	}
-	if n := store.inserted.Load(); n != 0 {
+	if n := len(store.stored()); n != 0 {
 		t.Errorf("probes stored %d usage records, want 0", n)
 	}
 }
