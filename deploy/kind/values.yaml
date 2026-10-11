@@ -1,7 +1,8 @@
 # Chart values for the local kind cluster (make kind-deploy). Everything here is
-# synthetic: the provider keys, the demo client's key (synthetic-kind-demo-key),
-# and the prices. Both providers point at the fake provider, a sidecar on
-# 127.0.0.1:9000 in each pod; no request leaves the cluster.
+# synthetic: the provider keys, the clients' keys (synthetic-kind-demo-key,
+# synthetic-kind-load-key, synthetic-kind-limited-key), and the prices. Both
+# providers point at the fake provider, a sidecar on 127.0.0.1:9000 in each
+# pod; no request leaves the cluster.
 
 image:
   # Loaded into the cluster by make kind-up, never pulled.
@@ -55,6 +56,9 @@ sidecars:
   - name: fakeprovider
     image: llm-gateway-fakeprovider:dev
     imagePullPolicy: Never
+    # Keeps requests in flight long enough for the shutdown and rollout
+    # demonstrations to matter.
+    args: ["-delay=200ms"]
     resources:
       requests:
         cpu: 10m

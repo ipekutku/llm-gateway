@@ -39,7 +39,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check helm-lint kind-up kind-deploy kind-check kind-down smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check helm-lint kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -146,6 +146,12 @@ kind-deploy:
 ## metrics port; needs kubectl and curl
 kind-check:
 	bash deploy/kind/check.sh
+
+## kind-demo: demonstrate shared limits, shutdown, a rolling restart, a
+## database outage, and autoscaling on the local cluster, after kind-up and
+## kind-deploy (about ten minutes; results in deploy/kind/results, not CI)
+kind-demo:
+	bash deploy/kind/demo.sh
 
 ## kind-down: delete the local cluster and everything in it
 kind-down:
