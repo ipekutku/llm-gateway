@@ -807,7 +807,7 @@ These limits govern the server's own lifecycle and are separate from the upstrea
 
 ## Container image
 
-The root `Dockerfile` builds two targets for `linux/amd64` and `linux/arm64`: `gateway`, the default, and `fakeprovider`, the local fixture for demonstrations and the Kubernetes demo sidecar. `make image` builds both for the local platform and loads them into Docker; `make image-check`, run in CI, builds both for both platforms without loading or pushing them. Publishing to a registry is left to v1.0.
+The root `Dockerfile` builds two targets for `linux/amd64` and `linux/arm64`: `gateway`, the default, and `fakeprovider`, the local fixture for demonstrations and the Kubernetes demo sidecar. `make image` builds both for the local platform and loads them into Docker; `make image-check`, run in CI, builds both for both platforms without loading or pushing them. Milestone 10's bootstrap [verifies manual arm64 publication to private ECR](aws.md#bootstrap-verification--2026-10-11); automatic publication remains future work.
 
 ```text
 build    golang:1.26.9 on the builder's platform → static binaries for the target platform
@@ -868,7 +868,7 @@ Decisions:
 - **Sidecars as native sidecars.** The `sidecars` value adds containers to each pod as init containers with `restartPolicy: Always` (Kubernetes 1.29 or later). They start before the gateway, and on termination the kubelet stops them only after the gateway has exited. As ordinary containers, they would receive `SIGTERM` together with the gateway: a database proxy or the fake provider would go away at the start of the gateway's shutdown delay, while it still accepts requests. The roadmap plan named the value `extraContainers`; the name changed with the semantics. Container names must be unique, and each sidecar brings its own `securityContext` and `resources`; the pod's non-root user and seccomp profile apply to it too.
 - **Per-pod rate limits without Redis.** Each pod enforces every client's limits alone (see [Shared limits in Redis](#shared-limits-in-redis)), so N pods admit up to N times a client's limits, and the limit moves with the replica count. `NOTES.txt` warns when a release can have more than one pod without `redis.urlSecret`.
 - **Requests without limits.** The default requests (100m CPU, 128 MiB) let the scheduler place the pod. No CPU limit, which would throttle a latency-sensitive proxy; no memory limit by default, since the gateway's memory under load has not been measured in a cluster.
-- **Image `llm-gateway:dev` by default.** No image is published yet, and `make image` builds that tag; real deployments set a registry and tag.
+- **Image `llm-gateway:dev` by default.** `make image` builds that local tag; real deployments set a registry and tag. Bootstrap's manual ECR publication does not change the chart defaults.
 - **Helm is a developer tool.** It stays out of `go.mod`. `make helm-lint` runs `deploy/helm/lint.sh`, which lints the chart (`--strict`) and renders it with every `ci/*-values.yaml` (minimal and full), then requires each invalid-value case to fail with its expected message. CI installs Helm 4.3.0 for it.
 
 On 2026-10-11 the chart was also installed with Helm 4.3.0 into a temporary kind v0.27.0 cluster (Kubernetes 1.32.2) under Colima, with the minimal CI values, the `llm-gateway:dev` image, and a disposable PostgreSQL migrated by a one-off pod. The gateway pod became ready; a server-side dry run of the `restricted` Pod Security level reported no violation for it; through the Service, the probes answered `200`, a request without a key `401`, and an unknown model `404`, which was stored as a usage row and counted on the metrics port. Upgrading with a price rolled a new ReplicaSet, and the old pod logged `shutting down`, kept serving for the 5-second delay, drained, and exited. The cluster was deleted afterwards.
@@ -931,6 +931,60 @@ What they show, and what they do not:
 - **CPU is a coarse scaling signal.** Requests here cost little CPU and mostly wait on the fake provider's 200 ms, so 200 requests/s needed only a third pod.
 - **One node, one laptop.** Spreading, drains across nodes, and network partitions are not shown; the load generator, the cluster, and the stores share two CPUs. The numbers demonstrate behavior, not capacity.
 
+
+## AWS infrastructure
+
+Milestone 10 starts with `deploy/aws/bootstrap`, a persistent Terraform root module
+in `eu-north-1`. Terraform 1.16.5 and `hashicorp/aws` 6.68.0 are pinned; the provider
+lock file includes Linux amd64 and both Mac architectures. Terraform is a developer
+tool, outside `go.mod`, and does not change the gateway or its permissions.
+An explicit account ID limits which credentials the provider accepts.
+
+The planned split gives infrastructure two independent lifetimes and state keys:
+
+| Stack | Resources | State key | Lifetime |
+|---|---|---|---|
+| `bootstrap` (implemented) | S3 state bucket, two private ECR repositories | `bootstrap/terraform.tfstate` | Kept between sessions |
+| `platform` (future work) | VPC, EKS, managed data stores, deployment integrations | `platform/terraform.tfstate` | Created for demonstration sessions, then removed |
+
+Both keys use the bootstrap bucket. Only bootstrap exists in this PR; EKS, network
+boundaries, managed dependencies, ingress, and cloud logs have not been deployed.
+Taggable bootstrap resources inherit `Project=llm-gateway`, `Stack=bootstrap`;
+the future platform will use `Stack=platform`.
+
+The state bucket has versioning, explicit SSE-S3/AES256 encryption, all four public
+access blocks, bucket-owner-enforced ownership (ACLs disabled), and a policy denying
+non-TLS access by non-service principals. There is no access-granting bucket policy.
+`prevent_destroy` guards the bucket while its resource block is present, and
+`force_destroy=false` refuses automatic emptying. State versions are retained for
+recovery and can contain secrets in later milestones; protect access accordingly.
+Additional access logs, data-event trails, and paid metrics are outside this bootstrap.
+
+The initial apply uses local state to create the bucket; the operator then copies
+`backend.tf.example` to the gitignored `backend.tf` and migrates state into it.
+The S3 backend uses `use_lockfile=true`, without DynamoDB. A fresh checkout must
+initialize that backend before applying so it finds existing resources. State,
+plans, local variables, and `.terraform/` are gitignored; the provider lock file is
+committed. The [runbook](aws.md) describes migration, reconnecting, and key-scoped
+backend permissions.
+
+ECR holds `llm-gateway` and `llm-gateway-fakeprovider`, with immutable tags, AES256
+encryption, repository-scoped scan-on-push, and one lifecycle rule each retaining
+the newest 10 tagged or untagged images. Bootstrap does not change registry-wide
+scanning or create repository policies or CI roles. Retention can remove an old
+rollback image, so it is a demonstration policy. Basic scans cover OS packages;
+Go vulnerabilities still require `make vuln`. Nonempty repositories cannot be
+force-deleted. Manual arm64 pushes and completed scans with no findings reported
+are [recorded in the runbook](aws.md#bootstrap-verification--2026-10-11). OCI indexes
+are resolved to runnable platform image digests for scan queries, excluding
+attestations. CI publication and multi-platform registry verification are future work.
+
+`make terraform-check` runs formatting, backend-free initialization with a read-only
+lock file, validation, and mocked plans in a separate CI job. The mocked provider
+checks bucket protections, image settings/retention, and account input without
+AWS credentials or API calls. These checks do not establish a live apply, remote
+state migration, scan result, or image push; those remain manual verification,
+separate from the operator-provided bootstrap results in the runbook.
 
 ## Testing
 
