@@ -1,0 +1,9 @@
+# Send only what the image build needs. Everything else stays out of the
+# build context, including .git, local planning notes, load-test results,
+# and any local configuration that may hold credentials.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+**/*_test.go

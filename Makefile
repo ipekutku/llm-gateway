@@ -17,6 +17,12 @@ REDIS_IMAGE := redis:8
 REDIS_PORT ?= 56379
 REDIS_URL := redis://127.0.0.1:$(REDIS_PORT)/0
 
+# Container images (see the Dockerfile). CI builds both platforms without
+# pushing; publishing to a registry is not part of this repository yet.
+IMAGE ?= llm-gateway:dev
+FAKEPROVIDER_IMAGE ?= llm-gateway-fakeprovider:dev
+IMAGE_PLATFORMS := linux/amd64,linux/arm64
+
 # Local Prometheus, Grafana, and Jaeger for a gateway running on the host,
 # and the loopback ports they are published on.
 OBSERVABILITY := docker compose -f deploy/observability/compose.yaml
@@ -25,7 +31,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -81,6 +87,20 @@ build:
 ## vuln: known vulnerabilities reachable from the code (needs network)
 vuln:
 	go run $(GOVULNCHECK) ./...
+
+## image: build the gateway and fake provider images for this machine's
+## platform and load them into Docker as $(IMAGE) and $(FAKEPROVIDER_IMAGE)
+image:
+	docker build -t $(IMAGE) .
+	docker build --target fakeprovider -t $(FAKEPROVIDER_IMAGE) .
+
+## image-check: build both images for amd64 and arm64 without loading or
+## pushing them; the results stay in the build cache. Needs a builder that
+## supports several platforms (the containerd image store, or buildx's
+## docker-container driver, as in CI).
+image-check:
+	docker buildx build --platform $(IMAGE_PLATFORMS) .
+	docker buildx build --platform $(IMAGE_PLATFORMS) --target fakeprovider .
 
 ## smoke: call the REAL provider APIs (costs money; never run in CI).
 ## Needs OPENAI_MODEL and OPENAI_API_KEY, ANTHROPIC_MODEL and

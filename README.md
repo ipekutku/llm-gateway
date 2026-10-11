@@ -205,12 +205,12 @@ export ANTHROPIC_API_KEY=sk-ant-...     # your Anthropic key
 go run ./cmd/gateway
 ```
 
-The gateway listens on `127.0.0.1:8080`, serves Prometheus metrics on `http://127.0.0.1:9464/metrics`, and logs the configured models and the number of clients. Stop it with `Ctrl+C` or `SIGTERM`; in-flight requests get up to 5 seconds to finish, then pending handlers and usage writes share an additional 5-second drain budget.
+The gateway listens on `127.0.0.1:8080`, serves Prometheus metrics on `http://127.0.0.1:9464/metrics`, and logs the configured models and the number of clients. Stop it with `Ctrl+C` or `SIGTERM`; in-flight requests get up to `GATEWAY_SHUTDOWN_TIMEOUT` (default 5 seconds) to finish, then pending handlers and usage writes share an additional 5-second drain budget. See [Shutdown](#shutdown).
 
 Send a request to either model:
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/chat/completions \
+curl -s http://127.0.0.1:18080/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -222,7 +222,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
     "max_tokens": 200
   }'
 
-curl -s http://127.0.0.1:8080/v1/chat/completions \
+curl -s http://127.0.0.1:18080/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -233,6 +233,42 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 The `model` field must match a configured model exactly; the request is routed to that provider and the model name is forwarded unchanged.
+
+### Container image
+
+`make image` builds two images for this machine's platform and loads them into Docker: the gateway, `llm-gateway:dev`, and the local fake provider, `llm-gateway-fakeprovider:dev`. `make image-check` builds both for `linux/amd64` and `linux/arm64` without loading or pushing them, as CI does; locally it needs Docker's containerd image store or a buildx `docker-container` builder. Images are not published to a registry yet.
+
+The images are based on distroless `static`: a static binary, CA certificates, and time zone data, with no shell or package manager. They run as the numeric user `65532`, need no writable root filesystem or Linux capabilities, and set `GATEWAY_ADDR=:8080`, so the API port can be published. The metrics listener stays on `127.0.0.1:9464` inside the container unless `GATEWAY_METRICS_ADDR` says otherwise. There is no Docker `HEALTHCHECK`; use the [health probes](#supported-api). The gateway image is about 32 MB unpacked and 9.5 MB compressed, most of it the 26 MB gateway binary.
+
+The same image applies migrations (`migrate`) and runs the gateway. Settings come from environment variables and files mounted read-only, which must be readable by user `65532`. This example uses the `make db` database, the synthetic load-test client and prices, and the fake provider instead of real providers:
+
+```bash
+make image db
+PG_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' llm-gateway-postgres)
+DB_URL="postgres://gateway:gateway@$PG_IP:5432/gateway?sslmode=disable"
+docker run --rm -e GATEWAY_DATABASE_URL="$DB_URL" llm-gateway:dev migrate
+
+# The gateway shares the fake provider's network namespace, so it reaches the
+# fake over loopback, the only place plain HTTP providers are allowed. Port
+# 18080 avoids a gateway running on the host.
+docker run -d --name fakeprovider -p 127.0.0.1:18080:8080 llm-gateway-fakeprovider:dev
+docker run -d --name gateway --network container:fakeprovider --read-only --cap-drop ALL \
+  -v "$PWD/deploy/loadtest/clients.json:/config/clients.json:ro" \
+  -v "$PWD/deploy/loadtest/prices.json:/config/prices.json:ro" \
+  -e GATEWAY_CLIENTS_FILE=/config/clients.json -e GATEWAY_PRICING_FILE=/config/prices.json \
+  -e GATEWAY_DATABASE_URL="$DB_URL" \
+  -e OPENAI_MODEL=local-openai -e OPENAI_API_KEY=synthetic-openai-key -e OPENAI_BASE_URL=http://127.0.0.1:9000 \
+  llm-gateway:dev
+
+curl -s http://127.0.0.1:18080/readyz
+curl -s http://127.0.0.1:18080/v1/chat/completions \
+  -H 'Authorization: Bearer synthetic-loadtest-key' -H 'Content-Type: application/json' \
+  -d @deploy/loadtest/openai.json
+
+docker stop gateway fakeprovider && docker rm gateway fakeprovider
+```
+
+The request is stored as a synthetic usage row in the development database; `make db-stop` deletes it. For real providers, pass keys from your environment with `-e OPENAI_API_KEY` (no value), so they stay out of shell history; anyone who can run `docker inspect` on the host can still read them. The gateway still serves plain HTTP: publish its port only on loopback, or behind a proxy that terminates TLS.
 
 ### Configuration
 
@@ -551,7 +587,7 @@ Usage is queried directly in PostgreSQL. [docs/usage.md](docs/usage.md) provides
 
 ## Development
 
-The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck).
+The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check`, which builds the [container images](#container-image) for amd64 and arm64; it needs Docker, so it is not part of `make check`.
 
 `make bench` measures request-path components with allocation counts. It uses in-process fixtures and synthetic credentials; only the shared rate-limiter benchmark contacts Redis, gated on `GATEWAY_TEST_REDIS_URL` as below. [Performance measurements](docs/performance.md) describes the fixtures, baseline results, and comparisons with pinned `benchstat`. CI runs `make bench-check` to exercise the fixtures, without timing thresholds.
 
