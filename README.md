@@ -260,6 +260,8 @@ The `model` field must match a configured model exactly; the request is routed t
 | `GATEWAY_PROVIDER_TIMEOUT` | Time a provider with a fallback gets before the fallback takes over. Default half of `GATEWAY_UPSTREAM_TIMEOUT` (`60s`). |
 | `GATEWAY_BREAKER_FAILURES` | Failed requests in a row after which a provider is skipped, from `1` to `100`. Default `5`. |
 | `GATEWAY_BREAKER_COOLDOWN` | How long a provider is skipped before one test request is let through. Default `30s`. |
+| `GATEWAY_SHUTDOWN_DELAY` | After `SIGTERM` or `SIGINT`, how long the gateway keeps serving, with `/readyz` answering `503`, before it stops accepting connections. Gives a load balancer or Kubernetes time to stop sending requests. Default `0`. |
+| `GATEWAY_SHUTDOWN_TIMEOUT` | After the delay, how long requests already running may take to finish before they are canceled. Default `5s`. See [Shutdown](#shutdown). |
 | `GATEWAY_REDIS_URL` | Optional. A `redis://` or `rediss://` URL of a Redis that holds the clients' rate limits, so that several gateway instances share them. Unset means each instance limits on its own. See [Shared rate limits](#shared-rate-limits-with-redis). Treat it as a secret if it contains a password; for any Redis not on the local host, use `rediss://` (TLS). |
 
 For example, to fall back from OpenAI to Anthropic:
@@ -269,6 +271,12 @@ export OPENAI_FALLBACK=anthropic
 ```
 
 A request for `gpt-4o` that OpenAI cannot serve is then answered by `claude-opus-5-5`; the response's `model` field shows which model answered. While a provider is skipped and no fallback can answer, requests fail with `503 provider_unavailable`.
+
+### Shutdown
+
+On `SIGTERM` or `SIGINT`, `/readyz` answers `503` at once, and the gateway keeps serving everything else for `GATEWAY_SHUTDOWN_DELAY`. It then stops accepting connections and lets running requests finish within `GATEWAY_SHUTDOWN_TIMEOUT`; requests still running after that are canceled, and their usage is recorded as `499 client_closed`. Pending usage records and spans are then written, within 5 seconds each. The whole shutdown takes at most the delay plus the timeout plus about 10 seconds, so a process manager's kill timeout, such as Kubernetes' `terminationGracePeriodSeconds`, should be longer than that.
+
+The shutdown timeout is usually much shorter than `GATEWAY_UPSTREAM_TIMEOUT` (default `120s`), so a slow completion can be cut off by a shutdown even though it was still within its own time limit. A second signal during the delay does not shorten it.
 
 ### Provider destinations
 

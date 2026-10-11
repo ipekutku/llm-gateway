@@ -26,8 +26,9 @@ var probeReadTimeout = httpapi.BodyReadTimeout
 // no gateway key and create no request ID, log line, span, metric, or usage
 // record, so frequent probing adds nothing to the telemetry.
 //
-// Readiness depends only on ctx, the context whose cancellation starts the
-// server's shutdown: /readyz answers 503 once it is done. PostgreSQL, Redis,
+// Readiness depends only on ctx, which is done once shutdown begins:
+// /readyz answers 503 from then on, including throughout the shutdown
+// delay, while other requests are still served. PostgreSQL, Redis,
 // and the providers are deliberately not checked; accounting is best-effort,
 // rate limits fall back to local ones, and circuit breakers handle provider
 // failures, so none of them should take the gateway out of service. The

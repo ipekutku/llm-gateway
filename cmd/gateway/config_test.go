@@ -217,6 +217,7 @@ func TestLoadConfig(t *testing.T) {
 		c.ProviderTimeout = defaultUpstreamTimeout / 2
 		c.Retry = defaultRetry
 		c.Breaker = breaker.Settings{Failures: defaultBreakerFailures, Cooldown: defaultBreakerCooldown}
+		c.ShutdownTimeout = defaultShutdownTimeout
 		c.Clients, c.RateLimits = testClients, testRateLimits
 		if c.MetricsAddr == "" {
 			c.MetricsAddr = defaultMetricsAddr
@@ -275,9 +276,30 @@ func TestLoadConfig(t *testing.T) {
 				ProviderTimeout: 22500 * time.Millisecond, // half the upstream timeout
 				Retry:           defaultRetry,
 				Breaker:         breaker.Settings{Failures: defaultBreakerFailures, Cooldown: defaultBreakerCooldown},
+				ShutdownTimeout: defaultShutdownTimeout,
 				Clients:         testClients,
 				RateLimits:      testRateLimits,
 			},
+		},
+		{
+			name: "shutdown delay and timeout",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_SHUTDOWN_DELAY": " 5s ", "GATEWAY_SHUTDOWN_TIMEOUT": "25s",
+			},
+			want: func() config {
+				c := withDefaults(config{Addr: defaultAddr, OpenAI: openaiCfg})
+				c.ShutdownDelay, c.ShutdownTimeout = 5*time.Second, 25*time.Second
+				return c
+			}(),
+		},
+		{
+			name: "explicit zero shutdown delay",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_SHUTDOWN_DELAY": "0",
+			},
+			want: withDefaults(config{Addr: defaultAddr, OpenAI: openaiCfg}),
 		},
 		{
 			name: "custom retry policy",
@@ -502,6 +524,28 @@ func TestLoadConfigErrors(t *testing.T) {
 				"GATEWAY_PROVIDER_TIMEOUT must be a positive duration",
 			},
 		},
+		{
+			name: "invalid shutdown settings",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_SHUTDOWN_DELAY": "-1s", "GATEWAY_SHUTDOWN_TIMEOUT": "0s",
+			},
+			want: []string{
+				"GATEWAY_SHUTDOWN_DELAY must be a duration of zero or more",
+				"GATEWAY_SHUTDOWN_TIMEOUT must be a positive duration",
+			},
+		},
+		{
+			name: "unparsable shutdown settings",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_SHUTDOWN_DELAY": "secret-delay-value", "GATEWAY_SHUTDOWN_TIMEOUT": "25",
+			},
+			want: []string{
+				"GATEWAY_SHUTDOWN_DELAY must be a duration of zero or more",
+				"GATEWAY_SHUTDOWN_TIMEOUT must be a positive duration",
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -514,7 +558,7 @@ func TestLoadConfigErrors(t *testing.T) {
 					t.Errorf("error %q does not contain %q", err, want)
 				}
 			}
-			for _, secret := range []string{openaiKey, anthropicKey} {
+			for _, secret := range []string{openaiKey, anthropicKey, "secret-delay-value"} {
 				if strings.Contains(err.Error(), secret) {
 					t.Errorf("error exposes a secret: %q", err)
 				}

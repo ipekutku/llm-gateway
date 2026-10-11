@@ -56,6 +56,10 @@ const (
 	// maxBreakerFailures bounds GATEWAY_BREAKER_FAILURES.
 	maxBreakerFailures = 100
 
+	// defaultShutdownTimeout bounds the HTTP drain when
+	// GATEWAY_SHUTDOWN_TIMEOUT is unset.
+	defaultShutdownTimeout = 5 * time.Second
+
 	// clientsFileVar names the file of gateway clients.
 	clientsFileVar = "GATEWAY_CLIENTS_FILE"
 	databaseURLVar = "GATEWAY_DATABASE_URL"
@@ -88,6 +92,12 @@ type config struct {
 	Retry retry.Policy
 	// Breaker configures each provider's circuit breaker.
 	Breaker breaker.Settings
+	// ShutdownDelay is how long both servers keep serving after a shutdown
+	// signal, with readiness failing, before their listeners close.
+	ShutdownDelay time.Duration
+	// ShutdownTimeout bounds the HTTP drain after the delay. Requests still
+	// running afterwards are canceled.
+	ShutdownTimeout time.Duration
 	// OpenAI and Anthropic are nil when the provider is disabled.
 	OpenAI    *providerConfig
 	Anthropic *providerConfig
@@ -157,6 +167,12 @@ func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error
 		errs = append(errs, err)
 	}
 	if cfg.Breaker.Cooldown, err = loadDuration(getenv, "GATEWAY_BREAKER_COOLDOWN", defaultBreakerCooldown); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.ShutdownDelay, err = loadDelay(getenv, "GATEWAY_SHUTDOWN_DELAY"); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.ShutdownTimeout, err = loadDuration(getenv, "GATEWAY_SHUTDOWN_TIMEOUT", defaultShutdownTimeout); err != nil {
 		errs = append(errs, err)
 	}
 	// The default leaves half of the request's time for a fallback. An
@@ -429,6 +445,20 @@ func loadDuration(getenv func(string) string, name string, def time.Duration) (t
 	d, err := time.ParseDuration(v)
 	if err != nil || d <= 0 {
 		return 0, fmt.Errorf("%s must be a positive duration such as 30s", name)
+	}
+	return d, nil
+}
+
+// loadDelay parses a non-negative Go duration such as "5s", returning 0 if
+// the variable is absent.
+func loadDelay(getenv func(string) string, name string) (time.Duration, error) {
+	v := strings.TrimSpace(getenv(name))
+	if v == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("%s must be a duration of zero or more, such as 5s", name)
 	}
 	return d, nil
 }
