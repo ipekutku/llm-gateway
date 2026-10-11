@@ -1,0 +1,11 @@
+# The least a release needs: one provider, the clients file, and the database.
+providers:
+  openai:
+    model: gpt-4o
+    apiKeySecret:
+      name: llm-gateway-openai
+clients:
+  secretName: llm-gateway-clients
+database:
+  urlSecret:
+    name: llm-gateway-database

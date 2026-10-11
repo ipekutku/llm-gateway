@@ -1,0 +1,2 @@
+# Values files used only to lint and render the chart in CI.
+ci/

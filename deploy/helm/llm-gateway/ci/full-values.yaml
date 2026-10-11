@@ -1,0 +1,68 @@
+# Every optional setting: both providers with fallbacks and a base URL, Redis,
+# prices, extra environment variables, and a different shutdown budget.
+image:
+  repository: registry.example.com/llm-gateway
+  tag: 0.9.0
+  pullPolicy: Always
+imagePullSecrets:
+  - name: registry
+replicaCount: 3
+providers:
+  openai:
+    model: gpt-4o
+    apiKeySecret:
+      name: provider-keys
+      key: openai
+    baseURL: https://proxy.example.com/openai
+    fallback: anthropic
+  anthropic:
+    model: claude-opus-5-5
+    apiKeySecret:
+      name: provider-keys
+      key: anthropic
+    fallback: openai
+clients:
+  secretName: gateway-clients
+  key: clients
+database:
+  urlSecret:
+    name: gateway-database
+    key: postgres-url
+redis:
+  urlSecret:
+    name: gateway-redis
+    key: redis-url
+prices:
+  - provider: openai
+    model: gpt-4o
+    input: "2.50"
+    cache_read: "1.25"
+    cache_write: "0"
+    output: "10"
+logFormat: text
+shutdown:
+  delaySeconds: 10
+  timeoutSeconds: 60
+  terminationGracePeriodSeconds: 90
+env:
+  - name: GATEWAY_UPSTREAM_TIMEOUT
+    value: 60s
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability.svc:4318
+  - name: OTEL_EXPORTER_OTLP_HEADERS
+    valueFrom:
+      secretKeyRef:
+        name: collector-auth
+        key: headers
+service:
+  port: 80
+  metricsPort: 9100
+serviceAccount:
+  create: false
+  name: gateway
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 512Mi

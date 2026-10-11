@@ -1,0 +1,103 @@
+# Values for the llm-gateway chart. The chart never creates a Secret: every
+# credential is a reference to a Secret you create (see the README).
+
+image:
+  # No image is published yet. `make image` builds llm-gateway:dev; push it to
+  # a registry the cluster can pull from, or load it into a local cluster.
+  repository: llm-gateway
+  tag: dev
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+replicaCount: 1
+
+# Each provider serves exactly one model. Enable at least one by setting its
+# model and the Secret holding its API key.
+providers:
+  openai:
+    # The model name clients request; empty disables the provider.
+    model: ""
+    apiKeySecret:
+      name: ""
+      key: api-key
+    # Optional origin override, such as a proxy: HTTPS, or HTTP on loopback.
+    baseURL: ""
+    # "anthropic" sends failed requests to the Anthropic model.
+    fallback: ""
+  anthropic:
+    model: ""
+    apiKeySecret:
+      name: ""
+      key: api-key
+    baseURL: ""
+    # "openai" sends failed requests to the OpenAI model.
+    fallback: ""
+
+# Required. The Secret holding the clients file: client IDs, SHA-256 hashes
+# of their gateway keys, and their rate limits.
+clients:
+  secretName: ""
+  key: clients.json
+
+# Required. The Secret holding the PostgreSQL URL. Use sslmode=verify-full for
+# any database outside the pod.
+database:
+  urlSecret:
+    name: ""
+    key: url
+
+# Optional. The Secret holding the Redis URL for rate limits shared by all
+# replicas; without it, each replica limits on its own. Use rediss:// for any
+# Redis outside the pod.
+redis:
+  urlSecret:
+    name: ""
+    key: url
+
+# Model prices in USD per million tokens, rendered into the pricing file.
+# Prices are strings. A configured model without a price has unknown costs.
+prices: []
+#  - provider: openai
+#    model: gpt-4o
+#    input: "2.50"
+#    cache_read: "1.25"
+#    cache_write: "0"
+#    output: "10"
+
+# json or text.
+logFormat: json
+
+shutdown:
+  # Seconds the gateway keeps serving after SIGTERM, with readiness failing,
+  # so the pod leaves the Service endpoints before its listener closes.
+  delaySeconds: 5
+  # Seconds requests already running may take to finish after the delay;
+  # requests still running afterwards are canceled.
+  timeoutSeconds: 25
+  # Must be at least delay + timeout + 10 seconds, which the gateway needs to
+  # write pending usage records and spans.
+  terminationGracePeriodSeconds: 45
+
+# Further environment variables, such as GATEWAY_UPSTREAM_TIMEOUT, retry and
+# breaker settings, or OTEL_EXPORTER_OTLP_ENDPOINT to enable tracing. Use
+# valueFrom.secretKeyRef for anything secret. Variables the chart sets from
+# the values above are rejected here.
+env: []
+
+# The Service is ClusterIP only: the gateway serves plain HTTP, so expose it
+# outside the cluster only through something that terminates TLS.
+service:
+  port: 8080
+  # The metrics port is unauthenticated.
+  metricsPort: 9464
+
+serviceAccount:
+  create: true
+  # Defaults to the release's full name.
+  name: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi

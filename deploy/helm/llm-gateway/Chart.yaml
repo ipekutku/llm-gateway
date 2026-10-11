@@ -1,0 +1,11 @@
+apiVersion: v2
+name: llm-gateway
+description: An LLM gateway that serves OpenAI and Anthropic models through one OpenAI-style API.
+type: application
+# The chart's own version; bump it with every change to the chart.
+version: 0.1.0
+# The gateway release the chart is written for.
+appVersion: "0.9.0"
+home: https://github.com/ipekutku/llm-gateway
+sources:
+  - https://github.com/ipekutku/llm-gateway
