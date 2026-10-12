@@ -1,6 +1,8 @@
-# These plans exercise the module without credentials or AWS API calls. The
+# These runs exercise the module without credentials or AWS API calls. The
 # mocked data sources return values shaped like the real ones, which the
-# modules validate (ARNs and IAM policy JSON).
+# modules validate (ARNs and IAM policy JSON). The first run applies against
+# the mocks, so generated IDs are known and assertions can compare them across
+# resources, such as a security group rule's source.
 mock_provider "aws" {
   mock_data "aws_caller_identity" {
     defaults = {
@@ -27,6 +29,42 @@ mock_provider "aws" {
       json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
     }
   }
+
+  mock_data "aws_eks_addon_version" {
+    defaults = {
+      version = "v1.0.0-eksbuild.1"
+    }
+  }
+
+  mock_resource "aws_eks_cluster" {
+    defaults = {
+      arn                   = "arn:aws:eks:eu-north-1:123456789012:cluster/llm-gateway"
+      endpoint              = "https://mock.eks.eu-north-1.amazonaws.com"
+      certificate_authority = [{ data = "bW9jaw==" }]
+    }
+  }
+
+  mock_resource "aws_launch_template" {
+    defaults = {
+      id = "lt-0123456789abcdef0"
+    }
+  }
+
+  mock_resource "aws_iam_role" {
+    defaults = {
+      arn = "arn:aws:iam::123456789012:role/mock"
+    }
+  }
+
+  mock_resource "aws_db_instance" {
+    defaults = {
+      master_user_secret = [{
+        kms_key_id    = "arn:aws:kms:eu-north-1:123456789012:key/mock"
+        secret_arn    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:rds!db-mock"
+        secret_status = "active"
+      }]
+    }
+  }
 }
 
 variables {
@@ -35,7 +73,7 @@ variables {
 }
 
 run "platform" {
-  command = plan
+  command = apply
 
   assert {
     condition     = module.eks.cluster_version == "1.37"
@@ -70,6 +108,117 @@ run "platform" {
       length(aws_vpc_endpoint.s3.route_table_ids) == length(module.vpc.private_route_table_ids)
     )
     error_message = "The private subnets must reach S3 through the free gateway endpoint."
+  }
+
+  assert {
+    condition = (
+      aws_db_instance.postgres.engine == "postgres" &&
+      startswith(aws_db_instance.postgres.engine_version, "18.") &&
+      aws_db_instance.postgres.instance_class == "db.t4g.micro" &&
+      !aws_db_instance.postgres.multi_az &&
+      !aws_db_instance.postgres.publicly_accessible &&
+      aws_db_instance.postgres.storage_encrypted &&
+      aws_db_instance.postgres.parameter_group_name == aws_db_parameter_group.postgres.name &&
+      aws_db_instance.postgres.db_subnet_group_name == aws_db_subnet_group.postgres.name &&
+      toset(aws_db_instance.postgres.vpc_security_group_ids) == toset([aws_security_group.postgres.id])
+    )
+    error_message = "PostgreSQL must be 18 on the Free plan's db.t4g.micro, Single-AZ, private, and encrypted."
+  }
+
+  assert {
+    condition = (
+      aws_db_instance.postgres.manage_master_user_password &&
+      aws_db_instance.postgres.password == null &&
+      aws_db_instance.postgres.password_wo == null
+    )
+    error_message = "RDS must manage the master password, so it never reaches configuration or state."
+  }
+
+  assert {
+    condition = anytrue([
+      for parameter in aws_db_parameter_group.postgres.parameter :
+      parameter.name == "rds.force_ssl" && parameter.value == "1" && parameter.apply_method == "pending-reboot"
+    ])
+    error_message = "PostgreSQL must require TLS with the static parameter's pending-reboot apply method."
+  }
+
+  assert {
+    condition = (
+      aws_db_instance.postgres.backup_retention_period == 0 &&
+      aws_db_instance.postgres.skip_final_snapshot &&
+      aws_db_instance.postgres.delete_automated_backups &&
+      !aws_db_instance.postgres.deletion_protection &&
+      !aws_db_instance.postgres.performance_insights_enabled
+    )
+    error_message = "The session database must leave no backup or snapshot behind and bill nothing extra."
+  }
+
+  assert {
+    condition = (
+      aws_elasticache_replication_group.redis.engine == "valkey" &&
+      aws_elasticache_replication_group.redis.node_type == "cache.t4g.micro" &&
+      aws_elasticache_replication_group.redis.num_cache_clusters == 1 &&
+      aws_elasticache_replication_group.redis.cluster_mode == "disabled" &&
+      !aws_elasticache_replication_group.redis.automatic_failover_enabled &&
+      !aws_elasticache_replication_group.redis.multi_az_enabled &&
+      aws_elasticache_replication_group.redis.snapshot_retention_limit == 0
+    )
+    error_message = "Valkey must be a single cache.t4g.micro node without snapshots."
+  }
+
+  assert {
+    condition = (
+      aws_elasticache_replication_group.redis.transit_encryption_enabled &&
+      aws_elasticache_replication_group.redis.transit_encryption_mode == "required" &&
+      aws_elasticache_replication_group.redis.at_rest_encryption_enabled &&
+      aws_elasticache_replication_group.redis.auth_token == random_password.redis_auth_token.result &&
+      aws_elasticache_replication_group.redis.auth_token_update_strategy == "SET" &&
+      aws_secretsmanager_secret_version.redis_auth_token.secret_string == random_password.redis_auth_token.result &&
+      aws_secretsmanager_secret_version.redis_auth_token.secret_id == aws_secretsmanager_secret.redis_auth_token.id &&
+      aws_elasticache_replication_group.redis.subnet_group_name == aws_elasticache_subnet_group.redis.name &&
+      toset(aws_elasticache_replication_group.redis.security_group_ids) == toset([aws_security_group.redis.id])
+    )
+    error_message = "Valkey must require TLS and encrypt its data."
+  }
+
+  assert {
+    condition = (
+      random_password.redis_auth_token.length == 64 &&
+      !random_password.redis_auth_token.special
+    )
+    error_message = "The AUTH token must be long and alphanumeric, so it fits a rediss:// URL unescaped."
+  }
+
+  assert {
+    condition = (
+      aws_vpc_security_group_ingress_rule.postgres_from_nodes.referenced_security_group_id == module.eks.node_security_group_id &&
+      aws_vpc_security_group_ingress_rule.postgres_from_nodes.security_group_id == aws_security_group.postgres.id &&
+      aws_vpc_security_group_ingress_rule.postgres_from_nodes.ip_protocol == "tcp" &&
+      aws_vpc_security_group_ingress_rule.postgres_from_nodes.from_port == 5432 &&
+      aws_vpc_security_group_ingress_rule.postgres_from_nodes.to_port == 5432 &&
+      aws_vpc_security_group_ingress_rule.redis_from_nodes.referenced_security_group_id == module.eks.node_security_group_id &&
+      aws_vpc_security_group_ingress_rule.redis_from_nodes.security_group_id == aws_security_group.redis.id &&
+      aws_vpc_security_group_ingress_rule.redis_from_nodes.ip_protocol == "tcp" &&
+      aws_vpc_security_group_ingress_rule.redis_from_nodes.from_port == 6379 &&
+      aws_vpc_security_group_ingress_rule.redis_from_nodes.to_port == 6379
+    )
+    error_message = "The data stores must accept only their own port, and only from the nodes."
+  }
+
+  assert {
+    condition = (
+      aws_db_subnet_group.postgres.subnet_ids == toset(module.vpc.private_subnets) &&
+      aws_elasticache_subnet_group.redis.subnet_ids == toset(module.vpc.private_subnets)
+    )
+    error_message = "The data stores must live in the private subnets."
+  }
+
+  assert {
+    condition = alltrue(concat(
+      [for secret in aws_secretsmanager_secret.operator : secret.recovery_window_in_days == 0],
+      [aws_secretsmanager_secret.redis_auth_token.recovery_window_in_days == 0]
+    ))
+    error_message = "Session secrets must be deleted without a recovery window, so the next session can recreate them."
   }
 }
 

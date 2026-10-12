@@ -24,8 +24,30 @@ profile.cov
 go.work
 go.work.sum
 
-# env file
+# Local environment files; sanitized examples/templates remain trackable.
 .env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+!.env.*.sample
+!.env.template
+!.env.*.template
+
+# Local gateway clients file. Public synthetic fixtures under deploy/ stay tracked.
+/clients.json
+
+# Credential directories accidentally copied into the repository root.
+/.aws/
+/.docker/
+/.kube/
+
+# Profiling captures may contain sensitive process information.
+*.prof
+*.pprof
+
+# macOS Finder metadata
+.DS_Store
 
 # Local load-test reports, profiles, logs, and binaries
 /deploy/loadtest/results/

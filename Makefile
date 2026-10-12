@@ -66,7 +66,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check aws-up aws-down aws-leftovers aws-init kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check aws-up aws-down aws-check-stores aws-leftovers aws-init kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -182,13 +182,18 @@ terraform-check:
 	terraform -chdir=deploy/aws/platform validate
 	terraform -chdir=deploy/aws/platform test
 
-## aws-up: create or update the platform (VPC, EKS, nodes) after showing the
+## aws-up: create or update the platform (VPC, EKS, RDS, Valkey, secrets) after showing the
 ## plan for approval, then add the cluster to kubeconfig as llm-gateway-aws.
 ## Bills by the hour until aws-down; apply takes about 15-20 minutes.
 aws-up: aws-init
 	terraform -chdir=$(PLATFORM) apply
 	aws eks update-kubeconfig --region eu-north-1 --name $(AWS_CLUSTER) --alias $(AWS_KUBE_CONTEXT)
 	kubectl --context $(AWS_KUBE_CONTEXT) get nodes -o wide
+
+## aws-check-stores: check private RDS and Valkey connections from a temporary
+## pod, including TLS and authentication failures. Needs a running platform.
+aws-check-stores:
+	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/check-stores.sh
 
 ## aws-down: destroy the platform after showing the plan for approval, and
 ## remove its kubeconfig entries. Bootstrap (state bucket, ECR) is kept.
