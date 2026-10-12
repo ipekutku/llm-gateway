@@ -36,7 +36,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Project Status
 
-v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is in progress, with the [state and image repository bootstrap](docs/aws.md), images published from CI, and an [on-demand EKS cluster](docs/aws.md#platform-sessions) in place. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is in progress, with the [state and image repository bootstrap](docs/aws.md), images published from CI, and an [on-demand EKS cluster](docs/aws.md#platform-sessions) with private RDS and Valkey defined in Terraform. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
 
 ```text
 v0.1  Provider abstraction + routing          ✅
@@ -394,12 +394,20 @@ The `demo` client (`deploy/kind/clients.json`, key `synthetic-kind-demo-key`) ma
 [`deploy/aws/bootstrap`](deploy/aws/bootstrap) provisions a private, versioned,
 encrypted S3 state bucket and two private ECR repositories in `eu-north-1`, kept
 between sessions. [`deploy/aws/platform`](deploy/aws/platform) creates a VPC and
-an EKS 1.37 cluster with two nodes for a working session: `make aws-up` creates
-it (about 13 minutes, about $0.30 per hour while it exists), `make aws-down`
+an EKS 1.37 cluster with two nodes, private PostgreSQL 18 on RDS, and a single
+Valkey node on ElastiCache for a working session. `make aws-up` creates the
+platform; the network and cluster alone took about 13 minutes and cost about
+$0.30 per hour, with the data stores and secrets adding charges. `make aws-down`
 destroys it, and `make aws-leftovers` fails while anything billable remains in
 the Region. The [platform verification](docs/aws.md#platform-verification--2026-10-12)
-covers a full create, inspect, and destroy cycle. `make terraform-check` validates
-both modules with mocked plans, without contacting AWS; Terraform 1.16.5 is required. The [AWS runbook](docs/aws.md) covers account
+covers the network and cluster's create, inspect, and destroy cycle. The data
+stores have mocked Terraform checks; `make aws-check-stores` performs their
+[live TLS and authentication checks](docs/aws.md#check-the-private-data-stores).
+A [store session](docs/aws.md#store-verification--2026-10-12) verified creation of
+all 67 resources, store connections, a no-change plan, and complete teardown
+with no checked leftovers.
+`make terraform-check` validates both modules with mocks, without contacting AWS;
+Terraform 1.16.5 is required. The [AWS runbook](docs/aws.md) covers account
 setup and costs, the first local apply, migration into S3 with native locking,
 and manually pushing the local images. [Live bootstrap verification](docs/aws.md#bootstrap-verification--2026-10-11)
 confirmed a no-change plan, encrypted/versioned remote state, and both arm64 image

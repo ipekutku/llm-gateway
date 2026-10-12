@@ -38,7 +38,12 @@ check "Classic load balancers" elb describe-load-balancers --query 'LoadBalancer
 check "RDS instances" rds describe-db-instances --query 'DBInstances[].DBInstanceIdentifier'
 check "RDS manual snapshots" rds describe-db-snapshots --snapshot-type manual \
 	--query 'DBSnapshots[].DBSnapshotIdentifier'
+check "RDS automated backups" rds describe-db-instance-automated-backups \
+	--query 'DBInstanceAutomatedBackups[].DBInstanceIdentifier'
 check "ElastiCache clusters" elasticache describe-cache-clusters --query 'CacheClusters[].CacheClusterId'
+check "ElastiCache snapshots" elasticache describe-snapshots --query 'Snapshots[].SnapshotName'
+# Billed per secret per month, prorated. Secrets pending deletion are not listed.
+check "Secrets" secretsmanager list-secrets --query 'SecretList[].Name'
 # A VPC costs nothing, but one left over means a destroy did not finish.
 check "Project VPCs" ec2 describe-vpcs \
 	--filters Name=tag:Project,Values=llm-gateway --query 'Vpcs[].VpcId'

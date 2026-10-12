@@ -954,10 +954,11 @@ The split gives infrastructure two independent lifetimes and state keys:
 | Stack | Resources | State key | Lifetime |
 |---|---|---|---|
 | `bootstrap` | S3 state bucket, two private ECR repositories | `bootstrap/terraform.tfstate` | Kept between sessions |
-| `platform` | VPC and EKS today; later managed data stores and deployment integrations | `platform/terraform.tfstate` | Created for working sessions, then destroyed |
+| `platform` | VPC, EKS, RDS PostgreSQL, ElastiCache Valkey, and secret containers | `platform/terraform.tfstate` | Created for working sessions, then destroyed |
 
-Both keys use the bootstrap bucket. The gateway, managed dependencies, ingress,
-and cloud logs have not been deployed. Taggable resources inherit
+Both keys use the bootstrap bucket. The network, cluster, and data stores have
+live creation, connection, and teardown verification. The gateway,
+ingress, and cloud logs have not been deployed. Taggable resources inherit
 `Project=llm-gateway` and `Stack=bootstrap` or `Stack=platform`.
 
 The state bucket has versioning, explicit SSE-S3/AES256 encryption, all four public
@@ -990,7 +991,7 @@ because the project cannot create the identity provider a keyless ECR push needs
 (see [Container image](#container-image)).
 
 `make terraform-check` runs formatting, backend-free initialization with a read-only
-lock file, validation, and mocked plans in a separate CI job. The mocked provider
+lock file, validation, and mocked tests in a separate CI job. The mocked provider
 checks bucket protections, image settings/retention, and account input without
 AWS credentials or API calls. These checks do not establish a live apply, remote
 state migration, scan result, or image push; those remain manual verification,
@@ -1006,7 +1007,7 @@ resources; anything added later is written as plain resources. It also pins the
 ```text
 VPC 10.0.0.0/16, eu-north-1a and eu-north-1b
 ├─ public  10.0.128.0/24, 10.0.129.0/24   internet gateway; one NAT gateway (in 1a)
-├─ private 10.0.0.0/19, 10.0.32.0/19      nodes (later the data stores); default route via the NAT gateway
+├─ private 10.0.0.0/19, 10.0.32.0/19      nodes and data stores; default route via the NAT gateway
 └─ S3 gateway endpoint on the private route table
 EKS 1.37 (STANDARD upgrade policy): API endpoint public for admin_cidr only, private for the nodes
 └─ managed node group: 2 × c7i-flex.large, AL2023 x86_64, on demand, 2–3 nodes
@@ -1057,6 +1058,84 @@ Decisions:
 `make aws-up`, `make aws-down`, and `make aws-leftovers` create, destroy, and
 check a session; the [runbook](aws.md#platform-sessions) describes them, the
 cost, and the [verification](aws.md#platform-verification--2026-10-12).
+
+### Private data stores and secrets
+
+RDS PostgreSQL 18.6 runs on one `db.t4g.micro` with 20 GiB of encrypted gp3
+storage. Its subnet group uses the two private subnets, and its security group
+allows TCP 5432 only from the node security group. `rds.force_ssl=1` rejects
+plaintext connections; clients use `sslmode=verify-full` and the RDS CA bundle.
+RDS generates and manages the master password in Secrets Manager: Terraform
+stores its secret ARN, not the password. RDS deletes that secret with the instance
+([AWS password management](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-secrets-manager.html)).
+
+ElastiCache Valkey 9.1 runs on one `cache.t4g.micro` as a replication group
+without replicas or cluster mode, compatible with the gateway's single-endpoint
+client. Its subnet group uses the same private subnets, and its security group
+allows TCP 6379 only from the node security group. Encryption at rest and TLS in
+`required` mode are explicit. The 64-character alphanumeric AUTH token is generated
+by pinned `hashicorp/random` 3.9.1 and stored in Secrets Manager; both the cache's
+token and the secret version use the same value. `SET` replaces an old token on
+updates. The token is sensitive but **is present in Terraform state**, including
+retained S3 state versions. Only provider keys, clients, and the RDS password stay
+out of that state. State read access must be treated as credential access.
+
+Both stores are session resources, with no replicas, backups, final snapshots,
+or deletion protection; destruction loses all usage rows and rate-limit state.
+They provide no high-availability or disaster-recovery guarantee. Minor engine
+upgrades are disabled for repeatable sessions, and extra monitoring/log exports
+are off. The node security group also admits any other pod or process on those
+nodes; these rules do not distinguish gateway pods from other node workloads.
+
+Terraform creates empty Secrets Manager containers at `llm-gateway/openai-api-key`,
+`llm-gateway/anthropic-api-key`, and `llm-gateway/clients`. The operator writes
+values through the AWS CLI, outside Terraform, and must repopulate them each
+session. Terraform-managed secrets have no recovery window; deletion is
+irreversible and allows their names to be reused, once deletion finishes.
+Secret consumption by the gateway is subsequent work; it still has no AWS role.
+
+`make aws-check-stores` creates a temporary namespace, a credential Secret, and
+a restricted pod that checks RDS with `psql` and Valkey with OpenSSL, then
+deletes the namespace. Credentials are transferred through private temporary
+files and stdin, never arguments or logs. It verifies the RDS certificate and
+hostname. Every Valkey TLS command, including AUTH, travels on an OpenSSL
+connection that checks the CA chain and endpoint hostname before sending
+application bytes. A `postgres:18` container supplies OpenSSL; a separate
+`redis:8` container tests plaintext rejection without receiving the token.
+It also checks rejection of plaintext PostgreSQL,
+unauthenticated Valkey, and plaintext Valkey, and runs a trivial Lua script.
+Connections and pod lifetime are bounded. These checks do not exercise the
+gateway's GCRA/lease scripts or two-replica limits. CI tests Redis 8; Valkey 9.1
+gateway compatibility still requires live deployment checks. See the
+[runbook](aws.md#check-the-private-data-stores) for the live sequence and limitations.
+
+On 2026-10-12, the operator supplied a full store-session verification: 67
+resources created in 11 minutes 14 seconds, both nodes Ready, PostgreSQL 18.6
+over verified TLS 1.3, and Valkey 9.1.0 passing the certificate, AUTH, and Lua
+checks. Plaintext PostgreSQL and unauthenticated Valkey were rejected; plaintext
+Valkey gave no response within the check's 10-second bound. The first plan
+found an apply-method mismatch on `rds.force_ssl`; making `pending-reboot`
+explicit removed it, and the next plan reported no changes with exit code 0.
+All 67 resources were then destroyed, and every leftover category was empty.
+The [runbook record](aws.md#store-verification--2026-10-12) separates these
+results from gateway integration and persistence, which remain unverified.
+That live run preceded the change from separate hostname checks to verifying
+the actual AUTH connection. A second AWS session passed verified AUTH and PING,
+then exposed a Lua reply-parsing bug: a returned string is a RESP bulk string,
+not a status reply. The corrected helper and TLS fixture now validate `$2` and
+`ok`. The operator's live retry passed all checks on PostgreSQL 18.6 and Valkey
+9.1.0, followed by a no-change plan with exit code 0, destruction of all 67
+resources, and an empty leftover report. This verifies the final helper on AWS.
+
+`TestAWSStoreCheck` runs the script with fake external commands and real `jq`,
+checking credential transfer, failed retrieval/validation, failed pods, namespace
+ownership, cleanup failures, and Valkey rejection checks that must not accept
+plaintext replies or tool errors. A local TLS server with real OpenSSL verifies
+successful command exchange and proves that a mismatched hostname or untrusted
+CA prevents any AUTH bytes reaching the server. It needs Bash, jq, and OpenSSL 3,
+but no AWS credentials, cluster, or Docker. Client-image tool availability was
+checked locally with networking disabled; managed-store connections were
+verified separately by the operator's live runs above.
 
 ## Testing
 

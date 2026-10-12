@@ -3,8 +3,9 @@
 Milestone 10 has two Terraform root modules. The persistent bootstrap in
 [`deploy/aws/bootstrap`](../deploy/aws/bootstrap) creates a state bucket and two
 private image repositories. The [platform](#platform-sessions) in
-[`deploy/aws/platform`](../deploy/aws/platform) creates the network and an EKS
-cluster for a working session, then is destroyed. The gateway does not run on AWS yet.
+[`deploy/aws/platform`](../deploy/aws/platform) creates the network, an EKS
+cluster, RDS PostgreSQL, Valkey, and secrets for a working session, then is
+destroyed. The gateway does not run on AWS yet.
 The roadmap defines the remaining [milestone scope](ROADMAP.md#milestone-10--aws-infrastructure).
 
 ## Setup and costs
@@ -32,8 +33,8 @@ can therefore disappear;
 the policy is for this demonstration, not a production retention guarantee.
 State versions are retained without automatic expiration, to allow recovery.
 
-The platform holds the hourly-cost resources: today EKS, two nodes, and a NAT
-gateway; later RDS, ElastiCache, and possibly an ALB. Create it only for working
+The platform holds the hourly-cost resources: EKS, two nodes, a NAT gateway,
+RDS, and ElastiCache; possibly an ALB later. Create it only for working
 sessions, then remove it and check for leftovers (see [Platform sessions](#platform-sessions)).
 Session teardown keeps bootstrap.
 
@@ -299,9 +300,11 @@ pinned `terraform-aws-modules/vpc` 6.7.3 and `terraform-aws-modules/eks` 21.29.0
 modules. State is `platform/terraform.tfstate` in the bootstrap bucket; its
 committed `backend.tf` takes the bucket and account from `make aws-up` and `make aws-down`.
 
-While it exists, the platform costs about **$0.30 per hour**: the EKS control plane
+The network and cluster alone cost about **$0.30 per hour**: the EKS control plane
 ($0.10), two nodes (about $0.08 each), and the NAT gateway with its public address
-(about $0.05), plus NAT data processing per GB. Left running, that is about $7 a day.
+(about $0.05), plus NAT data processing per GB. Left running, that is about $7 a day
+before RDS, Valkey, storage, and Secrets Manager charges. The data stores now
+belong to the same session stack and must also be destroyed at the end.
 
 Authenticate as in [Setup and costs](#setup-and-costs), then set the address
 allowed to reach the Kubernetes API. It must be a /24 or narrower; use your own:
@@ -330,7 +333,8 @@ make aws-leftovers   # fails while anything billable remains
 `aws-leftovers` searches the Region by resource type rather than by tag, so it also
 finds what Terraform does not manage, such as load balancers created by Kubernetes:
 EKS clusters, EC2 instances, EBS volumes, NAT gateways, Elastic IPs, load balancers,
-RDS instances and manual snapshots, ElastiCache clusters, and leftover project VPCs.
+RDS instances, manual snapshots and automated backups, ElastiCache clusters and
+snapshots, Secrets Manager secrets, and leftover project VPCs.
 A NAT gateway can show as deleting for a few minutes; run it again.
 
 Access to the cluster:
@@ -371,27 +375,197 @@ The operator ran the session from a Mac with Terraform 1.16.5 and supplied the r
 This verifies the network, cluster, node group, add-ons, and teardown, not a
 gateway deployment, managed data stores, ingress, or any request traffic.
 
+## Private data stores
+
+The platform also defines PostgreSQL **18.6** on RDS (`db.t4g.micro`, Single-AZ,
+20 GiB encrypted gp3) and **Valkey 9.1** on ElastiCache (`cache.t4g.micro`, one
+node, cluster mode disabled). Both use private subnets; their security groups
+accept only their service port from the EKS node security group, including pods
+on those nodes. They are not reachable directly from the laptop. RDS forces TLS;
+Valkey requires TLS and an AUTH token. There are no backups, replicas, final
+snapshots, or deletion protection: `aws-down` permanently deletes the stores and
+their data. This is a session environment, not a durable production deployment.
+
+Before applying, confirm the pinned engine versions and class are available in
+the project's Region:
+
+```bash
+aws rds describe-orderable-db-instance-options --region eu-north-1 \
+  --engine postgres --engine-version 18.6 --db-instance-class db.t4g.micro \
+  --query 'OrderableDBInstanceOptions[].{Version:EngineVersion,Class:DBInstanceClass,Storage:StorageType}'
+aws elasticache describe-cache-engine-versions --region eu-north-1 \
+  --engine valkey --engine-version 9.1 --query 'CacheEngineVersions[].EngineVersion'
+```
+
+On 2026-10-12, read-only API checks confirmed PostgreSQL 18.6 with `db.t4g.micro`
+and gp3, and Valkey 9.1 in `eu-north-1`. The project was still on the Free plan,
+and `make aws-leftovers` found none of the checked resources. This does not
+establish a successful store creation or connection. Check current plan limits
+before changing classes; engine/class availability alone does not prove that a
+Free-plan apply is permitted.
+
+### Secrets flow
+
+RDS generates its master password and stores it in a service-managed secret.
+Terraform exposes `database_master_secret_arn`, never the password. RDS deletes
+the secret when its instance is deleted; see
+[AWS password management](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-secrets-manager.html).
+
+Terraform generates the Valkey token and writes it to
+`llm-gateway/redis-auth-token`. This token **is in Terraform state**, in both the
+random-password resource and the cache/secret resources, even though plans hide
+it. S3 encryption and private access protect state; old versions retain old
+tokens after destruction. Restrict state access accordingly, and never print
+`terraform show -json` or retrieve secret values into shared terminal output.
+
+The other three secrets are empty containers only:
+
+| Name | Value supplied outside Terraform |
+|---|---|
+| `llm-gateway/openai-api-key` | OpenAI key, or a synthetic AWS demo key for the fake provider |
+| `llm-gateway/anthropic-api-key` | Anthropic key, or a synthetic AWS demo key for the fake provider |
+| `llm-gateway/clients` | Complete clients JSON, containing only SHA-256 key hashes |
+
+Use fresh AWS demo credentials; never reuse the public kind/load-test keys.
+Populate values with the AWS CLI after creation, using a private file rather
+than a literal secret in command arguments or shell history. For example,
+replace the path below with a file readable only by you:
+
+```bash
+aws secretsmanager put-secret-value --region eu-north-1 \
+  --secret-id llm-gateway/clients \
+  --secret-string file:///absolute/path/to/private/clients.json \
+  --query ARN --output text
+```
+
+Use the same command with each provider secret name and a private text file
+containing that key. Values never enter Terraform. Store checks need only the
+RDS-managed secret and generated Valkey token, so these containers can remain
+empty until gateway deployment. All Terraform-created secrets have zero
+recovery days; repopulate them each session. AWS secret deletion is asynchronous;
+if immediate recreation reports an existing name, wait for deletion to finish.
+
+### Check the private data stores
+
+After reviewing the plan and starting a session:
+
+```bash
+make aws-up
+make aws-check-stores
+make aws-down
+make aws-leftovers
+```
+
+Review the additions before approving `aws-up`: one private RDS instance, one
+single-node Valkey replication group, their subnet/security groups, four
+Terraform-managed secret containers, one generated token and its secret version.
+The RDS-managed secret is created by RDS. There is no public database, new IAM
+role, customer-managed KMS key, or gateway deployment in this step.
+
+`aws-check-stores` needs `aws`, `terraform`, `kubectl`, `jq`, and `curl`, with the
+same AWS profile and project as `aws-up`. It uses the `llm-gateway-aws` context,
+creates a unique temporary namespace, and runs a restricted pod with the
+`postgres:18` image for PostgreSQL and OpenSSL, plus a `redis:8` container for
+plaintext rejection. The latter receives no token. Credentials travel through
+private temporary files and stdin into a temporary Kubernetes Secret, without a
+last-applied annotation. Cleanup deletes the namespace and local files; a
+cleanup failure makes the command fail and names the namespace to remove if
+the API was unreachable.
+
+The checks cover a PostgreSQL connection with `sslmode=verify-full` and the
+Region's RDS CA bundle, its negotiated TLS details, rejection without TLS,
+Valkey certificate/hostname verification on every TLS command connection,
+authenticated `PING` and a trivial Lua script over TLS, and rejection without
+AUTH. OpenSSL verifies the certificate before sending AUTH on that same
+connection; it reads the token from stdin. A plaintext Valkey connection
+must close/reset or provide no response within 10 seconds; an application reply
+fails the check. No token is sent on that plaintext connection. Connection
+commands and the pod lifetime have time limits; a failed or unfinished pod
+fails the command.
+
+Record the client output and teardown result after a live run. The
+[store verification below](#store-verification--2026-10-12) covers live TLS and
+authentication; mocked Terraform tests alone do not establish that behavior.
+This step does not run migrations, insert usage
+rows, or test the gateway's shared limits. CI uses Redis 8, while AWS runs Valkey
+9.1; the gateway's GCRA and lease scripts still need the later two-replica
+deployment check before claiming compatibility. If any step fails, still run
+`aws-down` and `aws-leftovers` before ending the session.
+
+### Store verification — 2026-10-12
+
+The operator supplied the live terminal results from `eu-north-1`:
+
+- `make aws-up` created 67 resources in 11 minutes 14 seconds. Both amd64
+  Amazon Linux 2023 nodes were Ready on Kubernetes `v1.37.0-eks`, with no
+  external addresses.
+- `make aws-check-stores` passed. PostgreSQL reported 18.6 on aarch64 and
+  negotiated TLS 1.3 with `TLS_AES_256_GCM_SHA384`; plaintext was rejected.
+  Valkey reported 9.1.0; certificate-chain/hostname verification, authenticated
+  PING, and the trivial Lua check passed. No AUTH was rejected; plaintext
+  produced no response within the 10-second bound. Temporary-pod cleanup
+  completed successfully.
+- The first follow-up plan found one parameter-group update: AWS returned
+  `pending-reboot` for `rds.force_ssl`, while the provider defaulted to
+  `immediate`. Configuration now sets `apply_method="pending-reboot"`
+  explicitly, with a mocked regression assertion. The operator reran
+  `terraform plan -detailed-exitcode`: no changes, exit code 0.
+- `make aws-down` destroyed all 67 resources and removed the AWS kubeconfig
+  entries. `make aws-leftovers` then reported none for every checked category,
+  including RDS backups/snapshots, ElastiCache snapshots, and Secrets Manager
+  secrets. Persistent bootstrap resources were retained. No teardown duration
+  was supplied.
+
+These results establish managed-store connections from an EKS pod, not gateway
+deployment, schema migrations, usage persistence, or shared gateway limits.
+The live run used the earlier helper, which checked the Valkey hostname on a
+separate connection from `redis-cli` AUTH. Security review caught that gap;
+the revised helper sends AUTH through the hostname-verifying OpenSSL connection.
+Local tests with real TLS verify successful AUTH and reject both hostname
+mismatches and untrusted CAs before application data is sent.
+
+In a second session, the operator created all 67 resources again and confirmed
+both nodes Ready. The revised helper passed AUTH and PING over verified TLS,
+plus the PostgreSQL and plaintext-rejection checks, but failed the Lua reply
+check: it expected `+ok` instead of the bulk-string reply `$2\r\nok\r\n` that
+`return 'ok'` produces. The helper and TLS fixture now check the correct reply,
+with regression cases rejecting a status reply, wrong length, or wrong content.
+The Lua return type was also reproduced with local Redis 8. The operator reran
+the corrected helper on the same platform: verified AUTH and PING, the Lua bulk
+reply and content, server versions, the complete command response, and rejection
+without AUTH all passed. PostgreSQL still reported 18.6 over TLS 1.3 and rejected
+plaintext; plaintext Valkey again gave no response within 10 seconds.
+
+The second session's follow-up plan reported no changes with exit code 0.
+`make aws-down` then destroyed all 67 resources and removed the AWS kubeconfig
+entries; `make aws-leftovers` reported none in every checked category, including
+backups, snapshots, and secrets. This verifies the final helper against AWS.
+No second-session creation or teardown durations were supplied.
+
 ## Validation and provider updates
 
 `make terraform-check` checks formatting, then for each module initializes with
 `-backend=false` and `-lockfile=readonly`, validates, and runs mocked Terraform
-plans. Downloads need network access, but no AWS API is contacted. It runs in a
+tests. Downloads need network access, but no AWS API is contacted. It runs in a
 separate CI job and is not part of the Go-only `make check`. Locally, a module
 whose working directory was already initialized with the S3 backend (bootstrap
 after migration, the platform after `aws-up`) asks for AWS credentials even
 then; log in first. The checks do not prove an AWS apply, state migration, or
 push works in this account.
 
-The platform's mocked plans check the Kubernetes version, the absence of an IAM
+The platform's mocked tests check the Kubernetes version, the absence of an IAM
 OIDC provider, KMS key, and control-plane log group, the exact add-on set, two AZs
 with one NAT gateway, and the S3 gateway endpoint; they also require that an open
-or wider than /24 `admin_cidr` and a malformed account ID are rejected.
+or wider than /24 `admin_cidr` and a malformed account ID are rejected. A mocked
+apply makes generated IDs available to check that the stores use the private
+subnets, their own security groups, and node-only ingress, plus encryption,
+password management, token/secret agreement, and session teardown settings.
 
 Commit each module's `.terraform.lock.hcl`; it records the pinned providers'
 checksums for `linux_amd64` (CI), `darwin_arm64`, and `darwin_amd64` (Macs). The
 platform pins `aws` and the providers the EKS module needs (`cloudinit`, `null`,
-`time`, `tls`). After intentionally changing a provider or module version,
-regenerate and review the lock file with:
+`time`, `tls`), plus `random` for the Valkey token. After intentionally changing
+a provider or module version, regenerate and review the lock file with:
 
 ```bash
 terraform -chdir=deploy/aws/<module> providers lock \
