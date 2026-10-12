@@ -66,7 +66,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check aws-up aws-down aws-check-stores aws-leftovers aws-init kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check aws-up aws-down aws-check-stores aws-deploy aws-check aws-leftovers aws-init kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -194,6 +194,18 @@ aws-up: aws-init
 ## pod, including TLS and authentication failures. Needs a running platform.
 aws-check-stores:
 	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/check-stores.sh
+
+## aws-deploy: install External Secrets Operator and the gateway chart on the
+## platform, with the GHCR images of a commit on main (AWS_IMAGE_SHA, default
+## the newest one this branch contains) and session-generated demo secrets.
+## Needs a running platform; rerunning it upgrades in place.
+aws-deploy:
+	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/deploy.sh
+
+## aws-check: completions from both models, metrics, limits shared across two
+## pods through Valkey, and usage records in RDS. Needs aws-deploy.
+aws-check:
+	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/check.sh
 
 ## aws-down: destroy the platform after showing the plan for approval, and
 ## remove its kubeconfig entries. Bootstrap (state bucket, ECR) is kept.

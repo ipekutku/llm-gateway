@@ -33,6 +33,11 @@ output "operator_secret_names" {
   value       = sort([for secret in aws_secretsmanager_secret.operator : secret.name])
 }
 
+output "external_secrets_role_arn" {
+  description = "IAM role External Secrets Operator receives through EKS Pod Identity."
+  value       = aws_iam_role.external_secrets.arn
+}
+
 output "configure_kubectl" {
   description = "Adds the cluster to the local kubeconfig as context llm-gateway-aws."
   value       = "aws eks update-kubeconfig --region eu-north-1 --name ${module.eks.cluster_name} --alias llm-gateway-aws"

@@ -1,0 +1,107 @@
+# Creates or updates gateway_app, the PostgreSQL role the gateway pods log in
+# as (make aws-deploy, before the chart). It may connect, read tables, and
+# insert rows: enough to check the schema version and write usage records,
+# but not to change or delete data or the schema. The migration hook and
+# reports use the RDS master user instead. Default privileges extend the
+# grants to tables later migrations create as the master user. Rerunning it
+# is harmless. The connection settings come from the Secrets External Secrets
+# Operator creates (secrets.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-gateway-database-role
+data:
+  role.sql: |
+    \set ON_ERROR_STOP on
+    -- Terse errors never quote the statement, which holds the password.
+    \set VERBOSITY terse
+    \getenv app_password APP_PASSWORD
+    SELECT 'CREATE ROLE gateway_app' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'gateway_app')
+    \gexec
+    ALTER ROLE gateway_app WITH LOGIN PASSWORD :'app_password';
+    GRANT CONNECT ON DATABASE :"DBNAME" TO gateway_app;
+    GRANT USAGE ON SCHEMA public TO gateway_app;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT ON TABLES TO gateway_app;
+    GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO gateway_app;
+    SELECT 'gateway_app table privileges: ' || coalesce(string_agg(DISTINCT privilege_type, ', ' ORDER BY privilege_type), 'none yet (no tables)')
+    FROM information_schema.role_table_grants WHERE grantee = 'gateway_app';
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llm-gateway-database-role
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 180
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: psql
+          image: postgres:18
+          # Credentials come from the environment, never from arguments.
+          command:
+            - sh
+            - -c
+            - '[ "${#APP_PASSWORD}" -ge 32 ] || { echo "app password missing or short"; exit 1; }; exec psql -X -At -f /sql/role.sql'
+          env:
+            - name: PGHOST
+              valueFrom:
+                secretKeyRef:
+                  name: llm-gateway-database-owner
+                  key: host
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: llm-gateway-database-owner
+                  key: database
+            - name: PGSSLMODE
+              value: verify-full
+            - name: PGSSLROOTCERT
+              value: /etc/llm-gateway/database-ca/ca.pem
+            - name: PGCONNECT_TIMEOUT
+              value: "10"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: llm-gateway-database-owner
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: llm-gateway-database-owner
+                  key: password
+            - name: APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: llm-gateway-database
+                  key: password
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+              readOnly: true
+            - name: database-ca
+              mountPath: /etc/llm-gateway/database-ca
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: sql
+          configMap:
+            name: llm-gateway-database-role
+        - name: database-ca
+          configMap:
+            name: llm-gateway-database-ca
+            items:
+              - key: ca.pem
+                path: ca.pem

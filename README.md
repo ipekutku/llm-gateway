@@ -36,7 +36,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Project Status
 
-v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is in progress, with the [state and image repository bootstrap](docs/aws.md), images published from CI, and an [on-demand EKS cluster](docs/aws.md#platform-sessions) with private RDS and Valkey defined in Terraform. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is in progress, with the [state and image repository bootstrap](docs/aws.md), images published from CI, and an [on-demand EKS cluster](docs/aws.md#platform-sessions) with private RDS and Valkey defined in Terraform, and a [deployment of the gateway](docs/aws.md#deploy-and-check-the-gateway) onto it. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
 
 ```text
 v0.1  Provider abstraction + routing          ✅
@@ -414,7 +414,14 @@ confirmed a no-change plan, encrypted/versioned remote state, and both arm64 ima
 pushes with completed basic scans and no findings reported. CI publishes images
 to GHCR rather than ECR, because the AWS project does not allow the GitHub OIDC
 identity provider that keyless ECR pushes need (see the [runbook](docs/aws.md#ci-images-and-aws-credentials)).
-AWS gateway deployment is not implemented yet.
+`make aws-deploy` installs the chart on the session's cluster with the GHCR
+images of a commit on `main`, pinned to their digests, and the fake provider as
+a sidecar. External Secrets Operator, the only workload with an AWS role (through
+EKS Pod Identity), turns Secrets Manager values into the Secrets the chart
+expects; the gateway logs in to RDS as a role that can only read and insert.
+`make aws-check` checks completions, metrics, limits shared across two pods
+through Valkey, and usage records in RDS. Both have mocked tests, and a
+[live session](docs/aws.md#gateway-verification--2026-10-13) passed them on AWS.
 
 ### Configuration
 

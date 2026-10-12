@@ -220,6 +220,51 @@ run "platform" {
     ))
     error_message = "Session secrets must be deleted without a recovery window, so the next session can recreate them."
   }
+
+  assert {
+    condition = jsondecode(aws_iam_role.external_secrets.assume_role_policy).Statement == [{
+      Effect    = "Allow"
+      Principal = { Service = "pods.eks.amazonaws.com" }
+      Action    = ["sts:AssumeRole", "sts:TagSession"]
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = "123456789012" }
+        ArnEquals    = { "aws:SourceArn" = module.eks.cluster_arn }
+      }
+    }]
+    error_message = "Only EKS Pod Identity may assume the External Secrets role, and only for this cluster and account."
+  }
+
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role_policy.external_secrets.policy).Statement) == 1 &&
+      toset(jsondecode(aws_iam_role_policy.external_secrets.policy).Statement[0].Action) == toset([
+        "secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"
+      ]) &&
+      toset(jsondecode(aws_iam_role_policy.external_secrets.policy).Statement[0].Resource) == toset(concat(
+        [for secret in aws_secretsmanager_secret.operator : secret.arn],
+        [aws_secretsmanager_secret.redis_auth_token.arn, "arn:aws:secretsmanager:eu-north-1:123456789012:secret:rds!db-mock"]
+      )) &&
+      aws_iam_role_policy.external_secrets.role == aws_iam_role.external_secrets.id
+    )
+    error_message = "External Secrets may only read the platform's own secrets, listed by ARN."
+  }
+
+  assert {
+    condition = (
+      aws_eks_pod_identity_association.external_secrets.cluster_name == module.eks.cluster_name &&
+      aws_eks_pod_identity_association.external_secrets.namespace == "external-secrets" &&
+      aws_eks_pod_identity_association.external_secrets.service_account == "external-secrets" &&
+      aws_eks_pod_identity_association.external_secrets.role_arn == aws_iam_role.external_secrets.arn
+    )
+    error_message = "The External Secrets role must belong to the operator's service account only."
+  }
+
+  assert {
+    condition = toset(keys(aws_secretsmanager_secret.operator)) == toset([
+      "openai-api-key", "anthropic-api-key", "clients", "database-app-password"
+    ])
+    error_message = "Terraform must create only containers for the values written outside it."
+  }
 }
 
 run "rejects_open_api_access" {
