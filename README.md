@@ -36,7 +36,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Project Status
 
-v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is in progress, beginning with the [state and image repository bootstrap](docs/aws.md) and images published from CI. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is in progress, with the [state and image repository bootstrap](docs/aws.md), images published from CI, and an [on-demand EKS cluster](docs/aws.md#platform-sessions) in place. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
 
 ```text
 v0.1  Provider abstraction + routing          ✅
@@ -377,12 +377,17 @@ curl -s http://127.0.0.1:18080/v1/chat/completions \
 
 The `demo` client (`deploy/kind/clients.json`, key `synthetic-kind-demo-key`) may send 600 requests per minute, bursts of 20, and 10 at a time; `load` (`synthetic-kind-load-key`) is effectively unlimited, and `limited` (`synthetic-kind-limited-key`) gets bursts of 10, then one request per second. The keys are public: never reuse them, the values, or the stores outside this cluster. With Colima, give the VM at least 4 GiB of memory (`colima start --memory 4`); the default 2 GiB is enough for the cluster but leaves little room for building the images.
 
-### AWS bootstrap
+### AWS infrastructure
 
 [`deploy/aws/bootstrap`](deploy/aws/bootstrap) provisions a private, versioned,
-encrypted S3 state bucket and two private ECR repositories in `eu-north-1`.
-`make terraform-check` validates it without AWS credentials, including mocked
-plans; Terraform 1.16.5 is required. The [AWS runbook](docs/aws.md) covers account
+encrypted S3 state bucket and two private ECR repositories in `eu-north-1`, kept
+between sessions. [`deploy/aws/platform`](deploy/aws/platform) creates a VPC and
+an EKS 1.37 cluster with two nodes for a working session: `make aws-up` creates
+it (about 13 minutes, about $0.30 per hour while it exists), `make aws-down`
+destroys it, and `make aws-leftovers` fails while anything billable remains in
+the Region. The [platform verification](docs/aws.md#platform-verification--2026-10-12)
+covers a full create, inspect, and destroy cycle. `make terraform-check` validates
+both modules with mocked plans, without contacting AWS; Terraform 1.16.5 is required. The [AWS runbook](docs/aws.md) covers account
 setup and costs, the first local apply, migration into S3 with native locking,
 and manually pushing the local images. [Live bootstrap verification](docs/aws.md#bootstrap-verification--2026-10-11)
 confirmed a no-change plan, encrypted/versioned remote state, and both arm64 image
@@ -709,7 +714,7 @@ Usage is queried directly in PostgreSQL. [docs/usage.md](docs/usage.md) provides
 
 ## Development
 
-The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check image-scan`, which builds the [container images](#container-image) for amd64 and arm64 and scans them; it needs Docker, so it is not part of `make check`. On `main`, a final job scans the images again and publishes them with `make image-publish` once every other job has passed. Another job runs `make helm-lint`, which lints and renders the [Helm chart](#kubernetes-with-helm) with the values in its `ci/` directory and checks that invalid values are rejected; locally it needs `helm` on `PATH`. A fourth job runs `make kind-up kind-deploy kind-check`: it installs the chart in a [kind cluster](#local-kubernetes-with-kind) and sends one completion per provider through it. A fifth runs `make terraform-check` for the [AWS bootstrap](#aws-bootstrap), without AWS credentials.
+The Makefile defines the verification commands used locally and in GitHub Actions. `make check` runs `fmt` (gofmt), `vet` (including compilation of the smoke and optional performance probes), `test` (`go test -race -timeout 2m ./...`), `bench-check` (each benchmark once), `build`, and `vuln` (govulncheck). A separate CI job runs `make image-check image-scan`, which builds the [container images](#container-image) for amd64 and arm64 and scans them; it needs Docker, so it is not part of `make check`. On `main`, a final job scans the images again and publishes them with `make image-publish` once every other job has passed. Another job runs `make helm-lint`, which lints and renders the [Helm chart](#kubernetes-with-helm) with the values in its `ci/` directory and checks that invalid values are rejected; locally it needs `helm` on `PATH`. A fourth job runs `make kind-up kind-deploy kind-check`: it installs the chart in a [kind cluster](#local-kubernetes-with-kind) and sends one completion per provider through it. A fifth runs `make terraform-check` for the [AWS modules](#aws-infrastructure), without AWS credentials.
 
 `make bench` measures request-path components with allocation counts. It uses in-process fixtures and synthetic credentials; only the shared rate-limiter benchmark contacts Redis, gated on `GATEWAY_TEST_REDIS_URL` as below. [Performance measurements](docs/performance.md) describes the fixtures, baseline results, and comparisons with pinned `benchstat`. CI runs `make bench-check` to exercise the fixtures, without timing thresholds.
 
