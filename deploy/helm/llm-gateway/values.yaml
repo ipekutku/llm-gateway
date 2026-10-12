@@ -2,8 +2,8 @@
 # credential is a reference to a Secret you create (see the README).
 
 image:
-  # No image is published yet. `make image` builds llm-gateway:dev; push it to
-  # a registry the cluster can pull from, or load it into a local cluster.
+  # `make image` builds llm-gateway:dev for a local cluster. CI publishes
+  # ghcr.io/ipekutku/llm-gateway, tagged with each commit SHA on main.
   repository: llm-gateway
   tag: dev
   pullPolicy: IfNotPresent
@@ -63,6 +63,15 @@ database:
   urlSecret:
     name: ""
     key: url
+  # Optional. A ConfigMap holding the certificate authority that signed the
+  # database's certificate, when it is not a public CA in the image's trust
+  # store, such as Amazon RDS. It is mounted read-only at
+  # /etc/llm-gateway/database-ca/ca.pem in the gateway and migration pods; add
+  # sslmode=verify-full&sslrootcert=/etc/llm-gateway/database-ca/ca.pem to the
+  # database URLs. Restart the Deployment after changing the ConfigMap.
+  caBundle:
+    configMapName: ""
+    key: ca.pem
 
 # A pre-install and pre-upgrade hook Job runs `gateway migrate` with the same
 # image, so pods find a current schema. Disable it to migrate another way.

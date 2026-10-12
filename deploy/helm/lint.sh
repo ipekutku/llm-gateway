@@ -57,6 +57,8 @@ reject "'/podDisruptionBudget/maxUnavailable'" --set podDisruptionBudget.maxUnav
 reject "'/podDisruptionBudget/maxUnavailable'" --set podDisruptionBudget.maxUnavailable=150%
 reject "the container name gateway is already used" --set-json 'sidecars=[{"name":"gateway","image":"proxy:1"}]'
 reject "'/sidecars/0'" --set-json 'sidecars=[{"name":"proxy"}]'
+reject "'/database/caBundle/key'" --set database.caBundle.configMapName=rds-ca --set database.caBundle.key=
+reject "additional properties 'name' not allowed" --set database.caBundle.name=rds-ca
 
 # render <values file> <expected: present|absent> <text> [helm template arguments...]
 # requires the rendered manifests to contain, or not contain, the text.
@@ -85,6 +87,14 @@ render "$chart/ci/full-values.yaml" present "maxUnavailable: 25%" --show-only te
 render "$chart/ci/full-values.yaml" present "restartPolicy: Always" --show-only templates/deployment.yaml
 render "$minimal" absent "initContainers:" --show-only templates/deployment.yaml
 render "$chart/ci/full-values.yaml" present "container: gateway" --show-only templates/hpa.yaml
+# The CA bundle is mounted at the same path in the gateway and migration pods,
+# and nothing is mounted without it.
+for template in deployment migration-job; do
+    render "$minimal" absent "database-ca" --show-only "templates/$template.yaml"
+    render "$chart/ci/full-values.yaml" present "mountPath: /etc/llm-gateway/database-ca" --show-only "templates/$template.yaml"
+    render "$chart/ci/full-values.yaml" present "name: rds-ca" --show-only "templates/$template.yaml"
+    render "$chart/ci/full-values.yaml" present "key: global-bundle.pem" --show-only "templates/$template.yaml"
+done
 # The migration pod must not match the selector of the Deployment and Service.
 if helm template gateway "$chart" -f "$minimal" --show-only templates/migration-job.yaml |
     grep -Eq '^ *app\.kubernetes\.io/name: llm-gateway$'; then

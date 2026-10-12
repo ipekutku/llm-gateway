@@ -319,6 +319,17 @@ ALTER DEFAULT PRIVILEGES FOR ROLE gateway IN SCHEMA public GRANT SELECT, INSERT 
 
 Here `gateway` owns the schema and runs the migrations, and `gateway_app` is in `database.urlSecret`.
 
+`sslmode=verify-full` checks the database's certificate against the image's trust store, which holds only public CAs. A database whose certificate comes from a private CA, such as Amazon RDS, needs that CA's bundle: put it in a ConfigMap, name it in `database.caBundle`, and point `sslrootcert` in both database URLs at the path where the chart mounts it, in the gateway pods and the migration Job alike:
+
+```bash
+curl -fsSLo global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+kubectl -n llm-gateway create configmap rds-ca --from-file=ca.pem=global-bundle.pem
+# URL: postgres://...?sslmode=verify-full&sslrootcert=/etc/llm-gateway/database-ca/ca.pem
+helm upgrade ... --set database.caBundle.configMapName=rds-ca
+```
+
+Without the bundle, or with the wrong one, the connection fails rather than falling back to an unverified one. The chart cannot see changes to the ConfigMap, so restart the Deployment after replacing it.
+
 Migrations are forward-only, and a gateway refuses to start on a schema with migrations it does not know. After an upgrade that adds a migration, pods of the previous version keep serving until they are replaced, but any of them that restarts fails its schema check, and so do the pods of a `helm rollback` to that version: roll forward instead. Set `migrations.enabled=false` to migrate another way, such as with the [container image](#container-image).
 
 [`values.yaml`](deploy/helm/llm-gateway/values.yaml) describes every value; the main ones:
@@ -329,6 +340,7 @@ Migrations are forward-only, and a gateway refuses to start on a schema with mig
 | `providers.<openai\|anthropic>.model`, `.apiKeySecret` | none | Enable a provider with its model and the Secret (`name`, `key`, default `api-key`) holding its key. At least one is required. `.baseURL` and `.fallback` set `<PROVIDER>_BASE_URL` and `<PROVIDER>_FALLBACK`. |
 | `clients.secretName`, `clients.key` | none, `clients.json` | Required. The Secret holding the [clients file](#clients). |
 | `database.urlSecret` | none, key `url` | Required. The Secret holding `GATEWAY_DATABASE_URL`. |
+| `database.caBundle` | none, key `ca.pem` | Optional. A ConfigMap (`configMapName`, `key`) with the CA that signed the database's certificate, mounted read-only at `/etc/llm-gateway/database-ca/ca.pem` in the gateway and migration pods; name that path in `sslrootcert` (see above). |
 | `migrations.enabled` | `true` | Run `gateway migrate` as a pre-install and pre-upgrade hook Job. |
 | `migrations.urlSecret` | none, key `url` | Optional. A Secret holding a database URL with the right to change the schema, for the Job only; empty uses `database.urlSecret`. |
 | `migrations.backoffLimit`, `.activeDeadlineSeconds` | `1`, `240` | Retries after a failed run, and the Job's time limit including the image pull; keep it below Helm's `--timeout` (default 5 minutes). |
