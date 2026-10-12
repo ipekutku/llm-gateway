@@ -954,11 +954,11 @@ The split gives infrastructure two independent lifetimes and state keys:
 | Stack | Resources | State key | Lifetime |
 |---|---|---|---|
 | `bootstrap` | S3 state bucket, two private ECR repositories | `bootstrap/terraform.tfstate` | Kept between sessions |
-| `platform` | VPC, EKS, RDS PostgreSQL, ElastiCache Valkey, and secret containers | `platform/terraform.tfstate` | Created for working sessions, then destroyed |
+| `platform` | VPC, EKS, RDS PostgreSQL, ElastiCache Valkey, secret containers, and the External Secrets role | `platform/terraform.tfstate` | Created for working sessions, then destroyed |
 
 Both keys use the bootstrap bucket. The network, cluster, and data stores have
-live creation, connection, and teardown verification. The gateway,
-ingress, and cloud logs have not been deployed. Taggable resources inherit
+live creation, connection, and teardown verification. The [gateway deployment](#gateway-on-eks)
+is implemented with mocked checks; ingress and cloud logs are not implemented. Taggable resources inherit
 `Project=llm-gateway` and `Stack=bootstrap` or `Stack=platform`.
 
 The state bucket has versioning, explicit SSE-S3/AES256 encryption, all four public
@@ -1088,11 +1088,13 @@ are off. The node security group also admits any other pod or process on those
 nodes; these rules do not distinguish gateway pods from other node workloads.
 
 Terraform creates empty Secrets Manager containers at `llm-gateway/openai-api-key`,
-`llm-gateway/anthropic-api-key`, and `llm-gateway/clients`. The operator writes
-values through the AWS CLI, outside Terraform, and must repopulate them each
-session. Terraform-managed secrets have no recovery window; deletion is
-irreversible and allows their names to be reused, once deletion finishes.
-Secret consumption by the gateway is subsequent work; it still has no AWS role.
+`llm-gateway/anthropic-api-key`, `llm-gateway/clients`, and
+`llm-gateway/database-app-password`. Their values are written through the AWS
+API, outside Terraform: `make aws-deploy` fills empty ones each session (see
+[Gateway on EKS](#gateway-on-eks)), and an operator may write real values first.
+Terraform-managed secrets have no recovery window; deletion is irreversible and
+allows their names to be reused, once deletion finishes. The gateway still has
+no AWS role; External Secrets Operator reads the secrets for it.
 
 `make aws-check-stores` creates a temporary namespace, a credential Secret, and
 a restricted pod that checks RDS with `psql` and Valkey with OpenSSL, then
@@ -1105,8 +1107,9 @@ application bytes. A `postgres:18` container supplies OpenSSL; a separate
 It also checks rejection of plaintext PostgreSQL,
 unauthenticated Valkey, and plaintext Valkey, and runs a trivial Lua script.
 Connections and pod lifetime are bounded. These checks do not exercise the
-gateway's GCRA/lease scripts or two-replica limits. CI tests Redis 8; Valkey 9.1
-gateway compatibility still requires live deployment checks. See the
+gateway's GCRA/lease scripts or two-replica limits. CI tests Redis 8; the
+[gateway verification](aws.md#gateway-verification--2026-10-13) later ran the
+gateway's scripts on Valkey 9.1.0 across two pods. See the
 [runbook](aws.md#check-the-private-data-stores) for the live sequence and limitations.
 
 On 2026-10-12, the operator supplied a full store-session verification: 67
@@ -1136,6 +1139,91 @@ CA prevents any AUTH bytes reaching the server. It needs Bash, jq, and OpenSSL 3
 but no AWS credentials, cluster, or Docker. Client-image tool availability was
 checked locally with networking disabled; managed-store connections were
 verified separately by the operator's live runs above.
+
+### Gateway on EKS
+
+`make aws-deploy` installs the unchanged chart on the platform with
+`deploy/aws/values.yaml`; `deploy/aws/deploy.sh` does the work in this order:
+
+```text
+GHCR images for a main commit ──(digest)──► helm upgrade --install llm-gateway
+Secrets Manager ──GetSecretValue──► External Secrets Operator ──► Kubernetes Secrets
+  (Pod Identity role: six secrets, read-only)                         │
+RDS CA bundle (truststore.pki.rds.amazonaws.com) ──► ConfigMap ───────┤
+                                                                      ▼
+database role Job (master user) ──► migration hook (master user) ──► gateway pods (gateway_app)
+```
+
+- **Images.** The chart runs `ghcr.io/ipekutku/llm-gateway` and the fake provider
+  sidecar from one commit on `main`, by default the newest one the working branch
+  contains (`AWS_IMAGE_SHA` overrides it). The SHA tag is resolved to its index
+  digest at deploy time and passed as `<sha>@sha256:…`, so a moved GHCR tag cannot
+  change what runs. Code on an unmerged branch is not deployed. Pulls go through
+  the NAT gateway, about 10 MB per image and node.
+- **Secrets.** External Secrets Operator 2.12.0, pinned by chart version and
+  digest, is the only workload with AWS permissions. Its role, created by
+  Terraform, trusts only `pods.eks.amazonaws.com` with `aws:SourceAccount` and
+  this cluster's `aws:SourceArn`, and allows `GetSecretValue` and
+  `DescribeSecret` on exactly the four containers, the Valkey token, and the
+  RDS-managed master secret, by ARN. EKS Pod Identity binds it to the operator's
+  service account in `external-secrets`; no OIDC provider is involved. A
+  namespaced SecretStore in `llm-gateway` uses the operator's identity. Its
+  ExternalSecrets template the database URLs, with the password URL-encoded as a
+  query parameter, `verify-full`, and the CA path, and the `rediss://` URL from
+  the token, and copy the clients file and provider keys. The results are exactly
+  the Secrets the chart already references, so the chart has no AWS-specific
+  value. The gateway reads them at startup; changed values need a restart.
+- **Database roles.** The gateway logs in as `gateway_app`, which may connect,
+  `SELECT`, and `INSERT`, enough for the startup schema check and usage records,
+  but cannot update, delete, truncate, or change the schema. A Job running `psql`
+  as the RDS master user creates or updates it before the chart is installed, with
+  the password from `llm-gateway/database-app-password`; default privileges
+  extend the grants to tables later migrations create. Migrations (the chart's
+  `migrations.urlSecret`) and reports use the master user. psql reads every
+  credential from the environment and reports errors tersely, so a failing
+  statement is not echoed with the password; PostgreSQL's own server log would
+  still record such a statement, and it is not exported.
+- **Demo values.** Each session, `aws-deploy` fills empty secrets only: synthetic
+  provider keys (the fake provider ignores them), a random 64-character hex app
+  password, and two random client keys whose SHA-256 hashes form the clients file.
+  The plaintext keys exist only in the gitignored `deploy/aws/session/` (mode
+  0600) for `make aws-check`; values travel through private files, never command
+  arguments. A secret that already has a value is never replaced.
+- **Network.** Nothing new is exposed: the Service stays `ClusterIP`, and the
+  checks use `kubectl port-forward` through the restricted API endpoint. Pods
+  reach RDS and Valkey through the node security group rules above; both
+  providers point at the sidecar on loopback, so requests never leave the pod.
+
+`make aws-check` sends one completion per model through the Service, checks the
+request and `gateway_ratelimit_store_up 1` on that pod's metrics, sends 30
+requests for an unconfigured model alternating between two pods as a client with
+bursts of 10 refilling once per 10 seconds, requiring 10 or 11 admitted in total
+(per-pod limits would admit about 20), and reads both completions' usage records
+from RDS with a temporary `psql` pod. That last pair is the live test of the
+gateway's GCRA and lease scripts on Valkey 9.1, which CI covers only on Redis 8.
+
+`TestAWSDeploy` and `TestAWSCheck` run both scripts with fake external commands:
+pinned images and operator chart, only empty secrets filled, client hashes
+matching the session keys, the role Job before the chart, no credential in any
+output or command argument, and failure on a missing image, unsynced secrets,
+a failed role Job, unshared limits, a client still refilling, local-limit mode,
+or missing usage records. `TestAWSSecretTemplates` renders the URL templates as
+the operator does (`text/template`, `missingkey=error`) and parses them back with
+a password full of URL metacharacters; `TestAWSExternalSecretsIdentity` keeps the
+operator's namespace and service account equal to the Pod Identity association.
+The Terraform tests check the role's trust and policy, and `make helm-lint`
+renders the EKS values. The role SQL was run against a local PostgreSQL 18 with a
+non-superuser owner, where `gateway_app` could read and insert but not update,
+delete, truncate, drop, or create tables. A live session on 2026-10-13 then
+deployed and checked the gateway on AWS, with shared limits admitting 10 of 30
+requests across two pods on Valkey 9.1.0 and both usage rows written to RDS as
+`gateway_app` (see the [runbook record](aws.md#gateway-verification--2026-10-13)).
+
+External Secrets Operator is a cluster add-on installed from its upstream chart,
+not a Go dependency; it adds three pods (controller, webhook, certificate
+controller) and 25 CRDs. It was chosen over AWS's Secrets Store CSI provider
+because it can template a URL from several secrets into a Kubernetes Secret,
+which keeps the chart unchanged.
 
 ## Testing
 

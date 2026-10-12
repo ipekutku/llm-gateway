@@ -5,13 +5,14 @@ Milestone 10 has two Terraform root modules. The persistent bootstrap in
 private image repositories. The [platform](#platform-sessions) in
 [`deploy/aws/platform`](../deploy/aws/platform) creates the network, an EKS
 cluster, RDS PostgreSQL, Valkey, and secrets for a working session, then is
-destroyed. The gateway does not run on AWS yet.
+destroyed. [`make aws-deploy`](#deploy-and-check-the-gateway) installs the
+gateway on that cluster for the session.
 The roadmap defines the remaining [milestone scope](ROADMAP.md#milestone-10--aws-infrastructure).
 
 ## Setup and costs
 
 Use AWS CLI v2, Terraform **1.16.5**, Docker with Buildx, and `jq`. The AWS provider
-is pinned to **6.68.0**. Kubernetes work later needs `kubectl` and Helm 4.3.0.
+is pinned to **6.68.0**. Kubernetes work needs `kubectl`, Helm 4.3.0, `curl`, and OpenSSL.
 The current AWS project permits only **eu-north-1**, which is fixed in the provider
 and the backend template. Do not substitute another Region from a pricing example.
 
@@ -418,18 +419,20 @@ it. S3 encryption and private access protect state; old versions retain old
 tokens after destruction. Restrict state access accordingly, and never print
 `terraform show -json` or retrieve secret values into shared terminal output.
 
-The other three secrets are empty containers only:
+The other four secrets are empty containers only. `make aws-deploy` fills each
+one that is still empty with a value for this session:
 
-| Name | Value supplied outside Terraform |
-|---|---|
-| `llm-gateway/openai-api-key` | OpenAI key, or a synthetic AWS demo key for the fake provider |
-| `llm-gateway/anthropic-api-key` | Anthropic key, or a synthetic AWS demo key for the fake provider |
-| `llm-gateway/clients` | Complete clients JSON, containing only SHA-256 key hashes |
+| Name | Value supplied outside Terraform | Filled by `aws-deploy` with |
+|---|---|---|
+| `llm-gateway/openai-api-key` | OpenAI key | a synthetic key the fake provider ignores |
+| `llm-gateway/anthropic-api-key` | Anthropic key | a synthetic key the fake provider ignores |
+| `llm-gateway/clients` | Complete clients JSON, containing only SHA-256 key hashes | two random clients, `demo` and `limited` |
+| `llm-gateway/database-app-password` | Password of the gateway's `gateway_app` PostgreSQL role | 64 random hex characters |
 
-Use fresh AWS demo credentials; never reuse the public kind/load-test keys.
-Populate values with the AWS CLI after creation, using a private file rather
-than a literal secret in command arguments or shell history. For example,
-replace the path below with a file readable only by you:
+Never reuse the public kind/load-test keys here. To supply your own value, write
+it before `aws-deploy`, which never replaces an existing value. Use the AWS CLI
+with a private file rather than a literal secret in command arguments or shell
+history. For example, replace the path below with a file readable only by you:
 
 ```bash
 aws secretsmanager put-secret-value --region eu-north-1 \
@@ -442,7 +445,7 @@ Use the same command with each provider secret name and a private text file
 containing that key. Values never enter Terraform. Store checks need only the
 RDS-managed secret and generated Valkey token, so these containers can remain
 empty until gateway deployment. All Terraform-created secrets have zero
-recovery days; repopulate them each session. AWS secret deletion is asynchronous;
+recovery days, so every session starts empty. AWS secret deletion is asynchronous;
 if immediate recreation reports an existing name, wait for deletion to finish.
 
 ### Check the private data stores
@@ -488,9 +491,9 @@ Record the client output and teardown result after a live run. The
 authentication; mocked Terraform tests alone do not establish that behavior.
 This step does not run migrations, insert usage
 rows, or test the gateway's shared limits. CI uses Redis 8, while AWS runs Valkey
-9.1; the gateway's GCRA and lease scripts still need the later two-replica
-deployment check before claiming compatibility. If any step fails, still run
-`aws-down` and `aws-leftovers` before ending the session.
+9.1; the gateway's GCRA and lease scripts were checked later, by the
+[gateway verification](#gateway-verification--2026-10-13). If any step fails,
+still run `aws-down` and `aws-leftovers` before ending the session.
 
 ### Store verification — 2026-10-12
 
@@ -541,6 +544,137 @@ The second session's follow-up plan reported no changes with exit code 0.
 entries; `make aws-leftovers` reported none in every checked category, including
 backups, snapshots, and secrets. This verifies the final helper against AWS.
 No second-session creation or teardown durations were supplied.
+
+## Deploy and check the gateway
+
+After `make aws-up`, in the same shell (the AWS login, `AWS_PROFILE`, and the
+`TF_VAR_` variables from [Platform sessions](#platform-sessions)):
+
+```bash
+git fetch origin           # aws-deploy deploys the newest main commit this branch contains
+make aws-deploy            # a few minutes
+make aws-check
+make aws-down
+make aws-leftovers
+```
+
+The cluster then runs two gateway pods, each with the fake provider as a sidecar,
+plus the three External Secrets Operator pods. That adds no hourly AWS charge
+beyond the session's: the pods fit on the two nodes, the IAM role and Pod
+Identity association are free, and Secrets Manager bills each API call at a
+fraction of a cent. Image pulls cross the NAT gateway, which bills per GB
+processed; the largest is `postgres:18` for the Jobs, at roughly 150 MB per node,
+so a session's pulls cost a few cents.
+
+What `aws-deploy` does, in order (see [Gateway on EKS](architecture.md#gateway-on-eks)):
+
+1. Resolves `ghcr.io/ipekutku/llm-gateway` and `-fakeprovider` for the chosen
+   commit to their digests. It fails if CI has not published that commit, for
+   example on an unmerged branch whose base is not in your local `origin/main`.
+   To deploy another commit from `main`, set `AWS_IMAGE_SHA` to its full SHA.
+2. Fills the empty session secrets (see [Secrets flow](#secrets-flow)) and writes
+   the two client keys to `deploy/aws/session/demo-key` and `limited-key`.
+   Treat them as credentials; they are gitignored and valid only until `aws-down`.
+3. Installs External Secrets Operator 2.12.0 into `external-secrets`, creates the
+   namespace `llm-gateway`, the RDS CA ConfigMap, and the ExternalSecrets from
+   `deploy/aws/secrets.yaml`, and waits until all six Kubernetes Secrets are synced.
+4. Runs the `llm-gateway-database-role` Job, which creates or updates
+   `gateway_app` and prints its table privileges (`none yet` on the first deploy,
+   `INSERT, SELECT` afterwards).
+5. Installs or upgrades the chart; its hook Job migrates as the master user.
+
+Rerunning `aws-deploy` in the same session upgrades in place and keeps the
+secrets. The gateway reads its Secrets only at startup: after writing a new
+value, wait for the operator's hourly refresh, or force one with
+`kubectl annotate externalsecret <name> force-sync=$(date +%s) --overwrite`, then run
+`kubectl --context llm-gateway-aws -n llm-gateway rollout restart deployment/llm-gateway`.
+
+`aws-check` prints each step: both completions with their request IDs, the
+metrics sample, admitted and limited counts per pod, and the two usage rows (no
+content, only IDs, models, status, tokens, and estimated cost). Its shared-limit
+step uses the `limited` client's burst of 10, which refills one request every 10
+seconds; run it again within about two minutes and it reports fewer than 10
+admitted. To use the gateway by hand, keep a port-forward open and read the key
+from the file, not the command line:
+
+```bash
+kubectl --context llm-gateway-aws -n llm-gateway port-forward service/llm-gateway 8080:8080 &
+printf 'Authorization: Bearer %s\n' "$(cat deploy/aws/session/demo-key)" > /tmp/llm-gateway-demo.header
+curl -s localhost:8080/v1/chat/completions -H @/tmp/llm-gateway-demo.header \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"demo-openai","messages":[{"role":"user","content":"hello"}]}'
+rm /tmp/llm-gateway-demo.header; kill %1
+```
+
+Review these additions in the `aws-up` plan: `aws_iam_role.external_secrets`
+(trusting only `pods.eks.amazonaws.com` for this account and cluster), its inline
+policy listing six secret ARNs with `GetSecretValue` and `DescribeSecret` only,
+`aws_eks_pod_identity_association.external_secrets` for
+`external-secrets/external-secrets`, and the `database-app-password` container.
+`aws-down` removes everything, including what Helm installed, with the cluster;
+none of it creates AWS resources outside Terraform.
+
+Troubleshooting (`aws-up` makes `llm-gateway-aws` the current kubectl context):
+
+- **ExternalSecrets not Ready:** `kubectl -n llm-gateway describe externalsecret`
+  shows the operator's error. `AccessDenied` means the operator pod started
+  before the Pod Identity association existed or lacks the role: restart it with
+  `kubectl -n external-secrets rollout restart deployment/external-secrets`.
+- **Role Job failed:** `kubectl -n llm-gateway logs job/llm-gateway-database-role`.
+  A certificate error names the CA bundle; a password error means the owner
+  Secret is stale (force a sync as above).
+- **Pods not ready or `CrashLoopBackOff`:** `kubectl -n llm-gateway logs deploy/llm-gateway -c gateway`.
+  The gateway's startup errors name the setting, never its value. `tls_certificate`
+  means the database CA does not match; an authentication failure for
+  `gateway_app` means the role Job and the Secret disagree, which a rerun of
+  `make aws-deploy` resolves.
+- **`aws-check` reports local limits:** the gateway could not reach Valkey; its
+  log has one warning with the reason, and `gateway_ratelimit_store_errors_total`
+  counts failures.
+
+### Gateway verification — 2026-10-13
+
+The operator ran the session from a Mac with the working tree of this change and
+supplied the terminal output:
+
+- `make aws-up` created 71 resources in 12 minutes 52 seconds: the 67 of the store
+  session plus the External Secrets role, its policy, the Pod Identity
+  association, and the `database-app-password` container. Both amd64 nodes were
+  `Ready` on `v1.37.0-eks` with no external address.
+- `make aws-deploy` finished in 2 minutes 57 seconds. It deployed commit
+  `98f00586cfa8` as `llm-gateway@sha256:ef6c3f8c…` and
+  `llm-gateway-fakeprovider@sha256:53de61f1…`, filled the four empty secrets, and
+  installed External Secrets Operator. All six ExternalSecrets reached
+  `SecretSynced` without an access error, so the Pod Identity role and its
+  six-ARN policy were sufficient. The role Job reported `none yet (no tables)`,
+  as expected before the first migration. The chart's migration hook succeeded,
+  and two pods ran `2/2` on different nodes. The startup line reported
+  `"rate_limits":"shared"` and two clients.
+- `make aws-check` passed. Both models answered through the Service, and the
+  pod's metrics counted the requests with `gateway_ratelimit_store_up 1`. Of 30
+  requests from the limited client alternating between the two pods, 10 were
+  admitted (5 on each) and 20 limited. Both completions' usage rows were in RDS:
+  client `demo`, status 200, 12 input and 3 output tokens, and an estimated
+  $0.000018 each, matching the synthetic prices.
+- A second `make aws-deploy` finished in 57 seconds and upgraded both releases
+  in place: no secret was refilled, every ExternalSecret was unchanged and still
+  synced, the role Job reported `gateway_app table privileges: INSERT, SELECT` on
+  the migrated tables, and the chart's second revision kept the same pods. A
+  second `make aws-check` passed the same way, again admitting 10 of 30 (5 per
+  pod), with new usage rows for both completions.
+- `make aws-down` destroyed all 71 resources in 12 minutes 10 seconds, including
+  the IAM role and Pod Identity association, and removed the AWS kubeconfig
+  entries. `make aws-leftovers` then reported none in every checked category.
+  Everything Helm installed went with the cluster; none of it had created AWS
+  resources outside Terraform.
+
+This establishes on AWS what mocked tests could not: Pod Identity credentials for
+the operator, the templated database and `rediss://` URLs, `verify-full` TLS to
+RDS with the mounted CA bundle, the gateway running as `gateway_app` (its schema
+check reads and its usage writes insert), and the gateway's GCRA and lease
+scripts on Valkey 9.1.0, sharing one client's burst across two pods, and a
+repeatable deployment. Not covered: ingress, a rolling restart or node drain on
+AWS, autoscaling, and real providers.
 
 ## Validation and provider updates
 

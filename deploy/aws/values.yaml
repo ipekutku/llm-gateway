@@ -1,0 +1,83 @@
+# Chart values for the EKS cluster (make aws-deploy). The images come from
+# GHCR: deploy/aws/deploy.sh sets image.tag and the sidecar image to a commit
+# SHA from main pinned to its digest, so a moved tag cannot change what runs.
+# Both providers point at the fake provider, a sidecar on 127.0.0.1:9000 in
+# each pod; no request leaves the cluster. The Secrets and the CA ConfigMap
+# named here are created by deploy.sh and External Secrets Operator.
+
+image:
+  repository: ghcr.io/ipekutku/llm-gateway
+  # Replaced by deploy.sh with <sha>@sha256:<digest>.
+  tag: set-by-aws-deploy
+  pullPolicy: IfNotPresent
+
+providers:
+  openai:
+    model: demo-openai
+    apiKeySecret:
+      name: llm-gateway-openai
+    baseURL: http://127.0.0.1:9000
+  anthropic:
+    model: demo-anthropic
+    apiKeySecret:
+      name: llm-gateway-anthropic
+    baseURL: http://127.0.0.1:9000
+
+clients:
+  secretName: llm-gateway-clients
+
+# The gateway logs in as gateway_app, which can only read and insert rows;
+# migrations run as the RDS master user. Both verify the server certificate
+# against the Region's RDS bundle.
+database:
+  urlSecret:
+    name: llm-gateway-database
+  caBundle:
+    configMapName: llm-gateway-database-ca
+
+migrations:
+  urlSecret:
+    name: llm-gateway-database-owner
+
+# Shared rate limits across all pods, on ElastiCache.
+redis:
+  urlSecret:
+    name: llm-gateway-redis
+
+# Synthetic prices for the synthetic models.
+prices:
+  - provider: openai
+    model: demo-openai
+    input: "1"
+    cache_read: "0.1"
+    cache_write: "0"
+    output: "2"
+  - provider: anthropic
+    model: demo-anthropic
+    input: "1"
+    cache_read: "0.1"
+    cache_write: "1.25"
+    output: "2"
+
+# Two nodes hold up to four pods; the node group does not scale by itself.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+sidecars:
+  - name: fakeprovider
+    # Replaced by deploy.sh with the fake provider image for the same commit.
+    image: set-by-aws-deploy
+    imagePullPolicy: IfNotPresent
+    args: ["-delay=200ms"]
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]

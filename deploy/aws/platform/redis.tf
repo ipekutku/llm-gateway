@@ -1,8 +1,8 @@
 # Valkey for the shared rate limits: one cache.t4g.micro node, no replica, in
 # the private subnets, reachable only from the nodes, over TLS with an AUTH
 # token. CI tests the gateway against Redis 8; the gateway uses only basic
-# commands and Lua scripts; gateway compatibility still needs the later live
-# AWS deployment check, not a claim based on CI.
+# commands and Lua scripts, which make aws-check exercises on this Valkey
+# (see docs/aws.md, Gateway verification).
 resource "aws_elasticache_subnet_group" "redis" {
   name       = local.name
   subnet_ids = module.vpc.private_subnets

@@ -1,15 +1,18 @@
-# Secrets for the gateway, read by the cluster in a later step. Secrets created
-# here are deleted without a recovery window, so the next session can create
-# the same names again. The database password is not here: RDS keeps it in a
-# secret of its own, outside Terraform state.
+# Secrets for the gateway, which External Secrets Operator copies into the
+# cluster (external-secrets.tf). Secrets created here are deleted without a
+# recovery window, so the next session can create the same names again. The
+# master database password is not here: RDS keeps it in a secret of its own,
+# outside Terraform state.
 
-# Containers only: Terraform never sees their values, which the operator
-# writes with aws secretsmanager put-secret-value (see docs/aws.md).
+# Containers only: Terraform never sees their values. make aws-deploy fills
+# empty ones with session-generated demo values, and the operator may write
+# real ones first with aws secretsmanager put-secret-value (see docs/aws.md).
 resource "aws_secretsmanager_secret" "operator" {
   for_each = {
-    "openai-api-key"    = "OpenAI API key for the gateway"
-    "anthropic-api-key" = "Anthropic API key for the gateway"
-    "clients"           = "Gateway clients file (clients.json)"
+    "openai-api-key"        = "OpenAI API key for the gateway"
+    "anthropic-api-key"     = "Anthropic API key for the gateway"
+    "clients"               = "Gateway clients file (clients.json)"
+    "database-app-password" = "Password of the gateway's least-privilege PostgreSQL role"
   }
 
   name                    = "${local.name}/${each.key}"

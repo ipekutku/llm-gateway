@@ -13,6 +13,13 @@ for values in "$chart"/ci/*-values.yaml; do
     helm template gateway "$chart" -f "$values" >/dev/null
 done
 
+# The EKS values, with the images deploy/aws/deploy.sh would set.
+echo "== deploy/aws/values.yaml"
+aws_images=(--set image.tag=0123456789abcdef0123456789abcdef01234567@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    --set "sidecars[0].image=ghcr.io/ipekutku/llm-gateway-fakeprovider:0123456789abcdef0123456789abcdef01234567@sha256:0000000000000000000000000000000000000000000000000000000000000000")
+helm lint --strict "$chart" -f deploy/aws/values.yaml "${aws_images[@]}"
+helm template gateway "$chart" -f deploy/aws/values.yaml "${aws_images[@]}" >/dev/null
+
 failures=0
 
 # reject <expected message> <helm template arguments...> renders the chart
@@ -95,6 +102,12 @@ for template in deployment migration-job; do
     render "$chart/ci/full-values.yaml" present "name: rds-ca" --show-only "templates/$template.yaml"
     render "$chart/ci/full-values.yaml" present "key: global-bundle.pem" --show-only "templates/$template.yaml"
 done
+# On EKS, migrations use the master user and the gateway its own role.
+render deploy/aws/values.yaml present "name: llm-gateway-database-owner" "${aws_images[@]}" --show-only templates/migration-job.yaml
+render deploy/aws/values.yaml absent "llm-gateway-database-owner" "${aws_images[@]}" --show-only templates/deployment.yaml
+render deploy/aws/values.yaml present "image: \"ghcr.io/ipekutku/llm-gateway:0123456789abcdef0123456789abcdef01234567@sha256:" "${aws_images[@]}" --show-only templates/deployment.yaml
+# Setting the sidecar image keeps the rest of the sidecar from the values file.
+render deploy/aws/values.yaml present "- -delay=200ms" "${aws_images[@]}" --show-only templates/deployment.yaml
 # The migration pod must not match the selector of the Deployment and Service.
 if helm template gateway "$chart" -f "$minimal" --show-only templates/migration-job.yaml |
     grep -Eq '^ *app\.kubernetes\.io/name: llm-gateway$'; then

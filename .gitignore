@@ -65,6 +65,8 @@ go.work.sum
 crash.log
 crash.*.log
 /deploy/aws/bootstrap/backend.tf
+# Client keys make aws-deploy generates for a session's checks.
+/deploy/aws/session/
 
 # Editor/IDE
 # .idea/
