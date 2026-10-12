@@ -948,17 +948,16 @@ lock file includes Linux amd64 and both Mac architectures. Terraform is a develo
 tool, outside `go.mod`, and does not change the gateway or its permissions.
 An explicit account ID limits which credentials the provider accepts.
 
-The planned split gives infrastructure two independent lifetimes and state keys:
+The split gives infrastructure two independent lifetimes and state keys:
 
 | Stack | Resources | State key | Lifetime |
 |---|---|---|---|
-| `bootstrap` (implemented) | S3 state bucket, two private ECR repositories | `bootstrap/terraform.tfstate` | Kept between sessions |
-| `platform` (future work) | VPC, EKS, managed data stores, deployment integrations | `platform/terraform.tfstate` | Created for demonstration sessions, then removed |
+| `bootstrap` | S3 state bucket, two private ECR repositories | `bootstrap/terraform.tfstate` | Kept between sessions |
+| `platform` | VPC and EKS today; later managed data stores and deployment integrations | `platform/terraform.tfstate` | Created for working sessions, then destroyed |
 
-Both keys use the bootstrap bucket. Only bootstrap exists in this PR; EKS, network
-boundaries, managed dependencies, ingress, and cloud logs have not been deployed.
-Taggable bootstrap resources inherit `Project=llm-gateway`, `Stack=bootstrap`;
-the future platform will use `Stack=platform`.
+Both keys use the bootstrap bucket. The gateway, managed dependencies, ingress,
+and cloud logs have not been deployed. Taggable resources inherit
+`Project=llm-gateway` and `Stack=bootstrap` or `Stack=platform`.
 
 The state bucket has versioning, explicit SSE-S3/AES256 encryption, all four public
 access blocks, bucket-owner-enforced ownership (ACLs disabled), and a policy denying
@@ -995,6 +994,68 @@ checks bucket protections, image settings/retention, and account input without
 AWS credentials or API calls. These checks do not establish a live apply, remote
 state migration, scan result, or image push; those remain manual verification,
 separate from the operator-provided bootstrap results in the runbook.
+
+### Platform network and cluster
+
+`deploy/aws/platform` uses the pinned `terraform-aws-modules/vpc` (6.7.3) and
+`terraform-aws-modules/eks` (21.29.0) modules, which expand into about 50
+resources; anything added later is written as plain resources. It also pins the
+`cloudinit`, `null`, `time`, and `tls` providers the EKS module requires.
+
+```text
+VPC 10.0.0.0/16, eu-north-1a and eu-north-1b
+├─ public  10.0.128.0/24, 10.0.129.0/24   internet gateway; one NAT gateway (in 1a)
+├─ private 10.0.0.0/19, 10.0.32.0/19      nodes (later the data stores); default route via the NAT gateway
+└─ S3 gateway endpoint on the private route table
+EKS 1.37 (STANDARD upgrade policy): API endpoint public for admin_cidr only, private for the nodes
+└─ managed node group: 2 × c7i-flex.large, AL2023 x86_64, on demand, 2–3 nodes
+   add-ons: vpc-cni, eks-pod-identity-agent (before nodes), kube-proxy, coredns, metrics-server
+```
+
+Network boundaries:
+
+- **Nothing on the internet can open a connection to a node.** Private subnets
+  have no route in, and nodes get no public address. Outbound traffic (image
+  pulls, AWS APIs) leaves through the NAT gateway; S3 traffic, which includes ECR
+  layers for the add-on images, uses the free gateway endpoint instead.
+- **The Kubernetes API** is reachable from the internet only from `admin_cidr`,
+  which must be /24 or narrower. Nodes and pods reach it through the private endpoint.
+- **Security groups** are the EKS module's recommended rules. The cluster group
+  accepts HTTPS from nodes. The node group accepts, from the control plane, the
+  API (443), kubelet (10250), and common webhook ports (4443, 6443, 8443, 9443,
+  10251), and from other nodes, DNS (53) and ephemeral ports (1025–65535). It
+  allows all egress. Pods use VPC addresses from the private subnets (the VPC CNI),
+  so they share their node's security group.
+
+Decisions:
+
+- **Two AZs, one NAT gateway.** EKS needs subnets in two AZs, as RDS and an ALB
+  will. One NAT gateway instead of one per AZ halves its cost; nodes in `1b` lose
+  outbound access if `1a` fails, which a session-only demonstration accepts.
+- **Private /19 subnets.** The VPC CNI gives every pod a VPC address, so subnets
+  are sized for pods, not only nodes; a `c7i-flex.large` holds up to 29 pods.
+- **Nodes restricted by the account.** The SCPs deny Spot, and the Free plan
+  launches only free-tier-eligible types. `c7i-flex.large` is the smallest of
+  those with 4 GiB, enough for the add-ons later PRs install (2 GiB types fit
+  11 pods and about 1.4 GiB each). It is x86; the images are built for amd64 and
+  arm64, so the planned Graviton nodes would need only `ami_type` and the type.
+- **Access entries, not `aws-auth`.** `authentication_mode = "API"` maps IAM
+  identities to Kubernetes permissions through the EKS API; the applying
+  identity gets cluster admin. There is no ConfigMap to break or lock out.
+- **No IRSA; Pod Identity instead.** IRSA needs an IAM OIDC identity provider,
+  which the project's SCPs deny. The Pod Identity agent runs as an add-on so
+  later add-ons can receive scoped roles. The gateway pod gets no AWS permissions.
+- **No billed extras.** No customer-managed KMS key (EKS encrypts Secrets with an
+  AWS-owned key, and a session key would linger pending deletion), no
+  control-plane logs, and the `STANDARD` upgrade policy, so the cluster never
+  moves into extended support at six times the hourly price.
+- **Add-on versions** are the newest EKS offers for 1.37 when applied; Kubernetes
+  itself is pinned. `vpc-cni` and the Pod Identity agent install before the node
+  group, so nodes join with networking ready.
+
+`make aws-up`, `make aws-down`, and `make aws-leftovers` create, destroy, and
+check a session; the [runbook](aws.md#platform-sessions) describes them, the
+cost, and the [verification](aws.md#platform-verification--2026-10-12).
 
 ## Testing
 

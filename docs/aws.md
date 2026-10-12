@@ -1,8 +1,10 @@
 # AWS runbook
 
-Milestone 10 begins with the persistent Terraform bootstrap in
-[`deploy/aws/bootstrap`](../deploy/aws/bootstrap). It creates only a state bucket
-and two private image repositories. The gateway does not run on AWS yet.
+Milestone 10 has two Terraform root modules. The persistent bootstrap in
+[`deploy/aws/bootstrap`](../deploy/aws/bootstrap) creates a state bucket and two
+private image repositories. The [platform](#platform-sessions) in
+[`deploy/aws/platform`](../deploy/aws/platform) creates the network and an EKS
+cluster for a working session, then is destroyed. The gateway does not run on AWS yet.
 The roadmap defines the remaining [milestone scope](ROADMAP.md#milestone-10--aws-infrastructure).
 
 ## Setup and costs
@@ -30,10 +32,10 @@ can therefore disappear;
 the policy is for this demonstration, not a production retention guarantee.
 State versions are retained without automatic expiration, to allow recovery.
 
-The later platform stack will contain the hourly-cost resources: EKS, nodes, NAT,
-RDS, ElastiCache, and possibly an ALB. Create that stack only for working sessions,
-then remove it and check for leftovers. Session teardown must keep bootstrap.
-The platform and its up/down commands are not implemented in PR 1.
+The platform holds the hourly-cost resources: today EKS, two nodes, and a NAT
+gateway; later RDS, ElastiCache, and possibly an ALB. Create it only for working
+sessions, then remove it and check for leftovers (see [Platform sessions](#platform-sessions)).
+Session teardown keeps bootstrap.
 
 Authenticate with short-lived credentials and confirm the target account:
 
@@ -53,6 +55,18 @@ arguments, GitHub secrets, or Git. Renew the login if it expires.
 The current project's restrictions prohibit IAM identity providers and Spot
 instances. Bootstrap therefore adds no identity provider or CI AWS role, and no
 CI job uses AWS credentials; see [CI images and AWS credentials](#ci-images-and-aws-credentials).
+On the Free plan, EC2 also launches only free-tier-eligible instance types. Check
+them before choosing any instance or node type:
+
+```bash
+aws ec2 describe-instance-types --region eu-north-1 \
+  --filters Name=free-tier-eligible,Values=true \
+  --query 'sort_by(InstanceTypes,&InstanceType)[].[InstanceType,MemoryInfo.SizeInMiB]' --output table
+```
+
+On 2026-10-12 these were `t3` and `t4g` `micro` and `small`, `c7i-flex.large`, and
+`m7i-flex.large`. Another type fails only when its instances launch: an EKS node
+group with `t4g.medium` retried for about 33 minutes before failing.
 
 ## Create bootstrap with local state
 
@@ -276,20 +290,111 @@ Limitations: GHCR tags are mutable, so deployments should pin the digest that a
 SHA tag resolves to; SHA tags accumulate with no retention policy; and a CI
 deployment job would need AWS credentials, which the same restriction blocks.
 
-## Validation and provider updates
+## Platform sessions
 
-`make terraform-check` checks formatting, initializes with `-backend=false` and
-`-lockfile=readonly`, validates, and runs mocked Terraform plans. Downloads need
-network access, but no backend or AWS API is contacted and no credentials are
-required. It runs in a separate CI job and is not part of the Go-only `make check`.
-It does not prove an AWS apply, state migration, or push works in this account.
+The platform module creates a VPC across `eu-north-1a` and `eu-north-1b` (private
+/19 subnets for nodes, public /24 subnets for one NAT gateway, and a free S3 gateway
+endpoint) and an EKS 1.37 cluster with two `c7i-flex.large` nodes. It uses the
+pinned `terraform-aws-modules/vpc` 6.7.3 and `terraform-aws-modules/eks` 21.29.0
+modules. State is `platform/terraform.tfstate` in the bootstrap bucket; its
+committed `backend.tf` takes the bucket and account from `make aws-up` and `make aws-down`.
 
-Commit `.terraform.lock.hcl`; it records the pinned provider's checksums for
-`linux_amd64` (CI), `darwin_arm64`, and `darwin_amd64` (Macs). After intentionally
-changing the provider version, regenerate and review it with:
+While it exists, the platform costs about **$0.30 per hour**: the EKS control plane
+($0.10), two nodes (about $0.08 each), and the NAT gateway with its public address
+(about $0.05), plus NAT data processing per GB. Left running, that is about $7 a day.
+
+Authenticate as in [Setup and costs](#setup-and-costs), then set the address
+allowed to reach the Kubernetes API. It must be a /24 or narrower; use your own:
 
 ```bash
-terraform -chdir=deploy/aws/bootstrap providers lock \
+export TF_VAR_admin_cidr="$(curl -s https://checkip.amazonaws.com)/32"
+make aws-leftovers   # expect "none" everywhere before starting
+make aws-up          # shows the plan and asks for approval; about 13 minutes
+```
+
+Review the plan before approving: `aws_eks_cluster` at `1.37`, one NAT gateway, a
+node group of `c7i-flex.large` on `AL2023_x86_64_STANDARD`, and no
+`aws_iam_openid_connect_provider`, `aws_kms_key`, or `aws_cloudwatch_log_group`.
+`aws-up` then adds the context `llm-gateway-aws` to your kubeconfig. Healthy nodes
+join a few minutes after the node group starts. If it is still creating after about
+10 minutes, interrupt it and run `make aws-down`: EKS otherwise retries failed
+launches for about 30 minutes, which bills the whole time.
+
+End every session the same way, even after a failed apply:
+
+```bash
+make aws-down        # shows the destroy plan and asks for approval
+make aws-leftovers   # fails while anything billable remains
+```
+
+`aws-leftovers` searches the Region by resource type rather than by tag, so it also
+finds what Terraform does not manage, such as load balancers created by Kubernetes:
+EKS clusters, EC2 instances, EBS volumes, NAT gateways, Elastic IPs, load balancers,
+RDS instances and manual snapshots, ElastiCache clusters, and leftover project VPCs.
+A NAT gateway can show as deleting for a few minutes; run it again.
+
+Access to the cluster:
+
+- The public API endpoint accepts only `admin_cidr`; nodes use the private endpoint.
+  If your address changes, run `make aws-up` again with the new value.
+- Authentication uses EKS access entries only (no `aws-auth` ConfigMap). Whoever
+  applies gets cluster admin.
+- IRSA is off because the project cannot create IAM identity providers; add-ons
+  that need AWS permissions will use EKS Pod Identity, whose agent runs on every node.
+- There is no customer-managed KMS key (EKS encrypts Secrets with an AWS-owned key)
+  and no control-plane logging, since both bill per session.
+
+On some macOS 26 Macs, a second `terraform init` over the EKS module's installed
+local submodules hangs, because a nil-pointer dereference there hangs instead of
+panicking ([hashicorp/terraform#39047](https://github.com/hashicorp/terraform/issues/39047)).
+The Make targets delete `.terraform/modules` before each init; do the same before
+running `terraform init` in `deploy/aws/platform` by hand.
+
+## Platform verification — 2026-10-12
+
+The operator ran the session from a Mac with Terraform 1.16.5 and supplied the results.
+
+- A first apply with `t4g.medium` nodes created the cluster, network, and add-ons,
+  but its node group failed after about 33 minutes with `AsgInstanceLaunchFailures`:
+  the Free plan allows only free-tier-eligible instance types. `make aws-down`
+  removed everything. The node type was changed to `c7i-flex.large`.
+- `make aws-up` then created 52 resources in 13 minutes. Both nodes were `Ready`
+  on `v1.37.0-eks`, `amd64`, Amazon Linux 2023, one in each private subnet,
+  with no external address.
+- All add-on pods ran: `aws-node`, `kube-proxy`, and the Pod Identity agent on each
+  node, and two replicas each of CoreDNS and metrics-server with their own VPC
+  addresses. `kubectl top nodes` reported about 470 MiB (15%) of memory per node.
+- `make aws-down` destroyed all 52 resources in 11 minutes and removed the
+  kubeconfig entries; `make aws-leftovers` then reported none of the checked
+  resource types in `eu-north-1`.
+
+This verifies the network, cluster, node group, add-ons, and teardown, not a
+gateway deployment, managed data stores, ingress, or any request traffic.
+
+## Validation and provider updates
+
+`make terraform-check` checks formatting, then for each module initializes with
+`-backend=false` and `-lockfile=readonly`, validates, and runs mocked Terraform
+plans. Downloads need network access, but no AWS API is contacted. It runs in a
+separate CI job and is not part of the Go-only `make check`. Locally, a module
+whose working directory was already initialized with the S3 backend (bootstrap
+after migration, the platform after `aws-up`) asks for AWS credentials even
+then; log in first. The checks do not prove an AWS apply, state migration, or
+push works in this account.
+
+The platform's mocked plans check the Kubernetes version, the absence of an IAM
+OIDC provider, KMS key, and control-plane log group, the exact add-on set, two AZs
+with one NAT gateway, and the S3 gateway endpoint; they also require that an open
+or wider than /24 `admin_cidr` and a malformed account ID are rejected.
+
+Commit each module's `.terraform.lock.hcl`; it records the pinned providers'
+checksums for `linux_amd64` (CI), `darwin_arm64`, and `darwin_amd64` (Macs). The
+platform pins `aws` and the providers the EKS module needs (`cloudinit`, `null`,
+`time`, `tls`). After intentionally changing a provider or module version,
+regenerate and review the lock file with:
+
+```bash
+terraform -chdir=deploy/aws/<module> providers lock \
   -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64
 make terraform-check
 ```

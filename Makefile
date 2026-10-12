@@ -51,6 +51,13 @@ KIND_CLUSTER := llm-gateway
 KIND_NAMESPACE := llm-gateway
 KUBECTL_KIND := kubectl --context kind-$(KIND_CLUSTER) --namespace $(KIND_NAMESPACE)
 
+# The AWS platform (see docs/aws.md): created for a working session, then
+# destroyed. Needs AWS credentials (aws login), TF_VAR_aws_account_id, and
+# TF_VAR_admin_cidr, the only address allowed to reach the Kubernetes API.
+PLATFORM := deploy/aws/platform
+AWS_CLUSTER := llm-gateway
+AWS_KUBE_CONTEXT := llm-gateway-aws
+
 # Local Prometheus, Grafana, and Jaeger for a gateway running on the host,
 # and the loopback ports they are published on.
 OBSERVABILITY := docker compose -f deploy/observability/compose.yaml
@@ -59,7 +66,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check aws-up aws-down aws-leftovers aws-init kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -163,11 +170,49 @@ helm-lint:
 
 ## terraform-check: format, initialize without a backend, validate, and run
 ## mocked plans. No AWS credentials; provider downloads need network access.
+## Platform modules are downloaded again on every run: on some macOS 26 Macs a
+## second init over installed local submodules hangs (hashicorp/terraform#39047).
 terraform-check:
 	terraform fmt -check -recursive deploy/aws
 	terraform -chdir=deploy/aws/bootstrap init -backend=false -input=false -lockfile=readonly
 	terraform -chdir=deploy/aws/bootstrap validate
 	terraform -chdir=deploy/aws/bootstrap test
+	rm -rf deploy/aws/platform/.terraform/modules
+	terraform -chdir=deploy/aws/platform init -backend=false -input=false -lockfile=readonly
+	terraform -chdir=deploy/aws/platform validate
+	terraform -chdir=deploy/aws/platform test
+
+## aws-up: create or update the platform (VPC, EKS, nodes) after showing the
+## plan for approval, then add the cluster to kubeconfig as llm-gateway-aws.
+## Bills by the hour until aws-down; apply takes about 15-20 minutes.
+aws-up: aws-init
+	terraform -chdir=$(PLATFORM) apply
+	aws eks update-kubeconfig --region eu-north-1 --name $(AWS_CLUSTER) --alias $(AWS_KUBE_CONTEXT)
+	kubectl --context $(AWS_KUBE_CONTEXT) get nodes -o wide
+
+## aws-down: destroy the platform after showing the plan for approval, and
+## remove its kubeconfig entries. Bootstrap (state bucket, ECR) is kept.
+aws-down: aws-init
+	terraform -chdir=$(PLATFORM) destroy
+	-kubectl config delete-context $(AWS_KUBE_CONTEXT)
+	-kubectl config delete-cluster arn:aws:eks:eu-north-1:$(TF_VAR_aws_account_id):cluster/$(AWS_CLUSTER)
+	-kubectl config delete-user arn:aws:eks:eu-north-1:$(TF_VAR_aws_account_id):cluster/$(AWS_CLUSTER)
+
+## aws-leftovers: list anything in the Region that still bills (clusters,
+## instances, volumes, NAT gateways, addresses, load balancers, databases);
+## fails if anything is found. Run after every aws-down.
+aws-leftovers:
+	bash deploy/aws/leftovers.sh
+
+# Initializes the platform against its S3 state. Modules are downloaded again
+# each time (see terraform-check).
+aws-init:
+	@test -n '$(TF_VAR_aws_account_id)' && test -n '$(TF_VAR_admin_cidr)' || \
+		{ echo 'Set TF_VAR_aws_account_id and TF_VAR_admin_cidr (see docs/aws.md)'; exit 1; }
+	rm -rf $(PLATFORM)/.terraform/modules
+	terraform -chdir=$(PLATFORM) init -input=false -lockfile=readonly -reconfigure \
+		-backend-config='bucket=llm-gateway-tfstate-$(TF_VAR_aws_account_id)-eu-north-1' \
+		-backend-config='allowed_account_ids=["$(TF_VAR_aws_account_id)"]'
 
 ## kind-up: create the local cluster if it does not exist, load both images,
 ## and start metrics-server and the disposable PostgreSQL and Redis
