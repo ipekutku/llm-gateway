@@ -57,6 +57,13 @@ spec:
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- if .Values.database.caBundle.configMapName }}
+          # Named by sslrootcert in the database URL, as in the gateway pods.
+          volumeMounts:
+            - name: database-ca
+              mountPath: /etc/llm-gateway/database-ca
+              readOnly: true
+          {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -67,4 +74,15 @@ spec:
             capabilities:
               drop:
                 - ALL
+      {{- with .Values.database.caBundle }}
+      {{- if .configMapName }}
+      volumes:
+        - name: database-ca
+          configMap:
+            name: {{ .configMapName }}
+            items:
+              - key: {{ .key }}
+                path: ca.pem
+      {{- end }}
+      {{- end }}
 {{- end }}

@@ -1,7 +1,7 @@
 # Every optional setting: both providers with fallbacks and a base URL, a
-# separate migration database URL, autoscaling, a percentage disruption budget,
-# Redis,
-# prices, extra environment variables, and a different shutdown budget.
+# database CA bundle, a separate migration database URL, autoscaling, a
+# percentage disruption budget, Redis, prices, extra environment variables,
+# and a different shutdown budget.
 image:
   repository: registry.example.com/llm-gateway
   tag: 0.9.0
@@ -37,6 +37,9 @@ database:
   urlSecret:
     name: gateway-database
     key: postgres-url
+  caBundle:
+    configMapName: rds-ca
+    key: global-bundle.pem
 migrations:
   urlSecret:
     name: gateway-database-owner

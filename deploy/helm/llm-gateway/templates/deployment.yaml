@@ -133,6 +133,12 @@ spec:
             - name: pricing
               mountPath: /etc/llm-gateway/pricing
               readOnly: true
+            {{- if .Values.database.caBundle.configMapName }}
+            # Named by sslrootcert in the database URL.
+            - name: database-ca
+              mountPath: /etc/llm-gateway/database-ca
+              readOnly: true
+            {{- end }}
           # Liveness only checks that the process serves HTTP. Readiness fails
           # once shutdown begins, never because of PostgreSQL, Redis, or a
           # provider, so a dependency outage cannot take every pod out of
@@ -175,3 +181,13 @@ spec:
             items:
               - key: prices.json
                 path: prices.json
+        {{- with .Values.database.caBundle }}
+        {{- if .configMapName }}
+        - name: database-ca
+          configMap:
+            name: {{ .configMapName }}
+            items:
+              - key: {{ .key }}
+                path: ca.pem
+        {{- end }}
+        {{- end }}

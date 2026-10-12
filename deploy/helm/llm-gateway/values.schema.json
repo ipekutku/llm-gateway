@@ -99,7 +99,18 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["urlSecret"],
-      "properties": {"urlSecret": {"$ref": "#/definitions/secretRef"}}
+      "properties": {
+        "urlSecret": {"$ref": "#/definitions/secretRef"},
+        "caBundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["configMapName", "key"],
+          "properties": {
+            "configMapName": {"type": "string"},
+            "key": {"type": "string", "minLength": 1}
+          }
+        }
+      }
     },
     "migrations": {
       "type": "object",
