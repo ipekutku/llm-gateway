@@ -8,8 +8,11 @@ package postgres
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math/big"
 	"strings"
 
@@ -49,7 +52,12 @@ func Open(ctx context.Context, url string, tp trace.TracerProvider) (*Store, err
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		// pgx redacts passwords from parse errors only on a best-effort
-		// basis, so its message is not passed on.
+		// basis, so its message is not passed on. Parsing also reads the
+		// certificate files the URL names (sslrootcert, sslcert, sslkey); for
+		// those, only the file system's reason is added, without the path.
+		if pathErr, ok := errors.AsType[*fs.PathError](err); ok {
+			return nil, fmt.Errorf("postgres: cannot read a certificate file named in the database URL: %w", pathErr.Err)
+		}
 		return nil, errors.New("postgres: invalid database URL")
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
@@ -173,6 +181,9 @@ func databaseErrorType(err error) string {
 	if errors.Is(err, context.Canceled) {
 		return "canceled"
 	}
+	if isCertificateError(err) {
+		return "tls_certificate"
+	}
 	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		// SQLSTATE is five uppercase ASCII letters/digits. Do not accept
 		// arbitrary text from a server as a diagnostic category.
@@ -181,6 +192,23 @@ func databaseErrorType(err error) string {
 		}
 	}
 	return "_OTHER"
+}
+
+// isCertificateError reports whether TLS rejected the server's certificate:
+// an unknown authority, a name that does not match the host, or an invalid
+// certificate, such as an expired one. With sslmode=verify-full the TLS
+// handshake returns a tls.CertificateVerificationError; with verify-ca pgx
+// checks the chain itself, without the host name, and returns the x509
+// error directly.
+func isCertificateError(err error) bool {
+	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[x509.UnknownAuthorityError](err); ok {
+		return true
+	}
+	_, ok := errors.AsType[x509.CertificateInvalidError](err)
+	return ok
 }
 
 func setError(span trace.Span, err error) {

@@ -328,7 +328,7 @@ kubectl -n llm-gateway create configmap rds-ca --from-file=ca.pem=global-bundle.
 helm upgrade ... --set database.caBundle.configMapName=rds-ca
 ```
 
-Without the bundle, or with the wrong one, the connection fails rather than falling back to an unverified one. The chart cannot see changes to the ConfigMap, so restart the Deployment after replacing it.
+Without the bundle, or with the wrong one, the connection fails rather than falling back to an unverified one: the log says `database operation failed (tls_certificate)` when the certificate is rejected, and `cannot read a certificate file named in the database URL` when the `sslrootcert` path has no file, such as a missing mount. The chart cannot see changes to the ConfigMap, so restart the Deployment after replacing it.
 
 Migrations are forward-only, and a gateway refuses to start on a schema with migrations it does not know. After an upgrade that adds a migration, pods of the previous version keep serving until they are replaced, but any of them that restarts fails its schema check, and so do the pods of a `helm rollback` to that version: roll forward instead. Set `migrations.enabled=false` to migrate another way, such as with the [container image](#container-image).
 
