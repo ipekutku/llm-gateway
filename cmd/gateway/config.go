@@ -56,6 +56,10 @@ const (
 	// maxBreakerFailures bounds GATEWAY_BREAKER_FAILURES.
 	maxBreakerFailures = 100
 
+	// maxMaxTokens bounds GATEWAY_MAX_TOKENS, far above any model's output
+	// limit.
+	maxMaxTokens = 1_000_000
+
 	// defaultShutdownTimeout bounds the HTTP drain when
 	// GATEWAY_SHUTDOWN_TIMEOUT is unset.
 	defaultShutdownTimeout = 5 * time.Second
@@ -88,6 +92,9 @@ type config struct {
 	// ProviderTimeout bounds a primary provider that has a fallback, so the
 	// fallback has time left. It is less than UpstreamTimeout.
 	ProviderTimeout time.Duration
+	// MaxTokens is the largest max_tokens a request may ask for, or 0 for
+	// no ceiling.
+	MaxTokens int
 	// Retry is applied to each provider.
 	Retry retry.Policy
 	// Breaker configures each provider's circuit breaker.
@@ -161,6 +168,9 @@ func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error
 		errs = append(errs, err)
 	}
 	if cfg.Retry, err = loadRetry(getenv); err != nil {
+		errs = append(errs, err)
+	}
+	if cfg.MaxTokens, err = loadInt(getenv, "GATEWAY_MAX_TOKENS", 0, maxMaxTokens); err != nil {
 		errs = append(errs, err)
 	}
 	if cfg.Breaker.Failures, err = loadInt(getenv, "GATEWAY_BREAKER_FAILURES", defaultBreakerFailures, maxBreakerFailures); err != nil {

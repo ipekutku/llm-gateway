@@ -224,6 +224,36 @@ func TestRequestPathRoutesToEachProvider(t *testing.T) {
 	}
 }
 
+func TestRequestPathEnforcesMaxTokensCeiling(t *testing.T) {
+	oa := newUpstream(t, "/v1/chat/completions", reply(http.StatusOK, openaiReply))
+	an := newUpstream(t, "/v1/messages", reply(http.StatusOK, anthropicReply))
+	gw := gatewayWith(t, oa, an, func(c *config) { c.MaxTokens = 500 })
+
+	resp, data, err := postChat(t, context.Background(), gw.URL, `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"max_tokens":501}`)
+	if err != nil {
+		t.Fatalf("POST error = %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(data), "max_tokens must not exceed 500") {
+		t.Errorf("status = %d, body %s; want 400 naming the ceiling", resp.StatusCode, data)
+	}
+	if n := len(oa.received()); n != 0 {
+		t.Fatalf("upstream received %d requests over the ceiling, want 0", n)
+	}
+
+	// A request without max_tokens gets the ceiling, which is below the
+	// default.
+	resp, data, err = postChat(t, context.Background(), gw.URL, chatBody("claude-opus-5-5"))
+	if err != nil {
+		t.Fatalf("POST error = %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, data)
+	}
+	if got := an.received()[0].Body["max_tokens"]; got != 500.0 {
+		t.Errorf("anthropic max_tokens = %v, want 500", got)
+	}
+}
+
 func mapsEqual(a, b map[string]any) bool {
 	if len(a) != len(b) {
 		return false

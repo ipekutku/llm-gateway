@@ -44,6 +44,7 @@ type handler struct {
 	auth            *auth.Authenticator
 	limiter         Limiter
 	upstreamTimeout time.Duration
+	maxTokens       int
 	log             *slog.Logger
 	accounting      Accounting
 	metrics         Metrics
@@ -109,6 +110,11 @@ type Accounting struct {
 // one request. It must be positive. When it expires while the client is
 // still connected, the response is 504.
 //
+// maxTokens, if positive, is the largest max_tokens a request may ask for;
+// a larger one is rejected with 400 before it reaches provider, and a
+// request without max_tokens gets the default or maxTokens, whichever is
+// smaller. 0 sets no ceiling.
+//
 // Requests to other paths receive 404, and other methods on the endpoint
 // receive 405 with an Allow header.
 //
@@ -128,7 +134,7 @@ type Accounting struct {
 //
 // If the request context carries a trace span, such as the server span of
 // tracing.Handler, the request ID, client ID, and outcome are added to it.
-func New(provider llm.Provider, authenticator *auth.Authenticator, limiter Limiter, upstreamTimeout time.Duration, accounting Accounting, metrics Metrics, log *slog.Logger) (http.Handler, error) {
+func New(provider llm.Provider, authenticator *auth.Authenticator, limiter Limiter, upstreamTimeout time.Duration, maxTokens int, accounting Accounting, metrics Metrics, log *slog.Logger) (http.Handler, error) {
 	switch {
 	case provider == nil:
 		return nil, errors.New("httpapi: nil provider")
@@ -138,6 +144,8 @@ func New(provider llm.Provider, authenticator *auth.Authenticator, limiter Limit
 		return nil, errors.New("httpapi: nil limiter")
 	case upstreamTimeout <= 0:
 		return nil, errors.New("httpapi: upstream timeout must be positive")
+	case maxTokens < 0:
+		return nil, errors.New("httpapi: max tokens must not be negative")
 	case accounting.Recorder == nil || accounting.Pricing == nil:
 		return nil, errors.New("httpapi: recorder and pricing are required")
 	}
@@ -155,7 +163,7 @@ func New(provider llm.Provider, authenticator *auth.Authenticator, limiter Limit
 		models[provider] = model
 	}
 	accounting.Models = models
-	h := &handler{provider: provider, auth: authenticator, limiter: limiter, upstreamTimeout: upstreamTimeout, accounting: accounting, metrics: metrics, log: log}
+	h := &handler{provider: provider, auth: authenticator, limiter: limiter, upstreamTimeout: upstreamTimeout, maxTokens: maxTokens, accounting: accounting, metrics: metrics, log: log}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+ChatCompletionsPath, h.chatCompletions)
@@ -207,7 +215,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req, err := parseRequest(body)
+	req, err := parseRequest(body, h.maxTokens)
 	if err != nil {
 		h.fail(w, r, invalidRequest(err.Error()), nil)
 		return

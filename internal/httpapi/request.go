@@ -21,14 +21,15 @@ const (
 )
 
 // parseRequest decodes and validates a request body and returns the
-// normalized neutral request. Every error describes a client mistake, and
+// normalized neutral request. maxTokens is the gateway's ceiling on
+// max_tokens, or 0 for none. Every error describes a client mistake, and
 // its message is gateway-authored and safe to return to the caller.
-func parseRequest(body []byte) (llm.ChatRequest, error) {
+func parseRequest(body []byte, maxTokens int) (llm.ChatRequest, error) {
 	req, err := decodeRequest(body)
 	if err != nil {
 		return llm.ChatRequest{}, err
 	}
-	return normalize(req)
+	return normalize(req, maxTokens)
 }
 
 // decodeRequest parses body as exactly one JSON object followed only by
@@ -61,8 +62,11 @@ func decodeRequest(body []byte) (chatRequest, error) {
 }
 
 // normalize validates req and converts it to the neutral request passed to
-// the router. Message content is forwarded unchanged.
-func normalize(req chatRequest) (llm.ChatRequest, error) {
+// the router. Message content is forwarded unchanged. A max_tokens above
+// ceiling is rejected rather than lowered, so a client never gets a shorter
+// answer than it asked for without knowing; an absent one uses the default,
+// lowered to ceiling if that is smaller. A ceiling of 0 means none.
+func normalize(req chatRequest, ceiling int) (llm.ChatRequest, error) {
 	if req.Model == nil || strings.TrimSpace(*req.Model) == "" {
 		return llm.ChatRequest{}, errors.New("model is required")
 	}
@@ -71,9 +75,15 @@ func normalize(req chatRequest) (llm.ChatRequest, error) {
 	}
 
 	maxTokens := defaultMaxTokens
+	if ceiling > 0 {
+		maxTokens = min(maxTokens, ceiling)
+	}
 	if req.MaxTokens != nil {
 		if *req.MaxTokens <= 0 {
 			return llm.ChatRequest{}, errors.New("max_tokens must be a positive integer")
+		}
+		if ceiling > 0 && *req.MaxTokens > ceiling {
+			return llm.ChatRequest{}, fmt.Errorf("max_tokens must not exceed %d", ceiling)
 		}
 		maxTokens = *req.MaxTokens
 	}

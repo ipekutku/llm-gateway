@@ -192,6 +192,9 @@ func runWith(ctx context.Context, getenv func(string) string, readFile func(stri
 		slog.Bool("tracing", cfg.Tracing),
 		slog.String("rate_limits", rateLimitMode(cfg)),
 	)
+	if cfg.MaxTokens > 0 {
+		attrs = append(attrs, slog.Int("max_tokens", cfg.MaxTokens))
+	}
 	if (cfg.OpenAI != nil && cfg.OpenAI.FallbackTo != "") || (cfg.Anthropic != nil && cfg.Anthropic.FallbackTo != "") {
 		attrs = append(attrs, slog.Duration("provider_timeout", cfg.ProviderTimeout))
 	}
@@ -429,7 +432,7 @@ func newHandlerWithLimiter(cfg config, httpClient *http.Client, limiter httpapi.
 	for name, e := range providers {
 		models[name] = e.cfg.Model
 	}
-	h, err := httpapi.New(t.Route(router), authenticator, limiter, cfg.UpstreamTimeout, httpapi.Accounting{Recorder: recorder, Pricing: cfg.Pricing, Models: models}, m, logger)
+	h, err := httpapi.New(t.Route(router), authenticator, limiter, cfg.UpstreamTimeout, cfg.MaxTokens, httpapi.Accounting{Recorder: recorder, Pricing: cfg.Pricing, Models: models}, m, logger)
 	if err != nil {
 		return nil, err
 	}
