@@ -182,7 +182,7 @@ terraform-check:
 	terraform -chdir=deploy/aws/platform validate
 	terraform -chdir=deploy/aws/platform test
 
-## aws-up: create or update the platform (VPC, EKS, RDS, Valkey, secrets) after showing the
+## aws-up: create or update the platform (VPC, EKS, RDS, Valkey, secrets, log group) after showing the
 ## plan for approval, then add the cluster to kubeconfig as llm-gateway-aws.
 ## Bills by the hour until aws-down; apply takes about 15-20 minutes.
 aws-up: aws-init
@@ -195,15 +195,16 @@ aws-up: aws-init
 aws-check-stores:
 	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/check-stores.sh
 
-## aws-deploy: install External Secrets Operator and the gateway chart on the
-## platform, with the GHCR images of a commit on main (AWS_IMAGE_SHA, default
+## aws-deploy: install Fluent Bit, External Secrets Operator, and the gateway
+## chart on the platform, with the GHCR images of a commit on main (AWS_IMAGE_SHA, default
 ## the newest one this branch contains) and session-generated demo secrets.
 ## Needs a running platform; rerunning it upgrades in place.
 aws-deploy:
 	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/deploy.sh
 
 ## aws-check: completions from both models, metrics, limits shared across two
-## pods through Valkey, and usage records in RDS. Needs aws-deploy.
+## pods through Valkey, usage records in RDS, and the completions' log lines in
+## CloudWatch Logs. Needs aws-deploy.
 aws-check:
 	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/check.sh
 	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/check-ingress.sh
@@ -224,7 +225,8 @@ aws-down: aws-init
 	-kubectl config delete-user arn:aws:eks:eu-north-1:$(TF_VAR_aws_account_id):cluster/$(AWS_CLUSTER)
 
 ## aws-leftovers: list anything in the Region that still bills (clusters,
-## instances, volumes, NAT gateways, addresses, load balancers, databases);
+## instances, volumes, NAT gateways, addresses, load balancers, databases,
+## log groups);
 ## fails if anything is found. Run after every aws-down.
 aws-leftovers:
 	bash deploy/aws/leftovers.sh

@@ -6,11 +6,13 @@
 #    synthetic provider keys, a random database password for gateway_app, and
 #    two random client keys, whose plaintext stays only in deploy/aws/session/
 #    for make aws-check; a secret that already has a value is never replaced;
-# 3. installs External Secrets Operator, the RDS CA ConfigMap, and the
+# 3. installs Fluent Bit (fluent-bit.yaml), which ships the gateway's log
+#    lines to CloudWatch Logs, and checks it received Pod Identity credentials;
+# 4. installs External Secrets Operator, the RDS CA ConfigMap, and the
 #    ExternalSecrets, and waits until every Secret is synced;
-# 4. creates or updates the gateway's database role (database-role.yaml);
-# 5. installs or upgrades the chart, whose hook runs the migrations.
-# 6. creates HTTPS ingress, ensures ALB readiness gates, and publishes DNS.
+# 5. creates or updates the gateway's database role (database-role.yaml);
+# 6. installs or upgrades the chart, whose hook runs the migrations.
+# 7. creates HTTPS ingress, ensures ALB readiness gates, and publishes DNS.
 # AWS_IMAGE_SHA selects the commit; by default it is the newest commit of
 # origin/main this branch contains. Needs aws, terraform, kubectl, helm,
 # docker (buildx), jq, curl, openssl, and git; run from the repository root.
@@ -64,8 +66,10 @@ db_host=$(output database_address)
 db_name=$(output database_name)
 db_secret=$(output database_master_secret_arn)
 redis_host=$(output redis_address)
+log_group=$(output application_log_group)
 [[ $db_host =~ ^[a-z0-9.-]+$ && $redis_host =~ ^[a-z0-9.-]+$ && $db_name =~ ^[a-z_][a-z0-9_]*$ &&
-	$db_secret =~ ^arn:aws:secretsmanager:$region:[0-9]{12}:secret:[A-Za-z0-9/_+=.@!-]+$ ]] ||
+	$db_secret =~ ^arn:aws:secretsmanager:$region:[0-9]{12}:secret:[A-Za-z0-9/_+=.@!-]+$ &&
+	$log_group =~ ^/[A-Za-z0-9/_.-]+$ ]] ||
 	fail "Unexpected Terraform outputs; run make aws-up first."
 
 # 2. Session secrets. Values go through private files, never arguments.
@@ -110,7 +114,22 @@ elif [[ ! -f $session/demo-key || ! -f $session/limited-key ]]; then
 	echo "note: llm-gateway/clients already has a value, but $session has no client keys; make aws-check needs them"
 fi
 
-# 3. External Secrets Operator and the Secrets it keeps in sync.
+# 3. Fluent Bit, before the gateway's pods and Jobs start. The hash covers
+# the whole manifest, so a changed configuration restarts its pods.
+logging=$(<deploy/aws/fluent-bit.yaml)
+logging=${logging//__LOG_GROUP__/"$log_group"}
+logging=${logging//__MANIFEST_SHA256__/"$(openssl dgst -sha256 -r <<<"$logging" | cut -c1-64)"}
+[[ ! $logging =~ __[A-Z0-9_]+__ ]] || fail "unreplaced placeholder in deploy/aws/fluent-bit.yaml"
+printf '%s\n' "$logging" >"$work/fluent-bit.yaml"
+"${k[@]}" apply -f "$work/fluent-bit.yaml"
+"${k[@]}" --namespace fluent-bit rollout status daemonset/fluent-bit --timeout=180s
+# Pod Identity adds its credentials to pods created after the association.
+"${k[@]}" --namespace fluent-bit get pods --selector app.kubernetes.io/name=fluent-bit -o json | jq -e '
+	[.items[] | select(.metadata.deletionTimestamp == null)] | length > 0 and
+	all(.[]; any(.spec.containers[0].env[]?; .name == "AWS_CONTAINER_CREDENTIALS_FULL_URI"))' >/dev/null ||
+	fail "Fluent Bit pods have no Pod Identity credentials; restart them with kubectl -n fluent-bit rollout restart daemonset/fluent-bit"
+
+# 4. External Secrets Operator and the Secrets it keeps in sync.
 helm --kube-context "$context" upgrade --install external-secrets "$eso_chart" --version "$eso_version" \
 	--namespace "$eso_namespace" --create-namespace --set serviceAccount.name="$eso_service_account" \
 	--wait --timeout 5m
@@ -140,7 +159,7 @@ if ! "${kn[@]}" wait --for=condition=Ready externalsecret --all --timeout=180s; 
 	fail "External Secrets did not sync; see kubectl describe externalsecret in namespace $namespace."
 fi
 
-# 4. The gateway's database role, before the chart starts pods that use it.
+# 5. The gateway's database role, before the chart starts pods that use it.
 "${kn[@]}" delete job llm-gateway-database-role --ignore-not-found --wait=true >/dev/null
 "${kn[@]}" apply -f deploy/aws/database-role.yaml
 status=
@@ -153,7 +172,7 @@ done
 "${kn[@]}" logs job/llm-gateway-database-role || true
 [[ $status == *Complete* ]] || fail "The database role Job did not complete (conditions: ${status:-none})."
 
-# 5. The chart; its pre-install/pre-upgrade hook migrates as the master user.
+# 6. The chart; its pre-install/pre-upgrade hook migrates as the master user.
 # Install the controller and label the namespace before any gateway rollout.
 bash deploy/aws/ingress.sh prepare
 helm --kube-context "$context" upgrade --install "$release" deploy/helm/llm-gateway \

@@ -954,12 +954,13 @@ The split gives infrastructure two independent lifetimes and state keys:
 | Stack | Resources | State key | Lifetime |
 |---|---|---|---|
 | `bootstrap` | S3 state bucket, two private ECR repositories, optional gateway DNS zone and ACM certificate | `bootstrap/terraform.tfstate` | Kept between sessions |
-| `platform` | VPC, EKS, RDS PostgreSQL, ElastiCache Valkey, secret containers, External Secrets and Load Balancer Controller roles | `platform/terraform.tfstate` | Created for working sessions, then destroyed |
+| `platform` | VPC, EKS, RDS PostgreSQL, ElastiCache Valkey, secret containers, application log group, External Secrets, Load Balancer Controller, and Fluent Bit roles | `platform/terraform.tfstate` | Created for working sessions, then destroyed |
 
 Both keys use the bootstrap bucket. The network, cluster, and data stores have
 live creation, connection, and teardown verification. The [gateway deployment](#gateway-on-eks)
 and [HTTPS ingress](#https-ingress-on-eks) have live checks, including one rollout
-and complete session teardown; cloud logs are not implemented. Taggable resources inherit
+and complete session teardown. [Application logs](#application-logs-on-eks) go to
+CloudWatch Logs, with live verification. Taggable resources inherit
 `Project=llm-gateway` and `Stack=bootstrap` or `Stack=platform`.
 
 The state bucket has versioning, explicit SSE-S3/AES256 encryption, all four public
@@ -1322,6 +1323,86 @@ the session alias, with no checked leftovers; bootstrap remained. These are
 one low-rate synthetic run's results, not a capacity or general rollout
 guarantee. The [runbook](aws.md#ingress-verification--2026-10-13) records the
 environment, image digest, raw-artifact location, and untested cases.
+
+### Application logs on EKS
+
+Fluent Bit ships the gateway's logs to one CloudWatch Logs group. Terraform
+creates the group `/llm-gateway/application` with one day of retention, a role
+that only Pod Identity for this cluster and account may assume, and a policy
+allowing `logs:CreateLogStream` and `logs:PutLogEvents` on that group only. The
+gateway itself still has no AWS role and never calls an AWS API.
+
+```text
+gateway / migrate container stdout ─► node log file ─► Fluent Bit (DaemonSet, Pod Identity)
+                                                           │ PutLogEvents over HTTPS via NAT
+                                                           ▼
+                            /llm-gateway/application, stream pod/<pod>.<container>
+```
+
+`make aws-deploy` applies `deploy/aws/fluent-bit.yaml` before the External Secrets
+Operator, so the migration hook and gateway pods start with a collector running.
+It fills in the log group from the Terraform output and a hash of the manifest,
+which restarts the pods when their configuration changes. It then requires the
+Pod Identity variables in every Fluent Bit pod. Decisions:
+
+- **Raw lines, not enriched records.** The tail input reads only the files of
+  the chart's `gateway` and `migrate` containers in `llm-gateway`; the CRI
+  parser rejoins lines the runtime split, and the output sends only the
+  message (`log_key log`). Each event is therefore the gateway's own JSON line,
+  byte for byte, so the content-exclusion guarantee that
+  `TestObservabilityExcludesSensitiveData` checks for logs carries over unchanged,
+  and Logs Insights discovers the gateway's fields directly. The pod and
+  container are in the stream name, taken from the file name. Without the
+  Kubernetes filter, Fluent Bit needs no API access: no RBAC, and no service
+  account token (Pod Identity mounts its own token).
+- **Upstream Fluent Bit, as a plain manifest.** The image is
+  `cr.fluentbit.io/fluent/fluent-bit:5.1.3`, pinned by index digest. AWS's
+  `aws-for-fluent-bit` 2.x images are built on Fluent Bit 1.9, which cannot use
+  Pod Identity credentials; upstream's credential provider supports the Pod
+  Identity agent. A chart would add defaults (RBAC, the Kubernetes filter) to
+  override; the manifest is a namespace, a service account, a ConfigMap, and a
+  DaemonSet.
+- **Root without capabilities.** Kubelet's log files are readable only by root,
+  so the container runs as UID 0, but with every capability dropped, no privilege
+  escalation, a read-only root filesystem, and `RuntimeDefault` seccomp.
+  `/var/log` is mounted read-only. The only writable host path is
+  `/var/lib/llm-gateway-fluent-bit`, which holds the read offsets, so a restarted
+  pod neither repeats nor skips lines.
+- **Best effort, like the usage writer.** Fluent Bit buffers in memory (16 MB
+  per input) and retries a failed delivery up to five times; after that, or if a
+  pod's files are deleted before they are read, lines are lost from CloudWatch.
+  They stay in `kubectl logs` while the pod exists. The gateway never waits on
+  log delivery. This is a session's diagnostic trail, not an audit log.
+- **No group creation.** `auto_create_group` is off and the role cannot create
+  groups, so nothing can recreate a log group after Terraform destroys it.
+  `make aws-leftovers` also lists log groups in the Region.
+- **Logs only.** Container Insights, control-plane logs, metric filters, and
+  alarms stay off; they bill per metric or volume, and no requirement asks for
+  alerting. Prometheus remains the gateway's metrics interface. RDS and
+  ElastiCache publish basic CloudWatch metrics at no charge, and the
+  [runbook](aws.md#data-store-metrics) shows where to find them.
+
+`make aws-check` looks up both completions' request IDs in CloudWatch and
+requires the events to equal the pod's own `kubectl logs` lines and to be in
+that pod's stream, which also verifies the Pod Identity role on AWS. Before
+release, the configuration was checked with the pinned image (`--dry-run`), and
+a local run with the same input settings against synthetic CRI files showed that
+the fake provider's file was skipped, a split line was rejoined, and the stream
+names were `pod/<pod>.<container>`.
+`TestAWSDeploy` covers rendering, ordering, and missing Pod Identity
+credentials. `TestAWSCheck` covers missing events, changed events, and the
+wrong stream. `TestAWSFluentBitIdentity` keeps the namespace and service account
+equal to the association, and the tailed files equal to the chart's container
+names. The Terraform tests check the group, trust, and policy. The
+[runbook](aws.md#application-logs-in-cloudwatch) has the Logs Insights queries.
+
+On 2026-10-13 the operator created all 78 platform resources and deployed
+Fluent Bit; its pods received Pod Identity credentials without a Kubernetes API
+token. `make aws-check` passed, including both completions' events matching
+the pod's lines in its stream, and the outcomes-by-status query counted the
+session's 10 admitted `404` and 4 `200` requests. Teardown destroyed all 78
+resources with no log group or other checked leftover. The
+[runbook record](aws.md#logs-verification--2026-10-13) lists what was not covered.
 
 ## Testing
 

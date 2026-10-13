@@ -1,0 +1,124 @@
+# Fluent Bit ships the gateway's log lines to CloudWatch Logs (make
+# aws-deploy). It tails only the gateway and migration containers' files on
+# each node and sends each line's message unchanged: the gateway's own JSON,
+# with no Kubernetes metadata added, so it needs no Kubernetes API access.
+# The stream name carries the pod and container: pod/<pod>.<container>.
+# Credentials come from EKS Pod Identity; the namespace and service account
+# must match deploy/aws/platform/logs.tf. deploy.sh replaces the
+# placeholders with the Terraform log group and a hash of this file, which
+# restarts the pods when the configuration changes.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fluent-bit
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: fluent-bit
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit
+  namespace: fluent-bit
+data:
+  fluent-bit.yaml: |
+    service:
+      flush: 5
+      log_level: info
+    pipeline:
+      inputs:
+        # Kubelet names the files <pod>_<namespace>_<container>-<id>.log.
+        # cri joins lines the runtime split and puts the message in log.
+        # Offsets persist on the node, so a restart neither repeats nor
+        # skips lines; files are discovered within refresh_interval seconds.
+        - name: tail
+          path: /var/log/containers/*_llm-gateway_gateway-*.log,/var/log/containers/*_llm-gateway_migrate-*.log
+          tag: <pod_name>.<container_name>
+          tag_regex: '(?<pod_name>[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-(?<container_id>[a-z0-9]{64})\.log$'
+          multiline.parser: cri
+          db: /var/lib/fluent-bit/tail.db
+          db.locking: true
+          read_from_head: true
+          refresh_interval: 5
+          mem_buf_limit: 16MB
+          skip_long_lines: true
+      outputs:
+        # The region is explicit, so nothing is looked up through IMDS.
+        # auto_create_group stays off: the role cannot create groups.
+        - name: cloudwatch_logs
+          match: '*'
+          region: eu-north-1
+          log_group_name: __LOG_GROUP__
+          log_stream_prefix: pod/
+          log_key: log
+          auto_create_group: false
+          retry_limit: 5
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fluent-bit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fluent-bit
+      annotations:
+        llm-gateway/manifest-sha256: __MANIFEST_SHA256__
+    spec:
+      serviceAccountName: fluent-bit
+      # Pod Identity mounts its own token; no Kubernetes API token is needed.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fluent-bit
+          image: cr.fluentbit.io/fluent/fluent-bit:5.1.3@sha256:c5542543523c9678398dd78d927c05e8425ec15b038f226b67b3b019b1a70845
+          command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/config/fluent-bit.yaml"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          # Root, because the node's log files are readable only by root;
+          # with every capability dropped it reads them as their owner.
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /fluent-bit/config
+              readOnly: true
+            - name: logs
+              mountPath: /var/log
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/fluent-bit
+      volumes:
+        - name: config
+          configMap:
+            name: fluent-bit
+        - name: logs
+          hostPath:
+            path: /var/log
+            type: Directory
+        - name: state
+          hostPath:
+            path: /var/lib/llm-gateway-fluent-bit
+            type: DirectoryOrCreate

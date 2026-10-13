@@ -572,8 +572,9 @@ make aws-up          # shows the plan and asks for approval; about 13 minutes
 ```
 
 Review the plan before approving: `aws_eks_cluster` at `1.37`, one NAT gateway, a
-node group of `c7i-flex.large` on `AL2023_x86_64_STANDARD`, and no
-`aws_iam_openid_connect_provider`, `aws_kms_key`, or `aws_cloudwatch_log_group`.
+node group of `c7i-flex.large` on `AL2023_x86_64_STANDARD`, no
+`aws_iam_openid_connect_provider` or `aws_kms_key`, and only one
+`aws_cloudwatch_log_group`, `application` (see [Application logs](#application-logs-in-cloudwatch)).
 `aws-up` then adds the context `llm-gateway-aws` to your kubeconfig. Healthy nodes
 join a few minutes after the node group starts. If it is still creating after about
 10 minutes, interrupt it and run `make aws-down`: EKS otherwise retries failed
@@ -590,7 +591,7 @@ make aws-leftovers   # fails while anything billable remains
 finds what Terraform does not manage, such as load balancers created by Kubernetes:
 EKS clusters, EC2 instances, EBS volumes, NAT gateways, Elastic IPs, load balancers,
 RDS instances, manual snapshots and automated backups, ElastiCache clusters and
-snapshots, Secrets Manager secrets, and leftover project VPCs.
+snapshots, Secrets Manager secrets, CloudWatch log groups, and leftover project VPCs.
 A NAT gateway can show as deleting for a few minutes; run it again.
 
 Access to the cluster:
@@ -814,7 +815,7 @@ make aws-leftovers
 ```
 
 The cluster then runs two gateway pods, each with the fake provider as a sidecar,
-plus the three External Secrets Operator pods. That adds no hourly AWS charge
+plus the three External Secrets Operator pods and one Fluent Bit pod per node. That adds no hourly AWS charge
 beyond the session's nodes; the controller's two pods fit there too. HTTPS ingress
 adds the ALB charges described above. The IAM roles and Pod
 Identity association are free, and Secrets Manager bills each API call at a
@@ -831,15 +832,18 @@ What `aws-deploy` does, in order (see [Gateway on EKS](architecture.md#gateway-o
 2. Fills the empty session secrets (see [Secrets flow](#secrets-flow)) and writes
    the two client keys to `deploy/aws/session/demo-key` and `limited-key`.
    Treat them as credentials; they are gitignored and valid only until `aws-down`.
-3. Installs External Secrets Operator 2.12.0 into `external-secrets`, creates the
+3. Installs Fluent Bit 5.1.3 into `fluent-bit` from `deploy/aws/fluent-bit.yaml`
+   and checks that its pods received Pod Identity credentials (see
+   [Application logs](#application-logs-in-cloudwatch)).
+4. Installs External Secrets Operator 2.12.0 into `external-secrets`, creates the
    namespace `llm-gateway`, the RDS CA ConfigMap, and the ExternalSecrets from
    `deploy/aws/secrets.yaml`, and waits until all six Kubernetes Secrets are synced.
-4. Runs the `llm-gateway-database-role` Job, which creates or updates
+5. Runs the `llm-gateway-database-role` Job, which creates or updates
    `gateway_app` and prints its table privileges (`none yet` on the first deploy,
    `INSERT, SELECT` afterwards).
-5. Installs the Load Balancer Controller and labels the namespace for readiness
+6. Installs the Load Balancer Controller and labels the namespace for readiness
    gates, then installs or upgrades the gateway chart; its hook migrates as the master user.
-6. Applies HTTPS ingress, ensures ALB readiness gates, and publishes the session DNS alias.
+7. Applies HTTPS ingress, ensures ALB readiness gates, and publishes the session DNS alias.
 
 Rerunning `aws-deploy` in the same session upgrades in place and keeps the
 secrets. The gateway reads its Secrets only at startup: after writing a new
@@ -848,8 +852,9 @@ value, wait for the operator's hourly refresh, or force one with
 `kubectl --context llm-gateway-aws -n llm-gateway rollout restart deployment/llm-gateway`.
 
 `aws-check` prints each step: both completions with their request IDs, the
-metrics sample, admitted and limited counts per pod, and the two usage rows (no
-content, only IDs, models, status, tokens, and estimated cost). Its shared-limit
+metrics sample, admitted and limited counts per pod, the two usage rows (no
+content, only IDs, models, status, tokens, and estimated cost), and each
+completion's log stream in CloudWatch. Its shared-limit
 step uses the `limited` client's burst of 10, which refills one request every 10
 seconds; run it again within about two minutes and it reports fewer than 10
 admitted. To use the gateway by hand, keep a port-forward open and read the key
@@ -887,6 +892,10 @@ Troubleshooting (`aws-up` makes `llm-gateway-aws` the current kubectl context):
   means the database CA does not match; an authentication failure for
   `gateway_app` means the role Job and the Secret disagree, which a rerun of
   `make aws-deploy` resolves.
+- **No log events in CloudWatch:** `kubectl -n fluent-bit logs daemonset/fluent-bit`.
+  `AccessDenied` from `cloudwatch_logs` means the pods lack the role (rerun
+  `make aws-deploy`, which checks for Pod Identity credentials);
+  `ResourceNotFoundException` means the log group is missing (run `make aws-up`).
 - **`aws-check` reports local limits:** the gateway could not reach Valkey; its
   log has one warning with the reason, and `gateway_ratelimit_store_errors_total`
   counts failures.
@@ -935,6 +944,129 @@ scripts on Valkey 9.1.0, sharing one client's burst across two pods, and a
 repeatable deployment. Not covered: ingress, a rolling restart or node drain on
 AWS, autoscaling, and real providers.
 
+## Application logs in CloudWatch
+
+`make aws-deploy` runs Fluent Bit 5.1.3 as a DaemonSet in the `fluent-bit`
+namespace (`deploy/aws/fluent-bit.yaml`). On each node it tails the log files of
+the chart's `gateway` and `migrate` containers and sends every line, unchanged,
+to the log group `/llm-gateway/application`, in a stream per container named
+`pod/<pod>.<container>`. Nothing else is shipped: not the fake provider, the
+role Job, the add-ons, or Kubernetes metadata. Lines usually arrive within
+about 10 seconds. See [Application logs on EKS](architecture.md#application-logs-on-eks)
+for the design.
+
+Review these additions in the `aws-up` plan: `aws_cloudwatch_log_group.application`
+with `retention_in_days = 1`, `aws_iam_role.fluent_bit` (trusting only
+`pods.eks.amazonaws.com` for this account and cluster), its inline policy
+allowing only `logs:CreateLogStream` and `logs:PutLogEvents` on that group, and
+`aws_eks_pod_identity_association.fluent_bit` for `fluent-bit/fluent-bit`. The
+log group is a session resource: `aws-down` deletes it with every event in it,
+and `aws-leftovers` lists any log group left in the Region.
+
+[CloudWatch Logs bills](https://aws.amazon.com/cloudwatch/pricing/) ingestion and
+storage per GB, and Logs Insights per GB scanned. A session writes one line per
+request plus a few startup lines, a few MB even with `make aws-rollout`, so
+the cost is a fraction of a cent. The events cross the NAT gateway, as image
+pulls do. Container Insights, metric filters, and alarms are off.
+
+`make aws-check` finds both completions' lines in CloudWatch by request ID and
+requires them to equal the pod's own lines from `kubectl logs` and to be in that
+pod's stream. It waits up to `AWS_CHECK_LOG_WAIT` seconds (default 120).
+
+### Logs Insights queries
+
+In the console: CloudWatch → Logs → Logs Insights, select
+`/llm-gateway/application`, and pick a time range. The gateway's JSON fields
+(`msg`, `level`, `request_id`, `client_id`, `status`, `code`, `model`,
+`provider`, `latency` in nanoseconds, `retry_count`, `fallback`, `error`) are
+discovered automatically; `@logStream` names the pod.
+
+Outcomes by status, from the one `request completed` line each validated
+request logs:
+
+```text
+filter msg = "request completed"
+| stats count(*) as requests by status, code
+| sort requests desc
+```
+
+Everything logged for one request, whichever pod served it (the ID is the
+response's `X-Request-ID`):
+
+```text
+filter request_id = "REPLACE_WITH_REQUEST_ID"
+| fields @timestamp, @logStream, level, msg, status, code, latency
+| sort @timestamp asc
+```
+
+Changes of the rate-limit store mode: Valkey unavailable (local limits), recovered
+(shared limits), or unreachable at startup. Each is logged once per change, not
+per request:
+
+```text
+filter msg like /^rate limit store/
+| fields @timestamp, @logStream, level, msg, error
+| sort @timestamp asc
+```
+
+From the CLI (times in seconds since the epoch):
+
+```bash
+query_id=$(aws logs start-query --region eu-north-1 \
+  --log-group-name /llm-gateway/application \
+  --start-time $(($(date +%s) - 3600)) --end-time "$(date +%s)" \
+  --query-string 'filter msg = "request completed" | stats count(*) as requests by status, code' \
+  --query queryId --output text)
+aws logs get-query-results --region eu-north-1 --query-id "$query_id"   # repeat until "Complete"
+```
+
+### Data store metrics
+
+RDS and ElastiCache publish basic metrics to CloudWatch at no charge; nothing in
+the platform enables more. In the console: CloudWatch → Metrics → All metrics,
+then **RDS → Per-Database Metrics** for `DBInstanceIdentifier` `llm-gateway`
+(`CPUUtilization`, `DatabaseConnections`, `FreeableMemory`, `FreeStorageSpace`,
+`ReadLatency`, `WriteLatency`), and **ElastiCache → Host-Level Metrics** or
+**Cache Metrics** for `CacheClusterId` `llm-gateway-001` (`CPUUtilization`,
+`EngineCPUUtilization`, `CurrConnections`, `DatabaseMemoryUsagePercentage`).
+The RDS and ElastiCache consoles show the same metrics on each resource's
+**Monitoring** tab. Metrics remain viewable after `aws-down`. There are no
+alarms: the session has no one to page, and the roadmap adds no alerting.
+
+### Logs verification — 2026-10-13
+
+The operator ran the session from a Mac with the working tree of this change and
+supplied the terminal output (durations were not recorded):
+
+- `make aws-up` added 78 resources: the 74 of the ingress session plus the log
+  group, the Fluent Bit role, its policy, and the Pod Identity association. Both
+  amd64 nodes were `Ready` on `v1.37.0-eks` with no external address.
+- `make aws-deploy` deployed commit `d5bf59e7f52a` as
+  `llm-gateway@sha256:36fffab6…` and `llm-gateway-fakeprovider@sha256:fdf5779d…`.
+  The Fluent Bit DaemonSet rolled out on both nodes and passed the Pod Identity
+  check: the credentials were injected even though the pods mount no Kubernetes
+  API token. Secrets, the role Job, the migration hook, the controller, ingress,
+  and two gated gateway pods followed as in earlier sessions.
+- `make aws-check` passed. Both completions' events in `/llm-gateway/application`
+  equaled the pod's own lines and were in its stream
+  (`pod/llm-gateway-847bfc667f-w5pqp.gateway`; the port-forward reached one pod).
+  The earlier checks also passed: shared limits admitted 10 of 30 (5 per pod),
+  both usage rows were in RDS, and the HTTPS checks passed.
+- The outcomes-by-status query above, run with `start-query`, returned 10
+  `404 model_not_found` (the admitted shared-limit requests) and 4 `200` (two
+  completions through the Service, two over HTTPS). It scanned 35 lines, 19,603
+  bytes, for the whole session. Rate-limited requests log `chat completion failed`
+  instead, so they are not counted.
+- `make aws-down` destroyed all 78 resources, and `make aws-leftovers` reported
+  none in every category, including log groups.
+
+This verifies Pod Identity credentials for Fluent Bit, the write-only role,
+delivery of unchanged lines with per-pod streams, Logs Insights field discovery,
+and teardown of the log group. Not covered: the request-ID and rate-limit-store
+queries (no degraded mode occurred), the store metrics pointers, the migration
+container's stream, offsets across a Fluent Bit restart, and delivery while
+CloudWatch is unreachable.
+
 ## Validation and provider updates
 
 `make terraform-check` checks formatting, then for each module initializes with
@@ -952,7 +1084,9 @@ with one NAT gateway, and the S3 gateway endpoint; they also require that an ope
 or wider than /24 `admin_cidr` and a malformed account ID are rejected. A mocked
 apply makes generated IDs available to check that the stores use the private
 subnets, their own security groups, and node-only ingress, plus encryption,
-password management, token/secret agreement, and session teardown settings.
+password management, token/secret agreement, and session teardown settings,
+and the application log group's one-day retention, with a Fluent Bit role that
+only Pod Identity may assume and that may only write to that group.
 
 Commit each module's `.terraform.lock.hcl`; it records the pinned providers'
 checksums for `linux_amd64` (CI), `darwin_arm64`, and `darwin_amd64` (Macs). The

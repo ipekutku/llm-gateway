@@ -48,6 +48,11 @@ output "external_secrets_role_arn" {
   value       = aws_iam_role.external_secrets.arn
 }
 
+output "application_log_group" {
+  description = "CloudWatch log group receiving the gateway's log lines."
+  value       = aws_cloudwatch_log_group.application.name
+}
+
 output "configure_kubectl" {
   description = "Adds the cluster to the local kubeconfig as context llm-gateway-aws."
   value       = "aws eks update-kubeconfig --region eu-north-1 --name ${module.eks.cluster_name} --alias llm-gateway-aws"
