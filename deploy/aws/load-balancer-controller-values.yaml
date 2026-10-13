@@ -1,0 +1,32 @@
+# Helm chart 3.6.0 / controller v3.6.0. ingress.sh checks the chart SHA-256.
+image:
+  tag: v3.6.0@sha256:337a9bf9a99bbac372c8da20afad7b059e0bc89034f1087e325455b28c7fd488
+region: eu-north-1
+serviceAccount:
+  name: aws-load-balancer-controller
+replicaCount: 2
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+securityContext:
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+defaultTags:
+  Project: llm-gateway
+  Stack: platform
+enableShield: false
+enableWaf: false
+enableWafv2: false
+enableServiceMutatorWebhook: false
+podMutatorWebhookConfig:
+  failurePolicy: Fail
+objectSelector:
+  matchLabels:
+    app.kubernetes.io/name: llm-gateway

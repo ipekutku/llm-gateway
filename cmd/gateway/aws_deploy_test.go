@@ -168,6 +168,10 @@ var (
 // arguments are logged to calls, so tests can check that no credential is
 // ever passed as an argument.
 func awsScript(t *testing.T, script, mockScript string, env ...string) (string, error, string) {
+	return awsScriptArgs(t, script, nil, mockScript, env...)
+}
+
+func awsScriptArgs(t *testing.T, script string, args []string, mockScript string, env ...string) (string, error, string) {
 	t.Helper()
 	for _, name := range []string{"bash", "jq", "openssl"} {
 		if _, err := exec.LookPath(name); err != nil {
@@ -179,19 +183,20 @@ func awsScript(t *testing.T, script, mockScript string, env ...string) (string, 
 	if err := os.WriteFile(mock, []byte(mockScript), 0700); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"terraform", "aws", "kubectl", "helm", "docker", "curl", "git"} {
+	for _, name := range []string{"terraform", "aws", "kubectl", "helm", "docker", "curl", "git", "shasum"} {
 		if err := os.Symlink(mock, filepath.Join(dir, name)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", script)
+	cmd := exec.CommandContext(ctx, "bash", append([]string{script}, args...)...)
 	cmd.Dir = "../.."
 	cmd.Env = append([]string{
 		"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"MOCK_DIR=" + dir,
 		"AWS_SESSION_DIR=" + filepath.Join(dir, "session"),
+		"TF_VAR_aws_account_id=123456789012",
 	}, env...)
 	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
@@ -331,10 +336,26 @@ terraform)
     database_name) echo gateway ;;
     database_master_secret_arn) echo 'arn:aws:secretsmanager:eu-north-1:123456789012:secret:rds!db-mock' ;;
     redis_address) echo redis.example ;;
+    vpc_id) echo vpc-0123456789abcdef0 ;;
+    admin_cidr) echo 203.0.113.10/32 ;;
     *) exit 1 ;;
   esac ;;
 aws)
   case $2 in
+    get-caller-identity) echo '{"Account":"123456789012"}' ;;
+    list-hosted-zones-by-name) echo '{"HostedZones":[{"Id":"/hostedzone/ZMOCK","Name":"llm-gateway.utkuipek.dev.","Config":{"PrivateZone":false}}]}' ;;
+    list-certificates) echo '{"CertificateSummaryList":[{"DomainName":"llm-gateway.utkuipek.dev","CertificateArn":"arn:aws:acm:eu-north-1:123456789012:certificate/mock"}]}' ;;
+    describe-certificate) echo '{"Certificate":{"DomainName":"llm-gateway.utkuipek.dev","Status":"ISSUED","CertificateArn":"arn:aws:acm:eu-north-1:123456789012:certificate/mock"}}' ;;
+    describe-load-balancers) echo '{"LoadBalancers":[{"LoadBalancerName":"llm-gateway","LoadBalancerArn":"arn:aws:elasticloadbalancing:eu-north-1:123456789012:loadbalancer/app/llm-gateway/mock","DNSName":"llm-gateway-123.eu-north-1.elb.amazonaws.com","CanonicalHostedZoneId":"ZALB"}]}' ;;
+    describe-tags) echo '{"TagDescriptions":[{"Tags":[{"Key":"Project","Value":"llm-gateway"},{"Key":"Stack","Value":"platform"},{"Key":"elbv2.k8s.aws/cluster","Value":"llm-gateway"},{"Key":"ingress.k8s.aws/stack","Value":"llm-gateway/llm-gateway"}]}]}' ;;
+    list-resource-record-sets) echo '{"ResourceRecordSets":[]}' ;;
+    change-resource-record-sets)
+      while (($#)); do
+        if [[ $1 == --change-batch ]]; then cp "${2#file://}" "$MOCK_DIR/dns.json"; break; fi
+        shift
+      done
+      echo '{"ChangeInfo":{"Id":"/change/mock"}}' ;;
+    wait) ;;
     describe-secret) if [[ $SCENARIO == filled-secrets ]]; then echo 1; else echo 0; fi ;;
     put-secret-value)
       while (($#)); do
@@ -349,6 +370,7 @@ aws)
     *) exit 1 ;;
   esac ;;
 helm) ;;
+shasum) echo 'ee0403fcd713d6f1d28b1ff17d0d6d47e011cc4dd727a0aed0d95ae46897226a fixture' ;;
 curl)
   while (($#)); do
     if [[ $1 == -o ]]; then echo 'RDS CA fixture' >"$2"; fi
@@ -360,13 +382,18 @@ kubectl)
     'create namespace'|'create configmap') echo 'kind: Fixture' ;;
     'apply -f')
       if [[ $3 == - ]]; then cat >/dev/null
-      elif [[ $3 == */secrets.yaml ]]; then cp "$3" "$MOCK_DIR/secrets.yaml"; fi ;;
+      elif [[ $3 == */secrets.yaml ]]; then cp "$3" "$MOCK_DIR/secrets.yaml"
+      elif [[ $3 == */ingress.yaml ]]; then cp "$3" "$MOCK_DIR/ingress.yaml"; fi ;;
+    'label namespace') ;;
+    'get targetgroupbindings') echo '{"items":[{"spec":{"serviceRef":{"name":"llm-gateway"},"targetType":"ip"}}]}' ;;
+    'get ingress') echo llm-gateway-123.eu-north-1.elb.amazonaws.com ;;
+    'rollout status') ;;
     'wait --for=condition=Ready') [[ $SCENARIO != sync-fails ]] ;;
     'get externalsecret') echo 'synthetic status' ;;
     'delete job') ;;
     'get job') if [[ $SCENARIO == role-fails ]]; then echo 'Failed '; else echo 'Complete '; fi ;;
     'logs job/llm-gateway-database-role') echo 'gateway_app table privileges: INSERT, SELECT' ;;
-    'get pods') ;;
+    'get pods') echo '{"items":[{"spec":{"readinessGates":[{"conditionType":"target-health.elbv2.k8s.aws/mock"}]}},{"spec":{"readinessGates":[{"conditionType":"target-health.elbv2.k8s.aws/mock"}]}}]}' ;;
     *) exit 1 ;;
   esac ;;
 *) exit 1 ;;

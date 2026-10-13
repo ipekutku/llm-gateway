@@ -10,6 +10,7 @@
 #    ExternalSecrets, and waits until every Secret is synced;
 # 4. creates or updates the gateway's database role (database-role.yaml);
 # 5. installs or upgrades the chart, whose hook runs the migrations.
+# 6. creates HTTPS ingress, ensures ALB readiness gates, and publishes DNS.
 # AWS_IMAGE_SHA selects the commit; by default it is the newest commit of
 # origin/main this branch contains. Needs aws, terraform, kubectl, helm,
 # docker (buildx), jq, curl, openssl, and git; run from the repository root.
@@ -38,6 +39,9 @@ fail() {
 	echo "$*" >&2
 	exit 1
 }
+
+# Stop before any cluster/secret changes if DNS or issuance is incomplete.
+bash deploy/aws/ingress.sh preflight
 
 # 1. Images: a commit SHA tag on GHCR, pinned to the digest it names now.
 sha=${AWS_IMAGE_SHA:-$(git merge-base HEAD origin/main)}
@@ -150,9 +154,12 @@ done
 [[ $status == *Complete* ]] || fail "The database role Job did not complete (conditions: ${status:-none})."
 
 # 5. The chart; its pre-install/pre-upgrade hook migrates as the master user.
+# Install the controller and label the namespace before any gateway rollout.
+bash deploy/aws/ingress.sh prepare
 helm --kube-context "$context" upgrade --install "$release" deploy/helm/llm-gateway \
 	--namespace "$namespace" -f deploy/aws/values.yaml \
 	--set image.tag="$sha@${gateway_image##*@}" --set "sidecars[0].image=$fakeprovider_image" \
 	--wait --timeout 5m
+bash deploy/aws/ingress.sh publish
 "${kn[@]}" get pods -o wide
 echo "Deployed $sha. Check it with make aws-check."

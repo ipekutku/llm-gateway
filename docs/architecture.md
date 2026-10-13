@@ -953,12 +953,13 @@ The split gives infrastructure two independent lifetimes and state keys:
 
 | Stack | Resources | State key | Lifetime |
 |---|---|---|---|
-| `bootstrap` | S3 state bucket, two private ECR repositories | `bootstrap/terraform.tfstate` | Kept between sessions |
-| `platform` | VPC, EKS, RDS PostgreSQL, ElastiCache Valkey, secret containers, and the External Secrets role | `platform/terraform.tfstate` | Created for working sessions, then destroyed |
+| `bootstrap` | S3 state bucket, two private ECR repositories, optional gateway DNS zone and ACM certificate | `bootstrap/terraform.tfstate` | Kept between sessions |
+| `platform` | VPC, EKS, RDS PostgreSQL, ElastiCache Valkey, secret containers, External Secrets and Load Balancer Controller roles | `platform/terraform.tfstate` | Created for working sessions, then destroyed |
 
 Both keys use the bootstrap bucket. The network, cluster, and data stores have
 live creation, connection, and teardown verification. The [gateway deployment](#gateway-on-eks)
-is implemented with mocked checks; ingress and cloud logs are not implemented. Taggable resources inherit
+and [HTTPS ingress](#https-ingress-on-eks) have live checks, including one rollout
+and complete session teardown; cloud logs are not implemented. Taggable resources inherit
 `Project=llm-gateway` and `Stack=bootstrap` or `Stack=platform`.
 
 The state bucket has versioning, explicit SSE-S3/AES256 encryption, all four public
@@ -996,6 +997,34 @@ checks bucket protections, image settings/retention, and account input without
 AWS credentials or API calls. These checks do not establish a live apply, remote
 state migration, scan result, or image push; those remain manual verification,
 separate from the operator-provided bootstrap results in the runbook.
+
+### Gateway DNS and certificate
+
+An optional bootstrap `domain_name` input adds a public Route 53 child zone,
+a DNS-validated, non-exportable RSA certificate in `eu-north-1`, and its validation
+CNAME. Empty preserves the original state/ECR-only bootstrap. The chosen hostname
+is `llm-gateway.utkuipek.dev`; the parent stays with Cloudflare, and the operator
+adds the child's four name servers there once. No registrar API credentials or
+new Terraform provider are needed. Route 53 DNSSEC signing is off; the signed
+parent delegates to an unsigned child without a DS record.
+
+These resources persist across platform sessions. The zone forbids destruction
+while its block remains configured and never force-deletes records; operators
+must keep the same domain input on later bootstrap runs. The certificate allows
+replacement before destruction. Bootstrap intentionally has no
+`aws_acm_certificate_validation` waiter: its first apply must finish and print
+name servers before the manual delegation can happen. ACM validates asynchronously;
+the certificate ARN output is a request, not evidence of issuance. A timed-out
+request needs an explicit replacement after fixing delegation.
+
+Mocked plans check the optional path, DNS input boundaries, public-zone settings,
+certificate settings, exact validation-record wiring, and delegation outputs.
+The operator's 2026-10-13 verification applied exactly three additions, confirmed
+delegation with two public resolvers, observed ACM `ISSUED`, and finished with a
+no-change bootstrap plan (exit code 0). This stage creates no A/AAAA address; the
+[session ingress](#https-ingress-on-eks) publishes it. The
+[runbook](aws.md#gateway-dns-and-certificate) covers review, delegation, issuance,
+and recovery, all independent of the running EKS platform.
 
 ### Platform network and cluster
 
@@ -1121,7 +1150,7 @@ found an apply-method mismatch on `rds.force_ssl`; making `pending-reboot`
 explicit removed it, and the next plan reported no changes with exit code 0.
 All 67 resources were then destroyed, and every leftover category was empty.
 The [runbook record](aws.md#store-verification--2026-10-12) separates these
-results from gateway integration and persistence, which remain unverified.
+results from gateway integration and persistence, which that store check did not exercise.
 That live run preceded the change from separate hostname checks to verifying
 the actual AUTH connection. A second AWS session passed verified AUTH and PING,
 then exposed a Lua reply-parsing bug: a returned string is a RESP bulk string,
@@ -1161,7 +1190,7 @@ database role Job (master user) ──► migration hook (master user) ──►
   change what runs. Code on an unmerged branch is not deployed. Pulls go through
   the NAT gateway, about 10 MB per image and node.
 - **Secrets.** External Secrets Operator 2.12.0, pinned by chart version and
-  digest, is the only workload with AWS permissions. Its role, created by
+  digest, has its own AWS role. Its role, created by
   Terraform, trusts only `pods.eks.amazonaws.com` with `aws:SourceAccount` and
   this cluster's `aws:SourceArn`, and allows `GetSecretValue` and
   `DescribeSecret` on exactly the four containers, the Valkey token, and the
@@ -1189,8 +1218,9 @@ database role Job (master user) ──► migration hook (master user) ──►
   The plaintext keys exist only in the gitignored `deploy/aws/session/` (mode
   0600) for `make aws-check`; values travel through private files, never command
   arguments. A secret that already has a value is never replaced.
-- **Network.** Nothing new is exposed: the Service stays `ClusterIP`, and the
-  checks use `kubectl port-forward` through the restricted API endpoint. Pods
+- **Network.** The Service stays `ClusterIP`; store/metrics checks use
+  `kubectl port-forward` through the restricted API endpoint, and the
+  [ALB](#https-ingress-on-eks) exposes only its API port over HTTPS. Pods
   reach RDS and Valkey through the node security group rules above; both
   providers point at the sidecar on loopback, so requests never leave the pod.
 
@@ -1224,6 +1254,74 @@ not a Go dependency; it adds three pods (controller, webhook, certificate
 controller) and 25 CRDs. It was chosen over AWS's Secrets Store CSI provider
 because it can template a URL from several secrets into a Kubernetes Secret,
 which keeps the chart unchanged.
+
+### HTTPS ingress on EKS
+
+Terraform creates the Load Balancer Controller role, its v3.6.0 upstream policy,
+and a Pod Identity association for `kube-system/aws-load-balancer-controller`.
+The policy is vendored unchanged from the release and includes broad discovery
+and ELB/EC2 operations; trust limits it to this account and cluster, and the
+association identifies the controller service account. The gateway still has no
+AWS role. Region and VPC settings are explicit, avoiding pod access to IMDS.
+
+`deploy/aws/ingress.sh` manages the controller and session ingress outside the
+chart. Its Helm chart 3.6.0 is checked against a pinned package SHA-256, and the
+controller image is pinned by index digest. It uses two replicas, restricted
+container settings, default `Project`/`Stack` tags, and no WAF/Shield integration.
+VPC subnet tags enable public ALB discovery. The controller creates frontend and
+backend security groups and updates node rules to reach pod IP targets on 8080.
+
+```text
+operator IPv4 CIDR → HTTPS :443 ALB → HTTP :8080 gateway pod
+                          ↑                   (metrics stay on :9464)
+Route 53 session A alias ──┘
+Pod Identity → controller → ALB, target group, and security groups
+```
+
+Ingress has only an HTTPS listener, the issued eu-north-1 certificate, and a
+TLS 1.2/1.3 policy. The ALB is internet-facing with IPv4 only, but its frontend
+security group accepts only `admin_cidr`. TLS terminates there; the pod connection
+is plaintext inside the VPC. Health checks use `/readyz`, preserving the
+shutdown-only readiness contract. The ALB's 150s idle timeout exceeds the
+default 120s upstream budget.
+
+Deployment preflight verifies the AWS account, public child zone, and issued
+certificate before mutations. The namespace enables pod readiness gates, and
+the controller's pod mutator uses `Fail` only for gateway pods there. First
+install runs the chart, creates ingress, waits for its target-group binding,
+and restarts pods missing gates; publication waits for gated pods and rollout
+completion. Later upgrades use the existing binding. The gateway shutdown delay
+is 15s, longer than the ALB's 5s deregistration delay, followed by a 25s HTTP
+drain and a 55s pod grace period. Long completions may still be cut off.
+
+The session A alias is written through the operator's AWS credentials; the
+controller has no Route 53 policy. Teardown deletes that alias, then Ingress,
+then waits for the ALB and controller-tagged security groups before Terraform
+destroys the platform. It checks ownership, rejects unexpected DNS records,
+and stops on inventory or cleanup failure. Certificate status does not block
+teardown. Leftover inventory excludes only the zone's apex NS/SOA and the
+certificate's exact validation CNAME. Bootstrap survives; the alias does not.
+
+`make aws-check` adds verified HTTPS readiness, authentication, both completions,
+and absence of metrics/pprof to its existing checks. `make aws-rollout` is an
+opt-in 5 requests/s, 90s Vegeta run with a restart after 15s, requiring readiness
+gates and traffic through the completed rollout; any non-200 or transport error
+fails it. Reports stay private under the session directory. Mocked scripts,
+Terraform, and Helm checks are separate from live AWS verification.
+
+On 2026-10-13 the operator created all 74 platform resources and deployed the
+controller and gateway. The first-install restart gave both pods readiness
+gates `1/1` on different nodes. Service and verified HTTPS completions passed,
+along with authentication and metrics/pprof isolation; shared limits admitted
+10 of 30 requests across two pods, and both Service completions were stored in
+RDS. Rollout run `rollout-abnql0y7` sent 450 completions over HTTPS at 5/s for
+90s, with one restart completed during traffic: all 450 returned 200 without
+transport errors, p50 296.104 ms, p99 305.186 ms, max 511.482 ms. A subsequent
+`make aws-up` found no drift. Teardown destroyed all 74 resources and removed
+the session alias, with no checked leftovers; bootstrap remained. These are
+one low-rate synthetic run's results, not a capacity or general rollout
+guarantee. The [runbook](aws.md#ingress-verification--2026-10-13) records the
+environment, image digest, raw-artifact location, and untested cases.
 
 ## Testing
 
