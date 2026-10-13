@@ -4,8 +4,9 @@
 # 1. resolves the GHCR images of a commit on main to their digests;
 # 2. fills empty Secrets Manager containers with this session's demo values:
 #    synthetic provider keys, a random database password for gateway_app, and
-#    two random client keys, whose plaintext stays only in deploy/aws/session/
-#    for make aws-check; a secret that already has a value is never replaced;
+#    three random client keys, whose plaintext stays only in deploy/aws/session/
+#    for make aws-check and aws-demo; a secret that already has a value is
+#    never replaced;
 # 3. installs Fluent Bit (fluent-bit.yaml), which ships the gateway's log
 #    lines to CloudWatch Logs, and checks it received Pod Identity credentials;
 # 4. installs External Secrets Operator, the RDS CA ConfigMap, and the
@@ -48,6 +49,9 @@ bash deploy/aws/ingress.sh preflight
 # 1. Images: a commit SHA tag on GHCR, pinned to the digest it names now.
 sha=${AWS_IMAGE_SHA:-$(git merge-base HEAD origin/main)}
 [[ $sha =~ ^[0-9a-f]{40}$ ]] || fail "AWS_IMAGE_SHA must be a full 40-character commit SHA"
+# Only commits on main are deployed: CI publishes them after every job passed.
+git merge-base --is-ancestor "$sha" origin/main 2>/dev/null ||
+	fail "$sha is not on origin/main; fetch origin, or choose a commit merged to main."
 digest() {
 	local ref=$registry/$1:$sha digest
 	if ! digest=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$ref" | jq -er .digest) ||
@@ -97,21 +101,23 @@ if ! has_value llm-gateway/database-app-password; then
 fi
 if ! has_value llm-gateway/clients; then
 	# demo answers the checks; limited has bursts of 10 and refills one
-	# request every 10 seconds, so the shared-limit check is exact.
-	for client in demo limited; do
+	# request every 10 seconds, so the shared-limit check is exact; load
+	# carries make aws-demo's traffic, up to 500 requests/s.
+	for client in demo limited load; do
 		printf 'aws-%s-%s' "$client" "$(openssl rand -hex 24)" >"$work/$client-key"
 	done
 	hash() { openssl dgst -sha256 -r <"$work/$1-key" | cut -d' ' -f1; }
-	jq -n --arg demo "$(hash demo)" --arg limited "$(hash limited)" '{clients: [
+	jq -n --arg demo "$(hash demo)" --arg limited "$(hash limited)" --arg load "$(hash load)" '{clients: [
 		{id: "demo", key_sha256: $demo, requests_per_minute: 600, burst: 20, max_concurrent: 10},
-		{id: "limited", key_sha256: $limited, requests_per_minute: 6, burst: 10, max_concurrent: 5}
+		{id: "limited", key_sha256: $limited, requests_per_minute: 6, burst: 10, max_concurrent: 5},
+		{id: "load", key_sha256: $load, requests_per_minute: 30000, burst: 1000, max_concurrent: 400}
 	]}' >"$work/clients.json"
 	put llm-gateway/clients "$work/clients.json"
 	mkdir -p "$session"
-	mv "$work/demo-key" "$work/limited-key" "$session/"
-	echo "client keys for make aws-check: $session/demo-key, $session/limited-key"
-elif [[ ! -f $session/demo-key || ! -f $session/limited-key ]]; then
-	echo "note: llm-gateway/clients already has a value, but $session has no client keys; make aws-check needs them"
+	mv "$work/demo-key" "$work/limited-key" "$work/load-key" "$session/"
+	echo "client keys for make aws-check and aws-demo: $session/{demo,limited,load}-key"
+elif [[ ! -f $session/demo-key || ! -f $session/limited-key || ! -f $session/load-key ]]; then
+	echo "note: llm-gateway/clients already has a value, but $session lacks client keys; make aws-check and aws-demo need them"
 fi
 
 # 3. Fluent Bit, before the gateway's pods and Jobs start. The hash covers

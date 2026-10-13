@@ -66,7 +66,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check aws-up aws-down aws-check-stores aws-deploy aws-check aws-rollout aws-leftovers aws-init kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check aws-up aws-down aws-check-stores aws-deploy aws-check aws-rollout aws-demo aws-leftovers aws-init kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -213,6 +213,12 @@ aws-check:
 ## Opt-in, needs aws-deploy and the session's demo key; never run in CI.
 aws-rollout:
 	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/rollout.sh
+
+## aws-demo: RDS reboot, node drain, rolling restart, and autoscaling under
+## load from this machine through the ALB (deploy/aws/demo.sh, about 20
+## minutes). Opt-in, needs aws-deploy; never run in CI.
+aws-demo:
+	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/demo.sh
 
 ## aws-down: remove the DNS alias and Ingress, wait for the controller's ALB
 ## and security groups to disappear, then destroy the platform after approval.

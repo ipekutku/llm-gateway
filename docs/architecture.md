@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the implemented gateway through v0.9 containers and Kubernetes. The request path has client authentication and per-client rate limits, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, a circuit breaker per provider, and asynchronous usage persistence with estimated costs. Structured logs, bounded Prometheus metrics, optional OpenTelemetry traces, and a local Grafana dashboard make that behavior observable. With optional Redis, several gateway instances share the rate limits and fall back to their own when Redis is unavailable. A distroless image and a Helm chart run it in Kubernetes, with health probes, a graceful shutdown drain, a migration hook, a disruption budget, and optional autoscaling; a local kind cluster runs the same chart in CI.
+This document describes the implemented gateway through v1.0 AWS infrastructure. The request path has client authentication and per-client rate limits, a vendor-neutral provider contract, OpenAI and Anthropic adapters, static routing with provider fallback, upstream timeouts, bounded retries, a circuit breaker per provider, and asynchronous usage persistence with estimated costs. Structured logs, bounded Prometheus metrics, optional OpenTelemetry traces, and a local Grafana dashboard make that behavior observable. With optional Redis, several gateway instances share the rate limits and fall back to their own when Redis is unavailable. A distroless image and a Helm chart run it in Kubernetes, with health probes, a graceful shutdown drain, a migration hook, a disruption budget, and optional autoscaling; a local kind cluster runs the same chart in CI, and Terraform deploys it to EKS with managed PostgreSQL and Valkey.
 
 ## Request flow
 
@@ -1188,8 +1188,11 @@ database role Job (master user) ──► migration hook (master user) ──►
   sidecar from one commit on `main`, by default the newest one the working branch
   contains (`AWS_IMAGE_SHA` overrides it). The SHA tag is resolved to its index
   digest at deploy time and passed as `<sha>@sha256:…`, so a moved GHCR tag cannot
-  change what runs. Code on an unmerged branch is not deployed. Pulls go through
-  the NAT gateway, about 10 MB per image and node.
+  change what runs. Code on an unmerged branch is not deployed: a SHA outside
+  `origin/main` is refused before anything changes. This operator-run step is the
+  pipeline's deployment stage; CI cannot hold AWS credentials, so it ends at the
+  publish job (see the [runbook](aws.md#ci-images-and-aws-credentials)). Pulls go
+  through the NAT gateway, about 10 MB per image and node.
 - **Secrets.** External Secrets Operator 2.12.0, pinned by chart version and
   digest, has its own AWS role. Its role, created by
   Terraform, trusts only `pods.eks.amazonaws.com` with `aws:SourceAccount` and
@@ -1215,9 +1218,10 @@ database role Job (master user) ──► migration hook (master user) ──►
   still record such a statement, and it is not exported.
 - **Demo values.** Each session, `aws-deploy` fills empty secrets only: synthetic
   provider keys (the fake provider ignores them), a random 64-character hex app
-  password, and two random client keys whose SHA-256 hashes form the clients file.
+  password, and three random client keys (`demo`, `limited`, and `load`) whose
+  SHA-256 hashes form the clients file.
   The plaintext keys exist only in the gitignored `deploy/aws/session/` (mode
-  0600) for `make aws-check`; values travel through private files, never command
+  0600) for `make aws-check` and `make aws-demo`; values travel through private files, never command
   arguments. A secret that already has a value is never replaced.
 - **Network.** The Service stays `ClusterIP`; store/metrics checks use
   `kubectl port-forward` through the restricted API endpoint, and the
@@ -1236,7 +1240,8 @@ gateway's GCRA and lease scripts on Valkey 9.1, which CI covers only on Redis 8.
 `TestAWSDeploy` and `TestAWSCheck` run both scripts with fake external commands:
 pinned images and operator chart, only empty secrets filled, client hashes
 matching the session keys, the role Job before the chart, no credential in any
-output or command argument, and failure on a missing image, unsynced secrets,
+output or command argument, and failure on a commit outside `origin/main`, a
+missing image, unsynced secrets,
 a failed role Job, unshared limits, a client still refilling, local-limit mode,
 or missing usage records. `TestAWSSecretTemplates` renders the URL templates as
 the operator does (`text/template`, `missingkey=error`) and parses them back with
@@ -1403,6 +1408,61 @@ the pod's lines in its stream, and the outcomes-by-status query counted the
 session's 10 admitted `404` and 4 `200` requests. Teardown destroyed all 78
 resources with no log group or other checked leftover. The
 [runbook record](aws.md#logs-verification--2026-10-13) lists what was not covered.
+
+### Demonstrations on AWS
+
+`make aws-demo` (`deploy/aws/demo.sh`) repeats the [kind demonstrations](#demonstrations)
+where AWS adds something kind could not show, and reuses the existing checks for
+the rest: `make aws-check` already shows limits shared across pods on Valkey, and
+`make aws-rollout` a rolling restart through the ALB. Its scenarios and how to
+run them are in the [runbook](aws.md#demonstrations). Decisions:
+
+- **Load through the ALB from the operator's machine.** The ALB balances each
+  request across the pods and exercises TLS, the readiness gates, and the
+  restricted listener, which an in-cluster generator would bypass; Vegeta is
+  built pinned on the operator's machine, so the cluster needs no load image.
+  The round trip to the Region is in every latency, so the numbers show
+  behavior, not capacity.
+- **A node drain instead of a Spot interruption.** The project's SCPs deny Spot.
+  `kubectl drain` evicts through the same Eviction API, so it shows what the
+  PodDisruptionBudget and the readiness gates do when a node goes away; the
+  script uncordons the node on any exit.
+- **An RDS reboot instead of deleting the database.** It interrupts the managed
+  instance's connections the way a maintenance restart does, with no data loss
+  to repair, and costs nothing. Lost usage records are counted from the gateway's
+  own warnings and compared with stored rows, as in kind.
+- **No assertions on timing.** Like `make kind-demo`, it records numbers; only
+  `rollout`, which reuses `make aws-rollout`, fails on an unsuccessful request.
+
+Results of 2026-10-13 (runs `demo-20261013T182932Z` and `demo-20261013T184427Z`;
+two `c7i-flex.large` nodes, Kubernetes 1.37, chart 0.5.0, load from a MacBook Air
+over a home connection; details in the [runbook record](aws.md#demonstration-verification--2026-10-13)):
+
+| Scenario | Result |
+|---|---|
+| `database` | RDS was available again 45 s after the reboot request; both pods stayed ready and all 4,800 requests succeeded. 249 records were reported lost in 23 warnings and 4,551 stored, accounting for every request. |
+| `drain` | The node was empty after 19 s; its gateway pod was replaced on the other node within 21 s, and all 3,000 requests succeeded. No eviction was refused, since only one gateway pod was on the node. |
+| `rollout` | 450 of 450 requests succeeded through one restart. |
+| `scale` | At 200 requests/s CPU settled at 59–64% of the request, below the target, so two pods sufficed. At 300 requests/s it reached 86%, and a third pod was ready 69 s into the run; all 54,000 requests succeeded. |
+
+What they show, and what they do not:
+
+- **The managed stores are off the request path, as designed.** An RDS reboot
+  cost accounting records, logged with their counts, and nothing else; the
+  same outcome as the kind database outage, now against the managed instance.
+- **Node loss is absorbed at two replicas.** One pod per node meant a drain
+  never had to wait on the PodDisruptionBudget; a refused eviction was not
+  exercised live.
+- **CPU remains a coarse scaling signal**, as in kind: the gateway mostly waits
+  on the provider, so 300 requests/s needed only a third pod.
+- **Behavior, not capacity.** Latencies include the operator's round trip to the
+  Region, the load came from one laptop, and zone failures, Valkey failover, and
+  node-group replacement were not exercised.
+
+`TestAWSDemo` runs the script with fake external commands: no cluster or AWS
+call without the `load` key, no key in output, arguments, or results, the
+reboot and lost-record arithmetic, and that a failed drain still uncordons the
+node and stops the load generator.
 
 ## Testing
 

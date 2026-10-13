@@ -208,6 +208,12 @@ func awsScript(t *testing.T, script, mockScript string, env ...string) (string, 
 
 func awsScriptArgs(t *testing.T, script string, args []string, mockScript string, env ...string) (string, error, string) {
 	t.Helper()
+	return awsScriptMocks(t, script, args, mockScript, nil, env...)
+}
+
+// awsScriptMocks also replaces the extra commands, such as sleep or go.
+func awsScriptMocks(t *testing.T, script string, args []string, mockScript string, extra []string, env ...string) (string, error, string) {
+	t.Helper()
 	for _, name := range []string{"bash", "jq", "openssl"} {
 		if _, err := exec.LookPath(name); err != nil {
 			t.Fatalf("AWS script checks require %s: %v", name, err)
@@ -218,7 +224,7 @@ func awsScriptArgs(t *testing.T, script string, args []string, mockScript string
 	if err := os.WriteFile(mock, []byte(mockScript), 0700); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"terraform", "aws", "kubectl", "helm", "docker", "curl", "git", "shasum"} {
+	for _, name := range append([]string{"terraform", "aws", "kubectl", "helm", "docker", "curl", "git", "shasum"}, extra...) {
 		if err := os.Symlink(mock, filepath.Join(dir, name)); err != nil {
 			t.Fatal(err)
 		}
@@ -249,12 +255,13 @@ func readMockFile(t *testing.T, dir, name string) string {
 
 func TestAWSDeploy(t *testing.T) {
 	failures := map[string]string{
+		"not-on-main":     awsTestSHA + " is not on origin/main",
 		"image-missing":   "Cannot resolve ghcr.io/ipekutku/llm-gateway:" + awsTestSHA,
 		"no-pod-identity": "Fluent Bit pods have no Pod Identity credentials",
 		"sync-fails":      "External Secrets did not sync",
 		"role-fails":      "The database role Job did not complete (conditions: Failed )",
 	}
-	for _, scenario := range []string{"empty-secrets", "filled-secrets", "image-missing", "no-pod-identity", "sync-fails", "role-fails"} {
+	for _, scenario := range []string{"empty-secrets", "filled-secrets", "not-on-main", "image-missing", "no-pod-identity", "sync-fails", "role-fails"} {
 		t.Run(scenario, func(t *testing.T) {
 			out, err, dir := awsScript(t, "deploy/aws/deploy.sh", awsDeployMock, "SCENARIO="+scenario, "AWS_IMAGE_SHA="+awsTestSHA)
 			ok := scenario == "empty-secrets" || scenario == "filled-secrets"
@@ -266,8 +273,12 @@ func TestAWSDeploy(t *testing.T) {
 			if helmGateway != ok {
 				t.Fatalf("installed the gateway chart: %v\n%s", helmGateway, calls)
 			}
-			if scenario == "image-missing" && (strings.Contains(calls, "kubectl") || strings.Contains(calls, "put-secret-value")) {
-				t.Fatal("changed the cluster or secrets without a resolvable image")
+			if (scenario == "not-on-main" || scenario == "image-missing") &&
+				(strings.Contains(calls, "kubectl") || strings.Contains(calls, "put-secret-value")) {
+				t.Fatal("changed the cluster or secrets without a deployable image")
+			}
+			if scenario == "not-on-main" && strings.Contains(calls, "docker") {
+				t.Fatal("resolved images for a commit that is not on main")
 			}
 			if scenario == "sync-fails" && strings.Contains(calls, "database-role") {
 				t.Fatal("ran the database role Job before the Secrets were synced")
@@ -286,7 +297,7 @@ func TestAWSDeploy(t *testing.T) {
 				if puts != 0 {
 					t.Fatal("replaced a secret that already had a value")
 				}
-				if !strings.Contains(out, "make aws-check needs them") {
+				if !strings.Contains(out, "make aws-check and aws-demo need them") {
 					t.Fatal("no note about the missing client keys")
 				}
 			}
@@ -334,8 +345,8 @@ func TestAWSDeploy(t *testing.T) {
 			if err := json.Unmarshal([]byte(readMockFile(t, dir, "put-llm-gateway/clients")), &clients); err != nil {
 				t.Fatal(err)
 			}
-			if len(clients.Clients) != 2 {
-				t.Fatalf("clients file has %d clients, want 2", len(clients.Clients))
+			if len(clients.Clients) != 3 {
+				t.Fatalf("clients file has %d clients, want 3", len(clients.Clients))
 			}
 			secretValues := []string{readMockFile(t, dir, "put-llm-gateway/database-app-password")}
 			if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(secretValues[0]) {
@@ -359,6 +370,9 @@ func TestAWSDeploy(t *testing.T) {
 			if c := clients.Clients[1]; c.ID != "limited" || c.Burst != 10 || c.RequestsPerMinute != 6 {
 				t.Errorf("limited client %+v, want bursts of 10 at 6 per minute, as aws-check expects", c)
 			}
+			if c := clients.Clients[2]; c.ID != "load" || c.RequestsPerMinute < 200*60 {
+				t.Errorf("load client %+v, want at least 200 requests/s, as aws-demo sends", c)
+			}
 			for _, value := range secretValues {
 				if strings.Contains(out, value) || strings.Contains(calls, value) {
 					t.Fatal("a generated credential appeared in output or command arguments")
@@ -372,6 +386,8 @@ const awsDeployMock = `#!/usr/bin/env bash
 set -eu
 echo "$(basename "$0") $*" >>"$MOCK_DIR/calls"
 case $(basename "$0") in
+git)
+  [[ "$1 $2 $4" == "merge-base --is-ancestor origin/main" && $SCENARIO != not-on-main ]] ;;
 docker)
   [[ $SCENARIO != image-missing ]] || exit 1
   case $* in

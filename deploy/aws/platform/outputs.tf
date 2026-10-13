@@ -18,6 +18,11 @@ output "database_address" {
   value       = aws_db_instance.postgres.address
 }
 
+output "database_identifier" {
+  description = "RDS instance identifier, for make aws-demo's reboot."
+  value       = aws_db_instance.postgres.identifier
+}
+
 output "database_name" {
   description = "Database created on the instance."
   value       = aws_db_instance.postgres.db_name

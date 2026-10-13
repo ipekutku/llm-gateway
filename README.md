@@ -36,7 +36,7 @@ The project is intentionally developed **incrementally**. Each milestone should 
 
 ## Project Status
 
-v0.1 through v0.9 are feature-complete; v1.0 (AWS deployment with Terraform) is in progress, with the [state and image repository bootstrap](docs/aws.md), images published from CI, and an [on-demand EKS cluster](docs/aws.md#platform-sessions) with private RDS and Valkey defined in Terraform, and a [deployment of the gateway](docs/aws.md#deploy-and-check-the-gateway) onto it. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
+v0.1 through v1.0 are feature-complete. v1.0 deploys the same image and chart to AWS with Terraform: an [on-demand EKS platform](docs/aws.md#platform-sessions) with private RDS PostgreSQL and ElastiCache Valkey, secrets from Secrets Manager, HTTPS through an ALB, and logs in CloudWatch, created, deployed, checked, demonstrated, and destroyed with `make` targets. Each milestone leaves the gateway runnable and tested. Scope and exit criteria live in [docs/ROADMAP.md](docs/ROADMAP.md), and design decisions in [docs/architecture.md](docs/architecture.md).
 
 ```text
 v0.1  Provider abstraction + routing          ✅
@@ -48,8 +48,18 @@ v0.6  Prometheus + OpenTelemetry              ✅
 v0.7  Redis + multi-instance behavior        ✅
 v0.8  Load testing + performance work          ✅
 v0.9  Docker + Kubernetes + Helm               ✅
-v1.0  AWS deployment with Terraform
+v1.0  AWS deployment with Terraform           ✅
 ```
+
+### v1.0 — AWS Infrastructure ✅
+
+Implemented (see [AWS infrastructure](#aws-infrastructure) and the [AWS runbook](docs/aws.md)):
+
+* a persistent Terraform bootstrap (S3 state with native locking, ECR, the gateway's Route 53 zone and ACM certificate) and an on-demand platform (two-AZ VPC, EKS 1.37, RDS PostgreSQL 18, ElastiCache Valkey, Secrets Manager, a CloudWatch log group), validated with mocked tests in CI
+* `make aws-deploy`: the unchanged chart with digest-pinned GHCR images of a commit on `main`, External Secrets Operator, the Load Balancer Controller with an HTTPS ALB, and Fluent Bit, each through its own Pod Identity role; the gateway has no AWS permissions and writes usage as a read/insert-only database role
+* `make aws-check` and `make aws-demo`: completions over verified HTTPS, limits shared through Valkey, usage rows in RDS, log lines in CloudWatch, and an RDS reboot, node drain, rolling restart, and scale-out without a failed request
+* CI scans and publishes both images to GHCR; deployment stays an operator step, since the project cannot give GitHub AWS credentials
+* a recorded session from no resources to a checked deployment and back, with `make aws-leftovers` finding nothing left
 
 ### v0.9 — Containers and Kubernetes ✅
 
@@ -436,6 +446,10 @@ Fluent Bit, with a Pod Identity role that may only write to one log group,
 ships the gateway's JSON log lines unchanged to [CloudWatch Logs](docs/aws.md#application-logs-in-cloudwatch)
 for the session, with documented Logs Insights queries; `make aws-check`
 compares them with the pods' own lines. A [live session](docs/aws.md#logs-verification--2026-10-13) passed that check and a Logs Insights query.
+Deployment is this operator-run step: CI ends at publishing the images, since it
+cannot hold AWS credentials, and `make aws-deploy` refuses a commit outside
+`origin/main`. `make aws-demo` [demonstrates](docs/aws.md#demonstrations) an RDS
+reboot, a node drain, a rolling restart, and autoscaling under load through the ALB.
 
 ### Configuration
 
