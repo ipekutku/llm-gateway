@@ -469,6 +469,7 @@ reboot, a node drain, a rolling restart, and autoscaling under load through the 
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables tracing: base URL of an OpenTelemetry collector accepting OTLP over HTTP, such as `http://127.0.0.1:4318`. Unset means no tracing. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (the full URL) also enables it, and the other standard `OTEL_*` exporter, sampler, and resource variables apply. See [Traces](#traces). |
 | `GATEWAY_UPSTREAM_TIMEOUT` | Time limit for all upstream work on one request, as a Go duration such as `90s` or `2m`. Default `120s`. If it expires, the client gets `504 upstream_timeout`. |
 | `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Time limit for connecting to a provider (TCP dial and TLS handshake). Default `10s`. |
+| `GATEWAY_MAX_TOKENS` | Optional ceiling on `max_tokens`, from `1` to `1000000`. A request asking for more gets `400 invalid_request` and never reaches a provider; a request without `max_tokens` gets `1024` or the ceiling, whichever is smaller. Unset means no ceiling. Bounds what one request can cost and how long it can generate: keep long generations inside `GATEWAY_PROVIDER_TIMEOUT` when a fallback is set, since a primary that times out has usually already been billed. |
 | `GATEWAY_RETRY_MAX_ATTEMPTS` | Total attempts per request, including the first, from `1` to `10`. Default `3`. Set `1` to disable retries. |
 | `GATEWAY_RETRY_BASE_DELAY` | Longest wait before the first retry; it doubles for each further retry. The actual wait is random up to this value. Default `500ms`. |
 | `GATEWAY_RETRY_MAX_DELAY` | Cap on that doubling wait. Default `8s`. If a provider's `Retry-After` asks for longer, the gateway stops retrying and uses the fallback, or returns the error, instead of waiting. |
@@ -595,7 +596,7 @@ Live runs have not covered refusals (`content_filter`), Anthropic prompt-cache r
 |---|---|
 | `model` | Required. Must match a configured model. |
 | `messages` | Required. `role` is `system`, `user`, or `assistant`; `content` is a non-empty string. An optional `system` message must come first. |
-| `max_tokens` | Optional positive integer. Default `1024`. Sent to OpenAI as `max_completion_tokens` and to Anthropic as `max_tokens`. |
+| `max_tokens` | Optional positive integer, at most `GATEWAY_MAX_TOKENS` when that is set. Default `1024`, or the ceiling if lower. Sent to OpenAI as `max_completion_tokens` and to Anthropic as `max_tokens`. |
 | `stream` | Only `false` or absent. Streaming is not supported. |
 | anything else | Accepted but ignored (for example `temperature`, `tools`, `n`). |
 

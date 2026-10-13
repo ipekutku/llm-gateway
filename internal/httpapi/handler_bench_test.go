@@ -112,7 +112,7 @@ func BenchmarkHandler(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				h, err := httpapi.New(tracer.Route(router), a, l, time.Minute,
+				h, err := httpapi.New(tracer.Route(router), a, l, time.Minute, 0,
 					httpapi.Accounting{Recorder: benchmarkRecorder{}, Pricing: pricing, Models: map[string]string{"openai": "bench-model"}}, m, logger)
 				if err != nil {
 					b.Fatal(err)

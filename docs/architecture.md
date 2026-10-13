@@ -137,7 +137,7 @@ Every request other than a [health probe](#health-probes), including one rejecte
 | `model` | Required, non-blank string. Forwarded unchanged for exact-match routing. |
 | `messages` | Required, non-empty array. An optional `system` message is allowed only at index 0. Every other role must be `user` or `assistant`, and at least one such message is required. |
 | `messages[].content` | Required, non-blank string. Arrays, objects, and `null` are rejected. Content is forwarded unchanged, including surrounding whitespace. |
-| `max_tokens` | Optional positive integer. Absent or `null` uses the gateway default of 1024, so every provider receives the same normalized value. Provider-specific limits are left to the upstream. |
+| `max_tokens` | Optional positive integer. Absent or `null` uses the gateway default of 1024, so every provider receives the same normalized value. With `GATEWAY_MAX_TOKENS` set, a larger value is rejected (`max_tokens must not exceed <n>`) rather than lowered, so a client never receives a shorter answer than it asked for without knowing, and the default becomes the ceiling if that is lower, so a request without the field is never rejected. Provider-specific limits are left to the upstream. |
 | `stream` | Optional. Absent, `null`, or `false` is accepted; `true` is rejected. |
 
 Other rules:
@@ -300,6 +300,7 @@ Configuration is read once at startup in `cmd/gateway`: settings from the enviro
 | `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | Absent or `http/protobuf`; anything else fails startup, since only OTLP over HTTP is supported. |
 | `GATEWAY_UPSTREAM_TIMEOUT` | Upstream time budget per request, as a Go duration (`90s`, `2m`). Default `120s`. |
 | `GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | Limit on the upstream TCP dial and, separately, the TLS handshake. Default `10s`. |
+| `GATEWAY_MAX_TOKENS` | Optional ceiling on a request's `max_tokens`, from 1 to 1,000,000. Unset means none, the v1.0 behavior. Request rate limits count requests, not tokens, so without it one client's request can ask for as much output as the model allows; a generation that outlasts the primary timeout also counts against the breaker and, with a fallback, is generated and billed twice. |
 | `GATEWAY_RETRY_MAX_ATTEMPTS` | Total attempts per request, including the first, from 1 to 10. Default `3`; `1` disables retries. |
 | `GATEWAY_RETRY_BASE_DELAY` | Backoff ceiling before the first retry, doubling per retry. Default `500ms`. |
 | `GATEWAY_RETRY_MAX_DELAY` | Cap on the backoff ceiling and on the `Retry-After` the gateway will wait for; must not be less than the base delay. Default `8s`. |

@@ -329,6 +329,18 @@ func TestLoadConfig(t *testing.T) {
 			}(),
 		},
 		{
+			name: "max tokens ceiling",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_MAX_TOKENS": " 4096 ",
+			},
+			want: func() config {
+				c := withDefaults(config{Addr: defaultAddr, OpenAI: openaiCfg})
+				c.MaxTokens = 4096
+				return c
+			}(),
+		},
+		{
 			name: "retries disabled",
 			vars: map[string]string{
 				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
@@ -523,6 +535,30 @@ func TestLoadConfigErrors(t *testing.T) {
 				"GATEWAY_BREAKER_COOLDOWN must be a positive duration",
 				"GATEWAY_PROVIDER_TIMEOUT must be a positive duration",
 			},
+		},
+		{
+			name: "zero max tokens",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_MAX_TOKENS": "0",
+			},
+			want: []string{"GATEWAY_MAX_TOKENS must be an integer from 1 to 1000000"},
+		},
+		{
+			name: "max tokens above the bound",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_MAX_TOKENS": "1000001",
+			},
+			want: []string{"GATEWAY_MAX_TOKENS must be an integer from 1 to 1000000"},
+		},
+		{
+			name: "unparsable max tokens",
+			vars: map[string]string{
+				"OPENAI_MODEL": "gpt-4o", "OPENAI_API_KEY": openaiKey,
+				"GATEWAY_MAX_TOKENS": "4k",
+			},
+			want: []string{"GATEWAY_MAX_TOKENS must be an integer from 1 to 1000000"},
 		},
 		{
 			name: "invalid shutdown settings",

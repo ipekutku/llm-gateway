@@ -298,7 +298,7 @@ func TestLimiterReceivesRequestContext(t *testing.T) {
 		gotID, _ = ctx.Value(requestIDKey{}).(string)
 		return func() { released++ }, nil
 	})
-	h, err := New(okProvider, testAuthenticator(t), limiter, testTimeout, testAccounting(), nil, slog.New(slog.DiscardHandler))
+	h, err := New(okProvider, testAuthenticator(t), limiter, testTimeout, 0, testAccounting(), nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -324,7 +324,7 @@ func TestLimiterErrorIsAnInternalError(t *testing.T) {
 	limiter := limiterFunc(func(context.Context, string) (func(), error) {
 		return nil, errors.New("limiter unavailable")
 	})
-	h, err := New(p, testAuthenticator(t), limiter, testTimeout, testAccounting(), nil, slog.New(slog.DiscardHandler))
+	h, err := New(p, testAuthenticator(t), limiter, testTimeout, 0, testAccounting(), nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -345,7 +345,7 @@ func TestClientGoneDuringAdmissionIsClientClosed(t *testing.T) {
 		return nil, ctx.Err()
 	})
 	var logs strings.Builder
-	h, err := New(p, testAuthenticator(t), limiter, testTimeout, testAccounting(), nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	h, err := New(p, testAuthenticator(t), limiter, testTimeout, 0, testAccounting(), nil, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

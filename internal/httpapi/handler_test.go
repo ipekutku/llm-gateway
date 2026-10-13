@@ -74,7 +74,7 @@ func TestNewRequiresAccounting(t *testing.T) {
 	a := testAuthenticator(t)
 	l := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
 	for _, accounting := range []Accounting{{}, {Recorder: discardRecorder{}}, {Pricing: testAccounting().Pricing}} {
-		if _, err := New(okProvider, a, l, testTimeout, accounting, nil, nil); err == nil {
+		if _, err := New(okProvider, a, l, testTimeout, 0, accounting, nil, nil); err == nil {
 			t.Error("New accepted incomplete accounting dependencies")
 		}
 	}
@@ -127,7 +127,7 @@ func newHandlerWithTimeout(t *testing.T, p llm.Provider, timeout time.Duration) 
 func newHandlerWith(t *testing.T, p llm.Provider, limiter *ratelimit.Limiter, timeout time.Duration) (http.Handler, *bytes.Buffer) {
 	t.Helper()
 	var logs bytes.Buffer
-	h, err := New(p, testAuthenticator(t), limiter, timeout, testAccounting(), nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	h, err := New(p, testAuthenticator(t), limiter, timeout, 0, testAccounting(), nil, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -182,13 +182,13 @@ const validBody = `{"model":"model-a","messages":[{"role":"user","content":"hi"}
 func TestNewRejectsNilDependencies(t *testing.T) {
 	a := testAuthenticator(t)
 	l := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
-	if _, err := New(nil, a, l, testTimeout, testAccounting(), nil, nil); err == nil {
+	if _, err := New(nil, a, l, testTimeout, 0, testAccounting(), nil, nil); err == nil {
 		t.Error("New(nil provider) error = nil, want error")
 	}
-	if _, err := New(okProvider, nil, l, testTimeout, testAccounting(), nil, nil); err == nil {
+	if _, err := New(okProvider, nil, l, testTimeout, 0, testAccounting(), nil, nil); err == nil {
 		t.Error("New(nil authenticator) error = nil, want error")
 	}
-	if _, err := New(okProvider, a, nil, testTimeout, testAccounting(), nil, nil); err == nil {
+	if _, err := New(okProvider, a, nil, testTimeout, 0, testAccounting(), nil, nil); err == nil {
 		t.Error("New(nil limiter) error = nil, want error")
 	}
 }
@@ -197,7 +197,7 @@ func TestNewRejectsNonPositiveTimeout(t *testing.T) {
 	a := testAuthenticator(t)
 	l := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
 	for _, timeout := range []time.Duration{0, -time.Second} {
-		if _, err := New(okProvider, a, l, timeout, testAccounting(), nil, nil); err == nil {
+		if _, err := New(okProvider, a, l, timeout, 0, testAccounting(), nil, nil); err == nil {
 			t.Errorf("New(timeout %v) error = nil, want error", timeout)
 		}
 	}
@@ -473,6 +473,62 @@ func TestChatCompletionsMaxTokens(t *testing.T) {
 				t.Errorf("MaxTokens = %d, want %d", p.req.MaxTokens, tt.wantValue)
 			}
 		})
+	}
+}
+
+func TestChatCompletionsMaxTokensCeiling(t *testing.T) {
+	tests := []struct {
+		name      string
+		ceiling   int
+		field     string
+		wantValue int
+		wantError string
+	}{
+		{name: "omitted under a high ceiling", ceiling: 4096, field: ``, wantValue: defaultMaxTokens},
+		{name: "omitted under a low ceiling", ceiling: 500, field: ``, wantValue: 500},
+		{name: "null under a low ceiling", ceiling: 500, field: `,"max_tokens":null`, wantValue: 500},
+		{name: "below", ceiling: 4096, field: `,"max_tokens":100`, wantValue: 100},
+		{name: "at", ceiling: 4096, field: `,"max_tokens":4096`, wantValue: 4096},
+		{name: "above", ceiling: 4096, field: `,"max_tokens":4097`, wantError: "max_tokens must not exceed 4096"},
+		{name: "far above", ceiling: 4096, field: `,"max_tokens":200000`, wantError: "max_tokens must not exceed 4096"},
+		{name: "zero is still invalid", ceiling: 4096, field: `,"max_tokens":0`, wantError: "max_tokens must be a positive integer"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &recordingProvider{}
+			limiter := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
+			h, err := New(p, testAuthenticator(t), limiter, testTimeout, tt.ceiling, testAccounting(), nil, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			rec := post(t, h, `{"model":"m","messages":[{"role":"user","content":"hi"}]`+tt.field+`}`)
+
+			if tt.wantError != "" {
+				body := assertError(t, rec, http.StatusBadRequest, typeInvalidRequest, codeInvalidRequest)
+				if body.Message != tt.wantError {
+					t.Errorf("message = %q, want %q", body.Message, tt.wantError)
+				}
+				if p.calls != 0 {
+					t.Errorf("provider called %d times, want 0", p.calls)
+				}
+				return
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body)
+			}
+			if p.req.MaxTokens != tt.wantValue {
+				t.Errorf("MaxTokens = %d, want %d", p.req.MaxTokens, tt.wantValue)
+			}
+		})
+	}
+}
+
+func TestNewRejectsNegativeMaxTokens(t *testing.T) {
+	a := testAuthenticator(t)
+	l := testLimiter(t, map[string]ratelimit.Limits{"team-a": generous})
+	if _, err := New(okProvider, a, l, testTimeout, -1, testAccounting(), nil, nil); err == nil {
+		t.Error("New(max tokens -1) error = nil, want error")
 	}
 }
 
