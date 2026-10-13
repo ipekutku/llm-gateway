@@ -547,6 +547,20 @@ Limitations: GHCR tags are mutable, so deployments should pin the digest that a
 SHA tag resolves to; SHA tags accumulate with no retention policy; and a CI
 deployment job would need AWS credentials, which the same restriction blocks.
 
+So the pipeline ends at the publish job, and deployment is a manual step:
+the operator runs [`make aws-deploy`](#deploy-and-check-the-gateway) from their
+machine with their short-lived `aws login` credentials. It is controlled in
+these ways: it deploys only a commit in `origin/main`, whose images exist
+only because every CI job passed; it pins both images to the digests their SHA
+tags name at that moment; and nothing deploys on merge. A GitHub
+`workflow_dispatch` deployment gated by an environment approval was planned and
+dropped for the reason above. What this leaves out: GitHub keeps no deployment
+history (the release's `helm history` lives only as long as the session's
+cluster), and the digest is trusted as GHCR serves it, without a signed
+provenance check. If the project ever allows an IAM identity provider, a deploy
+role trusted only for a protected GitHub environment and limited to the
+`llm-gateway` namespace would replace the laptop step.
+
 ## Platform sessions
 
 The platform module creates a VPC across `eu-north-1a` and `eu-north-1b` (private
@@ -682,7 +696,7 @@ one that is still empty with a value for this session:
 |---|---|---|
 | `llm-gateway/openai-api-key` | OpenAI key | a synthetic key the fake provider ignores |
 | `llm-gateway/anthropic-api-key` | Anthropic key | a synthetic key the fake provider ignores |
-| `llm-gateway/clients` | Complete clients JSON, containing only SHA-256 key hashes | two random clients, `demo` and `limited` |
+| `llm-gateway/clients` | Complete clients JSON, containing only SHA-256 key hashes | three random clients, `demo`, `limited`, and `load` |
 | `llm-gateway/database-app-password` | Password of the gateway's `gateway_app` PostgreSQL role | 64 random hex characters |
 
 Never reuse the public kind/load-test keys here. To supply your own value, write
@@ -828,9 +842,11 @@ What `aws-deploy` does, in order (see [Gateway on EKS](architecture.md#gateway-o
 1. Resolves `ghcr.io/ipekutku/llm-gateway` and `-fakeprovider` for the chosen
    commit to their digests. It fails if CI has not published that commit, for
    example on an unmerged branch whose base is not in your local `origin/main`.
-   To deploy another commit from `main`, set `AWS_IMAGE_SHA` to its full SHA.
+   To deploy another commit from `main`, set `AWS_IMAGE_SHA` to its full SHA; a
+   commit that is not in your local `origin/main` is refused.
 2. Fills the empty session secrets (see [Secrets flow](#secrets-flow)) and writes
-   the two client keys to `deploy/aws/session/demo-key` and `limited-key`.
+   the three client keys to `deploy/aws/session/demo-key`, `limited-key`, and
+   `load-key` (up to 500 requests/s, for [demonstrations](#demonstrations)).
    Treat them as credentials; they are gitignored and valid only until `aws-down`.
 3. Installs Fluent Bit 5.1.3 into `fluent-bit` from `deploy/aws/fluent-bit.yaml`
    and checks that its pods received Pod Identity credentials (see
@@ -1066,6 +1082,71 @@ and teardown of the log group. Not covered: the request-ID and rate-limit-store
 queries (no degraded mode occurred), the store metrics pointers, the migration
 container's stream, offsets across a Fluent Bit restart, and delivery while
 CloudWatch is unreachable.
+
+## Demonstrations
+
+`make aws-demo` runs [`deploy/aws/demo.sh`](../deploy/aws/demo.sh) after
+`make aws-deploy aws-check`: four scenarios in about 20 minutes, by hand only,
+never in CI. Run a single one with `bash deploy/aws/demo.sh <scenario>`. Load
+comes from Vegeta v12.13.0, built pinned on this machine, through the ALB over
+verified HTTPS, as the session's `load` client. The ALB balances each request
+across the pods, and `inbound-cidrs` admits only `admin_cidr`, so run it from
+that address. Requests go to the fake provider sidecar, which answers after
+200 ms. Each run writes Vegeta reports, gateway logs, and a `summary.md` to
+`deploy/aws/session/demo-<UTC time>/`, gitignored and free of keys. Nothing
+asserts timing, and latencies include this machine's round trip to the Region:
+the numbers are a record, not capacity.
+
+| Scenario | What happens |
+|---|---|
+| `database` | 20 requests/s for 240 s; after 15 s, `aws rds reboot-db-instance` on the single-AZ instance, polling its status every 5 s until it is `available` again. Requests should keep succeeding, since readiness and the request path do not depend on PostgreSQL. Records lost meanwhile are counted from the gateway's `usage records not persisted` warnings and compared with the rows stored for the scenario. |
+| `drain` | 20 requests/s for 150 s; after 15 s, `kubectl drain` on the node with the most gateway pods. Evictions honor the chart's PodDisruptionBudget (one pod unavailable at a time) and the ALB readiness gates; refused evictions are counted from the drain output. The node is uncordoned afterwards, also if the script stops. This replaces a Spot interruption, which the project cannot launch. |
+| `rollout` | `make aws-rollout`: 5 requests/s for 90 s as the `demo` client, with one `kubectl rollout restart`; it fails on any unsuccessful request. |
+| `scale` | `SCALE_RATE` (default 200) requests/s for 180 s, sampling the HPA's CPU measurement and ready pods every 15 s; it starts once the autoscaler is back at its minimum of two pods. Runs last, so scale-down cannot remove pods during the other scenarios. |
+
+The scenarios cost nothing beyond the session: the RDS reboot is free, and the
+traffic is a few MB through the ALB. Results are recorded below and summarized in
+[Demonstrations on AWS](architecture.md#demonstrations-on-aws).
+
+### Demonstration verification — 2026-10-13
+
+The operator ran a complete session from a MacBook Air (Apple silicon, macOS,
+load over a home connection to `eu-north-1`) with the working tree of this
+change, starting with no platform resources. Durations are wall-clock times
+from `time`:
+
+| Step | Time | Result |
+|---|---|---|
+| `make aws-up` | 15 min 12 s | 78 resources added; two `c7i-flex.large` nodes in `eu-north-1a` and `-1b`, `Ready` on `v1.37.0-eks` |
+| `make aws-deploy` | 5 min 15 s | commit `22c4e143ecdc` as `llm-gateway@sha256:1e479566…` and `llm-gateway-fakeprovider@sha256:d628a25b…`; four secrets filled, six Secrets synced, role Job, migration hook, two gated pods |
+| `make aws-check` | 36 s | both completions, metrics, 10 of 30 admitted across two pods (5 and 5), both usage rows, both requests' lines unchanged in CloudWatch, HTTPS checks |
+| `make aws-demo` | 12 min 45 s | run `demo-20261013T182932Z`, below |
+| `SCALE_RATE=300 … demo.sh scale` | 4 min 13 s | run `demo-20261013T184427Z`, below |
+| `make aws-down` | 14 min 34 s | DNS alias, Ingress, and ALB removed first, then all 78 resources destroyed |
+| `make aws-leftovers` | — | `none` in every category, including log groups, secrets, RDS backups, and gateway DNS records |
+
+Results (all load as the `load` client through the ALB; the fake provider
+answers after 200 ms; most of the remaining ~90 ms of the median is the round
+trip from the operator's machine):
+
+| Scenario | Result |
+|---|---|
+| `database` | The instance was `available` again 45 s after the reboot request. Both gateway pods stayed ready, and all 4,800 requests succeeded (p50 291.9 ms, p99 309.8 ms, max 491.8 ms). 23 `usage records not persisted` warnings reported 249 lost records, and 4,551 rows were stored: together exactly the 4,800 requests. Writes resumed after the reboot without intervention. |
+| `drain` | Both nodes ran one gateway pod, and the drained node's pod, one controller replica, CoreDNS, metrics-server, and the operator were evicted; the node was empty after 19 s, and two gateway pods were ready on the other node after 21 s. No eviction was refused, since the other gateway pod was available throughout. All 3,000 requests succeeded (p99 298.2 ms, max 616.4 ms). |
+| `rollout` | Run `rollout-mRNDjjsw`: 450 of 450 requests succeeded through one restart (p99 301.1 ms). |
+| `scale`, 200/s | CPU settled at 59–64% of the request, below the 70% target, so the autoscaler kept two pods. All 36,000 requests succeeded (p50 286.3 ms, p99 324.1 ms). |
+| `scale`, 300/s | CPU reached 86% at 51 s, the autoscaler asked for a third pod, and it was ready by 69 s; with three, CPU settled at 58–60%. All 54,000 requests succeeded (p50 286.9 ms, p99 333.5 ms, max 703 ms). |
+
+From nothing to a checked HTTPS deployment took about 21 minutes of commands,
+and the whole cycle, including both demonstration runs and teardown, about 53.
+This is the reproducibility record for the milestone: one sequence of `make`
+targets created, deployed, checked, exercised, and removed the platform with no
+manual AWS step and nothing left behind.
+
+Not shown: the PodDisruptionBudget refusing an eviction (that needs both gateway
+pods on the drained node), a zone failure, a Valkey failover, a node replaced
+by the node group, and scale-out beyond three pods. The latencies include the
+operator's network and say nothing about capacity.
 
 ## Validation and provider updates
 
