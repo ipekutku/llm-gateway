@@ -7,6 +7,8 @@ private image repositories. The [platform](#platform-sessions) in
 cluster, RDS PostgreSQL, Valkey, and secrets for a working session, then is
 destroyed. [`make aws-deploy`](#deploy-and-check-the-gateway) installs the
 gateway on that cluster for the session.
+Bootstrap also optionally keeps the gateway's [DNS zone and certificate
+request](#gateway-dns-and-certificate), independently of the platform.
 The roadmap defines the remaining [milestone scope](ROADMAP.md#milestone-10--aws-infrastructure).
 
 ## Setup and costs
@@ -35,9 +37,16 @@ the policy is for this demonstration, not a production retention guarantee.
 State versions are retained without automatic expiration, to allow recovery.
 
 The platform holds the hourly-cost resources: EKS, two nodes, a NAT gateway,
-RDS, and ElastiCache; possibly an ALB later. Create it only for working
+RDS, and ElastiCache, plus the ALB created by deployment. Create it only for working
 sessions, then remove it and check for leftovers (see [Platform sessions](#platform-sessions)).
 Session teardown keeps bootstrap.
+With the gateway DNS zone enabled, bootstrap also incurs the
+[Route 53 hosted-zone charge](https://aws.amazon.com/route53/pricing/): $0.50 per
+month for one of the first 25 zones, plus applicable DNS query charges. The zone
+charge starts at creation and is not prorated. The certificate has export disabled;
+[ACM public certificates used with an ALB](https://aws.amazon.com/certificate-manager/pricing/)
+have no separate certificate charge. Domain registration is paid to the outside
+registrar separately.
 
 Authenticate with short-lived credentials and confirm the target account:
 
@@ -87,6 +96,8 @@ account and Region: six S3 resources (bucket, versioning, encryption, public acc
 block, ownership controls, and policy), two ECR repositories, and two lifecycle
 policies. Taggable resources inherit `Project=llm-gateway` and `Stack=bootstrap`.
 There are no VPC, cluster, data store, IAM identity, or secret resources.
+This count assumes `domain_name` is empty (the default). Enabling
+[gateway DNS](#gateway-dns-and-certificate) adds three resources.
 
 The bucket name is `llm-gateway-tfstate-<account-id>-eu-north-1`. S3 names are
 globally unique; if this name is already taken or a repository already exists,
@@ -151,6 +162,250 @@ Backend access requires `s3:ListBucket` on the bucket, `s3:GetObject` and
 disable locking to bypass a conflict; confirm that no operation is running before
 considering `force-unlock`. State recovery uses previous S3 versions; do not
 overwrite the current version while another Terraform operation is active.
+
+## Gateway DNS and certificate
+
+This is the persistent part of HTTPS ingress, independent of the platform.
+The operator's verification on 2026-10-13 created exactly three resources,
+confirmed all four delegation servers through 1.1.1.1 and 8.8.8.8, observed ACM
+status `ISSUED`, and finished with a no-change bootstrap plan (exit code 0).
+The [session ingress](#https-session-ingress) also has
+[live deployment, rollout, and teardown verification](#ingress-verification--2026-10-13).
+
+The hostname is `llm-gateway.utkuipek.dev`. Cloudflare Registrar keeps the parent
+`utkuipek.dev` zone; Route 53 hosts only the child zone. The operator adds its
+four NS records in Cloudflare once, by hand, following
+[AWS's subdomain delegation procedure](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/MigratingSubdomain.html).
+No Cloudflare provider or API token is used.
+
+Before applying, complete the registrar's registrant email verification and
+ensure you can add the NS records the same day. Bootstrap requests the certificate
+and writes its validation CNAME, then finishes without waiting for issuance, so
+the name-server outputs are available for delegation. ACM allows
+[72 hours for DNS validation](https://docs.aws.amazon.com/acm/latest/userguide/dns-validation.html).
+
+Use the existing remote bootstrap state, initialized as described above; never
+apply against empty local state. Set the optional `domain_name` input to the
+hostname itself, without a wildcard or trailing dot:
+
+```bash
+export TF_VAR_domain_name=llm-gateway.utkuipek.dev
+make terraform-check
+terraform -chdir=deploy/aws/bootstrap plan -out=ingress-bootstrap.tfplan
+```
+
+Review the saved plan before the next step. Against the existing bootstrap, it
+should add exactly three resources: one public hosted zone, one DNS-validated
+RSA certificate request in **eu-north-1** (the ALB's Region), and one validation
+CNAME in that zone. It should leave S3 and ECR unchanged. There is no A/AAAA alias
+or ALB yet. The certificate is non-exportable and uses certificate transparency.
+
+When ready to delegate, apply the reviewed plan and read the outputs:
+
+```bash
+terraform -chdir=deploy/aws/bootstrap apply ingress-bootstrap.tfplan
+terraform -chdir=deploy/aws/bootstrap output -json gateway_name_servers
+terraform -chdir=deploy/aws/bootstrap output -raw gateway_hosted_zone_id
+terraform -chdir=deploy/aws/bootstrap output -raw gateway_certificate_arn
+```
+
+In the Cloudflare dashboard, open `utkuipek.dev` → DNS → Records. Add four records,
+each with Type **NS**, Name **llm-gateway**, TTL **Auto**, and one of the four
+name servers from the output as its value. Keep the existing parent-zone name
+servers. Add no A, AAAA, CNAME, or DS record for `llm-gateway` in Cloudflare.
+The ACM CNAME belongs in the Route 53 child zone and Terraform already creates it.
+
+The parent may remain DNSSEC-signed, while this child delegation is unsigned.
+Route 53 signing is deliberately off: its signing key would need to be in
+[us-east-1](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-configuring-dnssec-cmk-requirements.html),
+outside the project's permitted Region. Adding a child DS without signing the
+child zone would break validating resolvers. If the parent has CAA restrictions,
+allow ACM's `amazon.com` issuer.
+
+Check delegation and issuance:
+
+```bash
+dig @1.1.1.1 NS llm-gateway.utkuipek.dev +short
+dig @8.8.8.8 NS llm-gateway.utkuipek.dev +short
+GATEWAY_CERTIFICATE_ARN="$(terraform -chdir=deploy/aws/bootstrap output -raw gateway_certificate_arn)"
+aws acm describe-certificate --region eu-north-1 \
+  --certificate-arn "$GATEWAY_CERTIFICATE_ARN" \
+  --query 'Certificate.{Domain:DomainName,Status:Status,Validation:DomainValidationOptions}'
+```
+
+Both DNS replies must match the four output servers. Confirm the validation
+CNAME resolves using the record name returned by ACM. Continue with ALB work
+only once certificate status is `ISSUED`; an output ARN alone does not prove
+issuance. Pending validation can take time after delegation propagates.
+If validation times out, fix delegation first, then review a replacement plan:
+
+```bash
+terraform -chdir=deploy/aws/bootstrap plan \
+  -replace='aws_acm_certificate.gateway[0]' -out=ingress-bootstrap.tfplan
+# After review, apply this saved plan as above and check issuance again.
+```
+
+An ordinary re-apply does not necessarily replace a timed-out certificate.
+Keep `domain_name` set to the same hostname on every later bootstrap plan/apply,
+either through the environment or a gitignored `.tfvars` file. The zone has
+`prevent_destroy` and `force_destroy=false`, so accidentally omitting or changing
+the input cannot remove its delegation. The certificate permits replacement
+before destruction. Session teardown keeps the zone, validation CNAME, and
+certificate; eligible managed renewals require the certificate to be in use and
+the CNAME to remain in place. Without a session alias, A/AAAA queries for the
+gateway hostname return no address, even after the certificate is issued.
+
+## HTTPS session ingress
+
+The session uses AWS Load Balancer Controller **v3.6.0**, installed from Helm
+chart **3.6.0**, pinned by package SHA-256 and image index digest. Terraform
+adds the controller's IAM role, upstream release policy, and EKS Pod Identity
+association in `kube-system/aws-load-balancer-controller`. It also tags public
+subnets for ALB discovery and passes the VPC ID and Region explicitly, so the
+controller never needs pod access to instance metadata. The gateway has no AWS
+role. The upstream policy has broad discovery and ELB/EC2 permissions; it is
+not limited to Terraform's resource ARNs. Trust is restricted to this account
+and cluster, and the association identifies the controller service account.
+WAF and Shield integration are disabled in its values.
+
+The ingress in `deploy/aws/ingress.yaml` creates one internet-facing IPv4 ALB
+named `llm-gateway`, with only an HTTPS listener on 443, the issued regional ACM
+certificate, and TLS 1.2/1.3 (`ELBSecurityPolicy-TLS13-1-2-Res-2021-06`). Its frontend
+security group admits only the platform's `admin_cidr`, the same CIDR used for
+the Kubernetes API. The controller manages the backend security group and the
+node rules for pod targets. TLS terminates at the ALB; traffic from it to pod
+port 8080 is plain HTTP inside the VPC. The health check is `/readyz`; dependencies
+still never determine readiness. Metrics and pprof are not routed to their port.
+
+Before starting a session, keep the existing AWS login/profile and account
+settings from [Setup](#setup-and-costs), and set:
+
+```bash
+export TF_VAR_domain_name=llm-gateway.utkuipek.dev
+# Use your current public IPv4 address, as /32.
+export TF_VAR_admin_cidr="$(curl -fsS https://checkip.amazonaws.com | tr -d '\n')/32"
+make aws-up
+make aws-deploy
+make aws-check
+make aws-rollout          # optional: 90s of synthetic traffic and one restart
+make aws-down
+make aws-leftovers
+```
+
+Review the `aws-up` plan before its apply. It includes three new controller
+resources (role, inline policy, Pod Identity association) in addition to the
+existing platform. Bootstrap remains separate. The ALB, its target group, and
+controller security groups are created during `aws-deploy`, outside Terraform
+state. They add hourly ALB, capacity-unit, and public IPv4 charges until removed;
+consult [ELB pricing](https://aws.amazon.com/elasticloadbalancing/pricing/).
+On an unmerged branch the deployment helpers and values come from the working
+tree, while gateway and fake-provider images still come from a published main
+commit; no gateway binary change is needed for ingress.
+
+`aws-deploy` checks the current account, finds exactly one public child zone and
+one certificate for the hostname, and requires `ISSUED` before changing secrets
+or the cluster. It installs the controller and labels the gateway namespace for
+readiness-gate injection before upgrading the gateway. On the first install,
+it creates ingress and waits for the Service's target-group binding, then
+restarts the initial pods if they lack gates. It requires gated pods and a
+completed rollout before publishing the Route 53 A alias. Later upgrades use
+the existing binding. The pod mutator fails closed only for gateway pods in the
+labeled namespace; migration and database Jobs do not match its pod selector.
+See the controller's [readiness-gate requirements](https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/deploy/pod_readiness_gate/).
+
+The ALB deregistration delay is 5s. AWS values keep the gateway serving for 15s
+after readiness fails, then drain HTTP for up to 25s, with a 55s pod grace period
+(at least 15 + 25 + 10). Its native fake-provider sidecar remains available
+through shutdown. The ALB idle timeout is 150s, above the default 120s upstream
+budget. These settings support the short synthetic rollout scenario; they do
+not guarantee that arbitrary long completions finish during a rollout.
+
+`make aws-check` retains the port-forward/store checks, then adds requests over
+verified HTTPS to the actual hostname: readiness, a 401 without a gateway key,
+both synthetic completions, and 404 for `/metrics` and `/debug/pprof/` on the API
+ingress. It never disables TLS verification. `make aws-rollout` builds pinned
+Vegeta v12.13.0 into a temporary directory and sends 5 completions/s for 90s,
+restarting after 15s. This stays below the demo client's 10/s rate. It requires
+readiness gates, load lasting through the rollout, and every measured request
+returning 200 without a transport error. Environment and reports remain under
+the gitignored `deploy/aws/session/rollout-*`; the key lives only in a private
+temporary target file that is deleted afterwards. This is an opt-in
+demonstration, not a capacity guarantee or CI test.
+
+Teardown removes the session alias first, then deletes the Ingress and waits
+for the controller's ALB and tagged security groups to disappear, before
+Terraform destroys the cluster and VPC. DNS mutation checks ALB ownership tags
+and refuses to replace/delete unexpected A/AAAA records. AWS inventory failures
+fail the script, never masquerade as an absent resource. A certificate that has
+expired does not block teardown. If controller cleanup fails, `aws-down` stops:
+keep the cluster running, inspect controller logs and Ingress finalizers, and
+restore cleanup; do not force-remove finalizers or destroy its VPC first.
+`aws-leftovers` lists extra child-zone records, retaining only the apex NS/SOA
+and the certificate's exact validation CNAME as expected persistent records.
+The zone and certificate stay between sessions; the hostname has no address
+after teardown.
+
+If HTTPS times out, confirm your current public IP still falls within the
+platform's CIDR; changing networks requires updating the platform and rerunning
+`aws-deploy`. For an ingress failure, inspect:
+
+```bash
+kubectl --context llm-gateway-aws -n llm-gateway describe ingress llm-gateway
+kubectl --context llm-gateway-aws -n kube-system logs deployment/aws-load-balancer-controller
+kubectl --context llm-gateway-aws -n llm-gateway get pods -o wide
+```
+
+Mocked tests cover preflight failures, artifact checksum failure, initial and
+existing readiness gates, DNS publication ordering and payload, ALB ownership,
+foreign DNS records, inventory failures, cleanup order, and the leftover filter.
+The operator's [live session](#ingress-verification--2026-10-13) separately
+verified deployment, HTTPS routing, one successful rollout run, and cleanup.
+
+### Ingress verification — 2026-10-13
+
+The operator ran the AWS commands; the results below combine their terminal
+output with the local rollout report. This session used `eu-north-1`, two
+`c7i-flex.large` nodes running Kubernetes `v1.37.0-eks-3b4a6ca` on Amazon Linux
+2023 (amd64), the v3.6.0 controller/chart, and the working-tree ingress helpers
+and AWS values. The gateway and fake provider were the published images of main
+commit `ce0e41cb9899fe910b2667824dd925b73812df7d`; the gateway index digest was
+`sha256:0e541e310db84c0f3647a614a22918f2b5ee33e01e38f01b1fff557b913ef623`.
+All completions used the fake-provider sidecar, not real provider APIs.
+
+- Platform creation added exactly 74 resources, with no changes or deletions.
+  Both nodes became Ready, with private addresses and no public node address.
+- `make aws-deploy` installed the controller and gateway. It created the
+  Ingress, then restarted the initial pods. Both replacement pods ran on
+  separate nodes with readiness gates `1/1`, before the HTTPS alias was published.
+- `make aws-check` passed both provider completions through the Service,
+  metrics, and the Valkey shared-limit check: each pod admitted 5 and limited
+  10 requests, so the shared burst admitted 10 of 30 overall. Both completions
+  appeared in RDS with status 200, 12 input and 3 output tokens, and estimated
+  cost `0.000018000000` under the synthetic prices.
+- The HTTPS checks passed readiness, both completions with normal certificate
+  verification, authentication rejection without a key, and absence of
+  `/metrics` and `/debug/pprof/` from the API ingress.
+- `make aws-rollout`, run `rollout-abnql0y7` at `2026-10-13T00:16:29Z`, sent
+  5 completions/s for 90s with one rolling restart after 15s. All **450**
+  requests returned **200**, with no reported transport errors. Latency p50 was
+  **296.104 ms**, p99 **305.186 ms**, and maximum **511.482 ms**. The restart
+  completed while traffic was still running. Raw environment/report artifacts
+  remain gitignored under `deploy/aws/session/rollout-abnql0y7`.
+- Rerunning `make aws-up` reported `No changes` and `0 added, 0 changed,
+  0 destroyed`; both nodes stayed Ready.
+- `make aws-down` completed and destroyed all **74** Terraform resources,
+  after the ingress cleanup stage. It removed the session kubeconfig entries.
+  `make aws-leftovers` then found no EKS, EC2, EBS, NAT, EIP, load balancer,
+  RDS/backup/snapshot, ElastiCache/snapshot, Secret, project VPC, or extra gateway
+  DNS record. Bootstrap, including the child zone and validation CNAME, was kept.
+
+This verifies the full session lifecycle and one low-rate ALB rollout over the
+operator's network. It is not a capacity or general zero-downtime guarantee.
+Not exercised: long real-provider generations, an ALB rollout at high load,
+node drain or AZ failure, a second ingress deployment in the same session,
+connections from a disallowed IP, or negative TLS-version negotiation. The
+CIDR and TLS policy restrictions are configured and covered by local checks;
+the live positive HTTPS checks do not prove those negative cases.
 
 ## Manually verify image publication
 
@@ -327,7 +582,7 @@ launches for about 30 minutes, which bills the whole time.
 End every session the same way, even after a failed apply:
 
 ```bash
-make aws-down        # shows the destroy plan and asks for approval
+make aws-down        # removes ingress/DNS, then asks to destroy the platform
 make aws-leftovers   # fails while anything billable remains
 ```
 
@@ -344,8 +599,8 @@ Access to the cluster:
   If your address changes, run `make aws-up` again with the new value.
 - Authentication uses EKS access entries only (no `aws-auth` ConfigMap). Whoever
   applies gets cluster admin.
-- IRSA is off because the project cannot create IAM identity providers; add-ons
-  that need AWS permissions will use EKS Pod Identity, whose agent runs on every node.
+- IRSA is off because the project cannot create IAM identity providers; External
+  Secrets and the Load Balancer Controller use EKS Pod Identity, whose agent runs on every node.
 - There is no customer-managed KMS key (EKS encrypts Secrets with an AWS-owned key)
   and no control-plane logging, since both bill per session.
 
@@ -560,7 +815,8 @@ make aws-leftovers
 
 The cluster then runs two gateway pods, each with the fake provider as a sidecar,
 plus the three External Secrets Operator pods. That adds no hourly AWS charge
-beyond the session's: the pods fit on the two nodes, the IAM role and Pod
+beyond the session's nodes; the controller's two pods fit there too. HTTPS ingress
+adds the ALB charges described above. The IAM roles and Pod
 Identity association are free, and Secrets Manager bills each API call at a
 fraction of a cent. Image pulls cross the NAT gateway, which bills per GB
 processed; the largest is `postgres:18` for the Jobs, at roughly 150 MB per node,
@@ -581,7 +837,9 @@ What `aws-deploy` does, in order (see [Gateway on EKS](architecture.md#gateway-o
 4. Runs the `llm-gateway-database-role` Job, which creates or updates
    `gateway_app` and prints its table privileges (`none yet` on the first deploy,
    `INSERT, SELECT` afterwards).
-5. Installs or upgrades the chart; its hook Job migrates as the master user.
+5. Installs the Load Balancer Controller and labels the namespace for readiness
+   gates, then installs or upgrades the gateway chart; its hook migrates as the master user.
+6. Applies HTTPS ingress, ensures ALB readiness gates, and publishes the session DNS alias.
 
 Rerunning `aws-deploy` in the same session upgrades in place and keeps the
 secrets. The gateway reads its Secrets only at startup: after writing a new
@@ -611,8 +869,9 @@ Review these additions in the `aws-up` plan: `aws_iam_role.external_secrets`
 policy listing six secret ARNs with `GetSecretValue` and `DescribeSecret` only,
 `aws_eks_pod_identity_association.external_secrets` for
 `external-secrets/external-secrets`, and the `database-app-password` container.
-`aws-down` removes everything, including what Helm installed, with the cluster;
-none of it creates AWS resources outside Terraform.
+The controller role/policy and Pod Identity association are session resources too.
+`aws-down` first removes the alias and controller-created ingress resources,
+then removes what Helm installed with the cluster. Bootstrap is kept.
 
 Troubleshooting (`aws-up` makes `llm-gateway-aws` the current kubectl context):
 

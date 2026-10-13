@@ -76,6 +76,40 @@ run "platform" {
   command = apply
 
   assert {
+    condition = jsondecode(aws_iam_role.load_balancer_controller.assume_role_policy).Statement == [{
+      Effect    = "Allow"
+      Principal = { Service = "pods.eks.amazonaws.com" }
+      Action    = ["sts:AssumeRole", "sts:TagSession"]
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = "123456789012" }
+        ArnEquals    = { "aws:SourceArn" = module.eks.cluster_arn }
+      }
+    }]
+    error_message = "Only Pod Identity in this cluster and account may assume the controller role."
+  }
+
+  assert {
+    condition = (
+      aws_eks_pod_identity_association.load_balancer_controller.namespace == "kube-system" &&
+      aws_eks_pod_identity_association.load_balancer_controller.service_account == "aws-load-balancer-controller" &&
+      aws_eks_pod_identity_association.load_balancer_controller.cluster_name == module.eks.cluster_name &&
+      aws_eks_pod_identity_association.load_balancer_controller.role_arn == aws_iam_role.load_balancer_controller.arn &&
+      aws_iam_role_policy.load_balancer_controller.role == aws_iam_role.load_balancer_controller.id &&
+      jsondecode(aws_iam_role_policy.load_balancer_controller.policy) == jsondecode(file("./load-balancer-controller-iam-policy.json"))
+    )
+    error_message = "The pinned controller policy must be attached only to its Pod Identity role."
+  }
+
+  assert {
+    condition = (
+      alltrue([for subnet in module.vpc.public_subnet_objects : subnet.tags["kubernetes.io/role/elb"] == "1"]) &&
+      alltrue([for subnet in module.vpc.private_subnet_objects : subnet.tags["kubernetes.io/role/internal-elb"] == "1"]) &&
+      output.vpc_id == module.vpc.vpc_id && output.admin_cidr == "203.0.113.10/32"
+    )
+    error_message = "Subnet discovery tags and explicit VPC/CIDR outputs must support controller setup."
+  }
+
+  assert {
     condition     = module.eks.cluster_version == "1.37"
     error_message = "The cluster must use the pinned standard-support Kubernetes version."
   }

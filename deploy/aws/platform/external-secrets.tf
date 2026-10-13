@@ -1,6 +1,6 @@
 # External Secrets Operator copies the gateway's secrets from Secrets Manager
-# into the Kubernetes Secrets the chart expects. It is the only workload with
-# AWS permissions: make aws-deploy installs it in this namespace under this
+# into the Kubernetes Secrets the chart expects. make aws-deploy installs it
+# in this namespace under this
 # service account, and EKS Pod Identity gives that service account the role
 # below. The gateway pods get no AWS permissions.
 locals {

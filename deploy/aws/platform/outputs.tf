@@ -3,6 +3,16 @@ output "cluster_name" {
   value       = module.eks.cluster_name
 }
 
+output "vpc_id" {
+  description = "VPC passed explicitly to the Load Balancer Controller, avoiding pod access to IMDS."
+  value       = module.vpc.vpc_id
+}
+
+output "admin_cidr" {
+  description = "Operator CIDR used for both Kubernetes API access and HTTPS ingress."
+  value       = var.admin_cidr
+}
+
 output "database_address" {
   description = "Private host name of the PostgreSQL instance."
   value       = aws_db_instance.postgres.address

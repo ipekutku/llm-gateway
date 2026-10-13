@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Lists resources in the project Region that bill while they exist, whoever
 # created them: Terraform, a Kubernetes controller, or the console. Read-only.
-# Exits 1 if anything is found, so an empty report means nothing is billing
-# by the hour. The bootstrap bucket and image repositories are not listed.
+# Exits 1 if any session resource or extra DNS record is found.
+# Persistent bootstrap resources are not listed; extra records
+# in the gateway zone are, including an alias left pointing at a deleted ALB.
 set -euo pipefail
 
 region=eu-north-1
@@ -48,8 +49,16 @@ check "Secrets" secretsmanager list-secrets --query 'SecretList[].Name'
 check "Project VPCs" ec2 describe-vpcs \
 	--filters Name=tag:Project,Values=llm-gateway --query 'Vpcs[].VpcId'
 
+records=$(bash deploy/aws/ingress.sh records)
+if [[ $(jq length <<<"$records") != 0 ]]; then
+	printf '%-24s %s\n' "Gateway DNS records" "$records"
+	found=1
+else
+	printf '%-24s none\n' "Gateway DNS records"
+fi
+
 if ((found)); then
-	echo "Billable resources remain; run make aws-down, or remove what Terraform does not manage."
+	echo "Session resources or DNS records remain; run make aws-down, or inspect what Terraform does not manage."
 	exit 1
 fi
-echo "Nothing billable is left in $region."
+echo "No session resources or extra gateway DNS records remain in $region; bootstrap is kept."

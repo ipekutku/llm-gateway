@@ -66,7 +66,7 @@ export GRAFANA_PORT ?= 3000
 export JAEGER_UI_PORT ?= 16686
 export OTLP_HTTP_PORT ?= 4318
 
-.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check aws-up aws-down aws-check-stores aws-deploy aws-check aws-leftovers aws-init kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
+.PHONY: check fmt vet test bench bench-check loadtest binary-size performance-probes build vuln image image-check image-scan image-publish helm-lint terraform-check aws-up aws-down aws-check-stores aws-deploy aws-check aws-rollout aws-leftovers aws-init kind-up kind-deploy kind-check kind-demo kind-down smoke db db-stop redis redis-stop observability observability-stop
 
 ## check: run every CI check
 check: fmt vet test bench-check build vuln
@@ -206,10 +206,18 @@ aws-deploy:
 ## pods through Valkey, and usage records in RDS. Needs aws-deploy.
 aws-check:
 	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/check.sh
+	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/check-ingress.sh
 
-## aws-down: destroy the platform after showing the plan for approval, and
-## remove its kubeconfig entries. Bootstrap (state bucket, ECR) is kept.
+## aws-rollout: small synthetic Vegeta run over HTTPS during a rolling restart.
+## Opt-in, needs aws-deploy and the session's demo key; never run in CI.
+aws-rollout:
+	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/rollout.sh
+
+## aws-down: remove the DNS alias and Ingress, wait for the controller's ALB
+## and security groups to disappear, then destroy the platform after approval.
+## Bootstrap (state, ECR, zone, certificate) is kept.
 aws-down: aws-init
+	AWS_KUBE_CONTEXT=$(AWS_KUBE_CONTEXT) bash deploy/aws/ingress.sh down
 	terraform -chdir=$(PLATFORM) destroy
 	-kubectl config delete-context $(AWS_KUBE_CONTEXT)
 	-kubectl config delete-cluster arn:aws:eks:eu-north-1:$(TF_VAR_aws_account_id):cluster/$(AWS_CLUSTER)

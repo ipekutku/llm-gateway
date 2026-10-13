@@ -391,6 +391,14 @@ The `demo` client (`deploy/kind/clients.json`, key `synthetic-kind-demo-key`) ma
 
 ### AWS infrastructure
 
+The persistent Route 53 child zone and ACM certificate for `llm-gateway.utkuipek.dev`
+have [live delegation and issuance verification](docs/aws.md#gateway-dns-and-certificate).
+[HTTPS session ingress](docs/aws.md#https-session-ingress) uses the AWS Load Balancer
+Controller with Pod Identity, restricts the ALB to the operator CIDR, and removes
+its DNS alias and controller resources before session teardown. A
+[live session](docs/aws.md#ingress-verification--2026-10-13) passed HTTPS checks,
+one 450-request rollout with no errors, a no-change plan, and complete teardown.
+
 [`deploy/aws/bootstrap`](deploy/aws/bootstrap) provisions a private, versioned,
 encrypted S3 state bucket and two private ECR repositories in `eu-north-1`, kept
 between sessions. [`deploy/aws/platform`](deploy/aws/platform) creates a VPC and
@@ -398,8 +406,8 @@ an EKS 1.37 cluster with two nodes, private PostgreSQL 18 on RDS, and a single
 Valkey node on ElastiCache for a working session. `make aws-up` creates the
 platform; the network and cluster alone took about 13 minutes and cost about
 $0.30 per hour, with the data stores and secrets adding charges. `make aws-down`
-destroys it, and `make aws-leftovers` fails while anything billable remains in
-the Region. The [platform verification](docs/aws.md#platform-verification--2026-10-12)
+destroys it, and `make aws-leftovers` fails while session resources or extra
+gateway DNS records remain; persistent bootstrap charges continue. The [platform verification](docs/aws.md#platform-verification--2026-10-12)
 covers the network and cluster's create, inspect, and destroy cycle. The data
 stores have mocked Terraform checks; `make aws-check-stores` performs their
 [live TLS and authentication checks](docs/aws.md#check-the-private-data-stores).
@@ -416,12 +424,14 @@ to GHCR rather than ECR, because the AWS project does not allow the GitHub OIDC
 identity provider that keyless ECR pushes need (see the [runbook](docs/aws.md#ci-images-and-aws-credentials)).
 `make aws-deploy` installs the chart on the session's cluster with the GHCR
 images of a commit on `main`, pinned to their digests, and the fake provider as
-a sidecar. External Secrets Operator, the only workload with an AWS role (through
-EKS Pod Identity), turns Secrets Manager values into the Secrets the chart
+a sidecar. External Secrets Operator has its own AWS role (through
+EKS Pod Identity) and turns Secrets Manager values into the Secrets the chart
 expects; the gateway logs in to RDS as a role that can only read and insert.
 `make aws-check` checks completions, metrics, limits shared across two pods
-through Valkey, and usage records in RDS. Both have mocked tests, and a
-[live session](docs/aws.md#gateway-verification--2026-10-13) passed them on AWS.
+through Valkey, usage records in RDS, and verified HTTPS through the ALB. The
+deployment and checks have mocked tests; a [live session](docs/aws.md#gateway-verification--2026-10-13)
+passed the port-forward/store checks before ingress was added. The later
+[ingress session](docs/aws.md#ingress-verification--2026-10-13) also passed HTTPS checks.
 
 ### Configuration
 

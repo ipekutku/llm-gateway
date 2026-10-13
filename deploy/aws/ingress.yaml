@@ -1,0 +1,40 @@
+# ingress.sh substitutes operator CIDR, issued certificate ARN, and hostname.
+# TLS terminates at the ALB; only the API port is forwarded into the VPC.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-gateway
+  namespace: llm-gateway
+  annotations:
+    alb.ingress.kubernetes.io/load-balancer-name: llm-gateway
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/ip-address-type: ipv4
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: __CERTIFICATE_ARN__
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-Res-2021-06
+    alb.ingress.kubernetes.io/inbound-cidrs: __ADMIN_CIDR__
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-path: /readyz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "5"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "2"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/success-codes: "200"
+    # Outlast the 120s upstream budget; silent generations must not idle out.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=150
+    # Five seconds to drain the target, while the gateway serves for 15s.
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=5
+spec:
+  ingressClassName: alb
+  rules:
+    - host: __DOMAIN_NAME__
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: llm-gateway
+                port:
+                  number: 8080

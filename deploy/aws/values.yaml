@@ -66,6 +66,13 @@ autoscaling:
   maxReplicas: 4
   targetCPUUtilizationPercentage: 70
 
+# Outlast target deregistration (5s) and controller propagation. The HTTP
+# drain has 25s; ALB rollouts do not promise to finish arbitrary 120s requests.
+shutdown:
+  delaySeconds: 15
+  timeoutSeconds: 25
+  terminationGracePeriodSeconds: 55
+
 sidecars:
   - name: fakeprovider
     # Replaced by deploy.sh with the fake provider image for the same commit.
