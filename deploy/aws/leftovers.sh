@@ -45,6 +45,9 @@ check "ElastiCache clusters" elasticache describe-cache-clusters --query 'CacheC
 check "ElastiCache snapshots" elasticache describe-snapshots --query 'Snapshots[].SnapshotName'
 # Billed per secret per month, prorated. Secrets pending deletion are not listed.
 check "Secrets" secretsmanager list-secrets --query 'SecretList[].Name'
+# Stored log events bill per GB-month. The platform creates its group only
+# in this Region, so us-east-1 is not searched.
+check "Log groups" logs describe-log-groups --query 'logGroups[].logGroupName'
 # A VPC costs nothing, but one left over means a destroy did not finish.
 check "Project VPCs" ec2 describe-vpcs \
 	--filters Name=tag:Project,Values=llm-gateway --query 'Vpcs[].VpcId'

@@ -155,6 +155,41 @@ func TestAWSExternalSecretsIdentity(t *testing.T) {
 	}
 }
 
+// Fluent Bit must run under the service account the Pod Identity association
+// names, and tail the files of the chart's gateway and migration containers.
+func TestAWSFluentBitIdentity(t *testing.T) {
+	read := func(path string) string {
+		data, err := os.ReadFile("../../" + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	terraform, manifest := read("deploy/aws/platform/logs.tf"), read("deploy/aws/fluent-bit.yaml")
+	namespace := regexp.MustCompile(`fluent_bit_namespace\s*=\s*"([^"]+)"`).FindStringSubmatch(terraform)
+	account := regexp.MustCompile(`fluent_bit_service_account\s*=\s*"([^"]+)"`).FindStringSubmatch(terraform)
+	if namespace == nil || account == nil {
+		t.Fatal("logs.tf no longer names the Fluent Bit namespace and service account")
+	}
+	for _, want := range []string{
+		"kind: ServiceAccount\nmetadata:\n  name: " + account[1] + "\n  namespace: " + namespace[1] + "\n",
+		"kind: DaemonSet\nmetadata:\n  name: fluent-bit\n  namespace: " + namespace[1] + "\n",
+		"serviceAccountName: " + account[1] + "\n",
+	} {
+		if !strings.Contains(manifest, want) {
+			t.Errorf("fluent-bit.yaml lacks %q, which the Pod Identity association expects", want)
+		}
+	}
+	for template, container := range map[string]string{"deployment.yaml": "gateway", "migration-job.yaml": "migrate"} {
+		if !strings.Contains(read("deploy/helm/llm-gateway/templates/"+template), "        - name: "+container+"\n") {
+			t.Errorf("the chart's %s no longer has a container named %s", template, container)
+		}
+		if !strings.Contains(manifest, "/var/log/containers/*_llm-gateway_"+container+"-*.log") {
+			t.Errorf("Fluent Bit does not tail the %s container", container)
+		}
+	}
+}
+
 // The digests the deploy mock reports for the two images.
 const awsTestSHA = "0123456789abcdef0123456789abcdef01234567"
 
@@ -214,11 +249,12 @@ func readMockFile(t *testing.T, dir, name string) string {
 
 func TestAWSDeploy(t *testing.T) {
 	failures := map[string]string{
-		"image-missing": "Cannot resolve ghcr.io/ipekutku/llm-gateway:" + awsTestSHA,
-		"sync-fails":    "External Secrets did not sync",
-		"role-fails":    "The database role Job did not complete (conditions: Failed )",
+		"image-missing":   "Cannot resolve ghcr.io/ipekutku/llm-gateway:" + awsTestSHA,
+		"no-pod-identity": "Fluent Bit pods have no Pod Identity credentials",
+		"sync-fails":      "External Secrets did not sync",
+		"role-fails":      "The database role Job did not complete (conditions: Failed )",
 	}
-	for _, scenario := range []string{"empty-secrets", "filled-secrets", "image-missing", "sync-fails", "role-fails"} {
+	for _, scenario := range []string{"empty-secrets", "filled-secrets", "image-missing", "no-pod-identity", "sync-fails", "role-fails"} {
 		t.Run(scenario, func(t *testing.T) {
 			out, err, dir := awsScript(t, "deploy/aws/deploy.sh", awsDeployMock, "SCENARIO="+scenario, "AWS_IMAGE_SHA="+awsTestSHA)
 			ok := scenario == "empty-secrets" || scenario == "filled-secrets"
@@ -235,6 +271,9 @@ func TestAWSDeploy(t *testing.T) {
 			}
 			if scenario == "sync-fails" && strings.Contains(calls, "database-role") {
 				t.Fatal("ran the database role Job before the Secrets were synced")
+			}
+			if scenario == "no-pod-identity" && strings.Contains(calls, "external-secrets") {
+				t.Fatal("continued after Fluent Bit started without credentials")
 			}
 
 			puts := strings.Count(calls, "put-secret-value")
@@ -265,6 +304,15 @@ func TestAWSDeploy(t *testing.T) {
 			}
 			if i, j := strings.Index(calls, "apply -f deploy/aws/database-role.yaml"), strings.Index(calls, "upgrade --install llm-gateway "); i < 0 || i > j {
 				t.Fatal("the database role must be created before the chart")
+			}
+			if i, j := strings.Index(calls, "/fluent-bit.yaml"), strings.Index(calls, "apply -f deploy/aws/database-role.yaml"); i < 0 || i > j {
+				t.Fatal("Fluent Bit must run before the gateway's Jobs and pods start")
+			}
+			logging := readMockFile(t, dir, "fluent-bit.yaml")
+			if !strings.Contains(logging, "log_group_name: /llm-gateway/application\n") ||
+				!regexp.MustCompile(`llm-gateway/manifest-sha256: [0-9a-f]{64}\n`).MatchString(logging) ||
+				strings.Contains(logging, "__") {
+				t.Fatalf("Fluent Bit manifest rendered incorrectly:\n%s", logging)
 			}
 			secrets := readMockFile(t, dir, "secrets.yaml")
 			if !strings.Contains(secrets, "key: arn:aws:secretsmanager:eu-north-1:123456789012:secret:rds!db-mock") ||
@@ -336,6 +384,7 @@ terraform)
     database_name) echo gateway ;;
     database_master_secret_arn) echo 'arn:aws:secretsmanager:eu-north-1:123456789012:secret:rds!db-mock' ;;
     redis_address) echo redis.example ;;
+    application_log_group) echo /llm-gateway/application ;;
     vpc_id) echo vpc-0123456789abcdef0 ;;
     admin_cidr) echo 203.0.113.10/32 ;;
     *) exit 1 ;;
@@ -377,11 +426,13 @@ curl)
     shift
   done ;;
 kubectl)
-  while [[ $1 == --* ]]; do shift 2; done
+  ns=
+  while [[ $1 == --* ]]; do [[ $1 != --namespace ]] || ns=$2; shift 2; done
   case "$1 $2" in
     'create namespace'|'create configmap') echo 'kind: Fixture' ;;
     'apply -f')
       if [[ $3 == - ]]; then cat >/dev/null
+      elif [[ $3 == */fluent-bit.yaml ]]; then cp "$3" "$MOCK_DIR/fluent-bit.yaml"
       elif [[ $3 == */secrets.yaml ]]; then cp "$3" "$MOCK_DIR/secrets.yaml"
       elif [[ $3 == */ingress.yaml ]]; then cp "$3" "$MOCK_DIR/ingress.yaml"; fi ;;
     'label namespace') ;;
@@ -393,7 +444,14 @@ kubectl)
     'delete job') ;;
     'get job') if [[ $SCENARIO == role-fails ]]; then echo 'Failed '; else echo 'Complete '; fi ;;
     'logs job/llm-gateway-database-role') echo 'gateway_app table privileges: INSERT, SELECT' ;;
-    'get pods') echo '{"items":[{"spec":{"readinessGates":[{"conditionType":"target-health.elbv2.k8s.aws/mock"}]}},{"spec":{"readinessGates":[{"conditionType":"target-health.elbv2.k8s.aws/mock"}]}}]}' ;;
+    'get pods')
+      if [[ $ns == fluent-bit ]]; then
+        env='[{"name":"AWS_CONTAINER_CREDENTIALS_FULL_URI","value":"http://169.254.170.23/v1/credentials"}]'
+        [[ $SCENARIO != no-pod-identity ]] || env='[]'
+        echo "{\"items\":[{\"metadata\":{},\"spec\":{\"containers\":[{\"name\":\"fluent-bit\",\"env\":$env}]}}]}"
+        exit
+      fi
+      echo '{"items":[{"spec":{"readinessGates":[{"conditionType":"target-health.elbv2.k8s.aws/mock"}]}},{"spec":{"readinessGates":[{"conditionType":"target-health.elbv2.k8s.aws/mock"}]}}]}' ;;
     *) exit 1 ;;
   esac ;;
 *) exit 1 ;;
@@ -407,12 +465,15 @@ func TestAWSCheck(t *testing.T) {
 		"refilling":     "4 of 30 admitted, fewer than the burst",
 		"local-limits":  "rate limits are not shared through Valkey",
 		"usage-missing": "usage records check (pod phase: Failed)",
+		"logs-missing":  "has no log events in /llm-gateway/application",
+		"logs-changed":  "differ from pod gateway-a's lines",
+		"logs-stream":   "differ from pod gateway-a's lines",
 	}
-	for _, scenario := range []string{"success", "missing-keys", "not-shared", "refilling", "local-limits", "usage-missing"} {
+	for _, scenario := range []string{"success", "missing-keys", "not-shared", "refilling", "local-limits", "usage-missing", "logs-missing", "logs-changed", "logs-stream"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			keys := map[string]string{"demo": "aws-demo-" + strings.Repeat("d", 48), "limited": "aws-limited-" + strings.Repeat("l", 48)}
-			env := []string{"SCENARIO=" + scenario}
+			env := []string{"SCENARIO=" + scenario, "AWS_CHECK_LOG_WAIT=0"}
 			if scenario != "missing-keys" {
 				session := filepath.Join(dir, "session")
 				if err := os.Mkdir(session, 0700); err != nil {
@@ -448,20 +509,49 @@ func TestAWSCheck(t *testing.T) {
 			if !strings.Contains(calls, "delete pod llm-gateway-check-usage") {
 				t.Fatal("the usage pod was not deleted")
 			}
+			for _, want := range []string{
+				"request " + strings.Repeat("A", 26) + " logged unchanged in /llm-gateway/application (stream pod/gateway-a.gateway)",
+				"request " + strings.Repeat("B", 26) + " logged unchanged in /llm-gateway/application (stream pod/gateway-b.gateway)",
+			} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("missing log check %q:\n%s", want, out)
+				}
+			}
 		})
 	}
 }
 
 // curl answers completions with request IDs AAAA… and BBBB…, and the
 // limited client's requests with 404 (admitted) or 429 according to the
-// scenario, counting them in a file.
+// scenario, counting them in a file. The gateway pods logged request AAAA…
+// on gateway-a and BBBB… on gateway-b; CloudWatch returns those lines, or
+// none, a changed line, or the wrong stream, according to the scenario.
 const awsCheckMock = `#!/usr/bin/env bash
 set -eu
 echo "$(basename "$0") $*" >>"$MOCK_DIR/calls"
+line() { printf '{"time":"2026-10-13T10:00:00Z","level":"INFO","msg":"request completed","request_id":"%s","client_id":"demo","status":200}' "$1"; }
 case $(basename "$0") in
+terraform)
+  [[ ${@: -1} == application_log_group ]] && echo /llm-gateway/application ;;
+aws)
+  [[ "$1 $2" == 'logs filter-log-events' && " $* " == *' --region eu-north-1 '* ]] || exit 1
+  id=$(sed -E 's/.*request_id = "([A-Z2-7]+)".*/\1/' <<<"$*")
+  pod=gateway-a
+  [[ $id != B* ]] || pod=gateway-b
+  message=$(line "$id")
+  case $SCENARIO in
+    logs-missing) echo '{"events":[]}'; exit ;;
+    logs-changed) message=${message%\}}',"kubernetes":{"host":"node"}}' ;;
+    logs-stream) pod=gateway-other ;;
+  esac
+  jq -n --arg message "$message" --arg stream "pod/$pod.gateway" '{events: [{logStreamName: $stream, message: $message}]}' ;;
 kubectl)
   while [[ $1 == --* ]]; do shift 2; done
   case "$1 $2" in
+    'logs --selector')
+      echo "[pod/gateway-a/gateway] $(line AAAAAAAAAAAAAAAAAAAAAAAAAA)"
+      echo '[pod/gateway-a/gateway] {"time":"2026-10-13T09:59:00Z","level":"INFO","msg":"listening"}'
+      echo "[pod/gateway-b/gateway] $(line BBBBBBBBBBBBBBBBBBBBBBBBBB)" ;;
     'rollout status') ;;
     port-forward*) exec sleep 30 ;;
     'get pods') printf 'gateway-a\ngateway-b\n' ;;

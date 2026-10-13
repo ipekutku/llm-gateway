@@ -432,6 +432,10 @@ through Valkey, usage records in RDS, and verified HTTPS through the ALB. The
 deployment and checks have mocked tests; a [live session](docs/aws.md#gateway-verification--2026-10-13)
 passed the port-forward/store checks before ingress was added. The later
 [ingress session](docs/aws.md#ingress-verification--2026-10-13) also passed HTTPS checks.
+Fluent Bit, with a Pod Identity role that may only write to one log group,
+ships the gateway's JSON log lines unchanged to [CloudWatch Logs](docs/aws.md#application-logs-in-cloudwatch)
+for the session, with documented Logs Insights queries; `make aws-check`
+compares them with the pods' own lines. A [live session](docs/aws.md#logs-verification--2026-10-13) passed that check and a Logs Insights query.
 
 ### Configuration
 

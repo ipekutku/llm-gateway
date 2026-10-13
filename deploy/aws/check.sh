@@ -10,10 +10,13 @@
 #   admit about 20. Admitted requests are answered 404, limited ones 429,
 #   neither reaching a provider;
 # - both completions' usage records in RDS, read by a temporary psql pod as
-#   the master user.
+#   the master user;
+# - both completions' log lines in CloudWatch Logs, identical to the pod's
+#   own lines and in that pod's stream, waiting up to AWS_CHECK_LOG_WAIT
+#   seconds (default 120) for delivery.
 # The client keys come from deploy/aws/session/, written by make aws-deploy;
 # they reach curl through files, never arguments. No timing thresholds.
-# Needs kubectl, curl, and jq; run from the repository root.
+# Needs kubectl, curl, jq, terraform, and aws; run from the repository root.
 set -euo pipefail
 umask 077
 
@@ -25,6 +28,9 @@ usage_pod=llm-gateway-check-usage
 api_port=28080
 metrics_port=29464
 pod_ports=(28081 28082)
+log_wait=${AWS_CHECK_LOG_WAIT:-120}
+# CloudWatch searches start here, in milliseconds, with a margin for clock skew.
+log_start=$((($(date +%s) - 300) * 1000))
 work=$(mktemp -d)
 forwards=()
 kn=(kubectl --context "$context" --namespace "$namespace")
@@ -210,4 +216,33 @@ done
 "${kn[@]}" logs "$usage_pod" || true
 [[ $phase == Succeeded ]] || fail "usage records check (pod phase: ${phase:-unknown})"
 echo "ok: both completions have usage records in RDS"
+
+# Log lines in CloudWatch: Fluent Bit sends each line unchanged, so the
+# events for a request equal the pod's lines for it, nothing added.
+log_group=$(terraform -chdir=deploy/aws/platform output -raw application_log_group)
+[[ $log_group =~ ^/[A-Za-z0-9/_.-]+$ ]] || fail "unexpected application_log_group output; run make aws-up first"
+"${kn[@]}" logs --selector "app.kubernetes.io/name=llm-gateway,app.kubernetes.io/instance=$release" \
+	--container gateway --prefix --tail=-1 --max-log-requests 10 >"$work/pod-logs"
+for id in "${ids[@]}"; do
+	# --prefix writes [pod/<pod>/gateway] before each line.
+	grep -F "\"request_id\":\"$id\"" "$work/pod-logs" >"$work/request-lines" ||
+		fail "request $id has no line in the gateway pods' logs"
+	pod=$(head -n 1 "$work/request-lines" | sed -E 's|^\[pod/([^/]+)/gateway\] .*|\1|')
+	[[ $pod =~ ^[a-z0-9.-]+$ ]] || fail "unexpected kubectl logs prefix for request $id"
+	expected=$(sed -E 's|^\[pod/[^]]+\] ||' "$work/request-lines" | jq -Rsc 'split("\n") | map(select(. != "")) | sort')
+	deadline=$((SECONDS + log_wait))
+	while :; do
+		events=$(aws logs filter-log-events --region eu-north-1 --log-group-name "$log_group" \
+			--start-time "$log_start" --filter-pattern "{ \$.request_id = \"$id\" }" --output json)
+		jq -e --argjson expected "$expected" --arg stream "pod/$pod.gateway" \
+			'([.events[].message] | sort) == $expected and all(.events[]; .logStreamName == $stream)' <<<"$events" >/dev/null && break
+		if ((SECONDS >= deadline)); then
+			[[ $(jq '.events | length' <<<"$events") != 0 ]] ||
+				fail "request $id has no log events in $log_group after ${log_wait}s; see kubectl -n fluent-bit logs daemonset/fluent-bit"
+			fail "the CloudWatch events for request $id differ from pod $pod's lines"
+		fi
+		sleep 5
+	done
+	echo "ok: request $id logged unchanged in $log_group (stream pod/$pod.gateway)"
+done
 echo "AWS checks passed."

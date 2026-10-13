@@ -33,7 +33,8 @@ module "eks" {
   create_kms_key    = false
   encryption_config = null
 
-  # Control-plane logs are billed by volume; application logs come later.
+  # Control-plane logs are billed by volume; only application logs are
+  # shipped (logs.tf).
   enabled_log_types           = []
   create_cloudwatch_log_group = false
 

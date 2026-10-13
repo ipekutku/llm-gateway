@@ -56,6 +56,12 @@ mock_provider "aws" {
     }
   }
 
+  mock_resource "aws_cloudwatch_log_group" {
+    defaults = {
+      arn = "arn:aws:logs:eu-north-1:123456789012:log-group:/llm-gateway/application"
+    }
+  }
+
   mock_resource "aws_db_instance" {
     defaults = {
       master_user_secret = [{
@@ -298,6 +304,54 @@ run "platform" {
       "openai-api-key", "anthropic-api-key", "clients", "database-app-password"
     ])
     error_message = "Terraform must create only containers for the values written outside it."
+  }
+
+  assert {
+    condition = (
+      aws_cloudwatch_log_group.application.name == "/llm-gateway/application" &&
+      aws_cloudwatch_log_group.application.retention_in_days == 1 &&
+      aws_cloudwatch_log_group.application.log_group_class == "STANDARD" &&
+      output.application_log_group == aws_cloudwatch_log_group.application.name
+    )
+    error_message = "The application log group must keep events for one day."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role.fluent_bit.assume_role_policy).Statement == [{
+      Effect    = "Allow"
+      Principal = { Service = "pods.eks.amazonaws.com" }
+      Action    = ["sts:AssumeRole", "sts:TagSession"]
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = "123456789012" }
+        ArnEquals    = { "aws:SourceArn" = module.eks.cluster_arn }
+      }
+    }]
+    error_message = "Only EKS Pod Identity may assume the Fluent Bit role, and only for this cluster and account."
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_iam_role_policy.fluent_bit.policy).Statement == [{
+        Effect = "Allow"
+        Action = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = [
+          "arn:aws:logs:eu-north-1:123456789012:log-group:/llm-gateway/application",
+          "arn:aws:logs:eu-north-1:123456789012:log-group:/llm-gateway/application:*",
+        ]
+      }] &&
+      aws_iam_role_policy.fluent_bit.role == aws_iam_role.fluent_bit.id
+    )
+    error_message = "Fluent Bit may only create streams and write events in the application log group, never create groups."
+  }
+
+  assert {
+    condition = (
+      aws_eks_pod_identity_association.fluent_bit.cluster_name == module.eks.cluster_name &&
+      aws_eks_pod_identity_association.fluent_bit.namespace == "fluent-bit" &&
+      aws_eks_pod_identity_association.fluent_bit.service_account == "fluent-bit" &&
+      aws_eks_pod_identity_association.fluent_bit.role_arn == aws_iam_role.fluent_bit.arn
+    )
+    error_message = "The Fluent Bit role must belong to the Fluent Bit service account only."
   }
 }
 
